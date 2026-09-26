@@ -181,25 +181,23 @@ curl -LsSf https://astral.sh/uv/install.sh | sh   # ставится в ~/.local
 uv python install 3.11                             # готовый бинарник, без компиляции
 ```
 
-### 3. Код — rsync, не git (пока)
+### 3. Код — приватный GitHub-репозиторий + деплой-ключ
 
-Приватного GitHub-репозитория для psybot ещё нет (в ТЗ предполагался деплой-ключ
-+ `git clone`, но репозиторий не заводили в этой сессии). Код лежит в
-`/home/psybot/psybot/` (не `/opt/psybot` — `/opt` тоже root-only), закинут туда
-`rsync` с локальной машины:
+Репозиторий: `git@github.com:psyteeth/psybot.git` (приватный). На сервере —
+свой read-only deploy key (`~/.ssh/psybot_deploy_key` у пользователя `psybot`,
+добавлен в Settings → Deploy keys репозитория без права записи), настроен
+через `git config core.sshCommand` в `/home/psybot/psybot/.git/config`. Код в
+`/home/psybot/psybot/` (не `/opt/psybot` — `/opt` root-only, `psybot`
+пользователем без root не пишет туда).
 
 ```bash
-./psybot/deploy/deploy.sh   # rsync кода + pip install + restart, см. ниже
+psybot/deploy/deploy.sh   # git pull + pip install + restart, см. п.6
 ```
-
-Если позже заведёте git-репозиторий — `deploy.sh` стоит переписать на
-`git pull`, путь и остальное не изменится.
 
 ### 4. Секреты
 
-`.env` скопирован на сервер напрямую (`scp`, вне rsync-исключений), права
-`600`, владелец `psybot`. В `.gitignore` — не попадёт в репозиторий, если он
-появится.
+`.env` на сервере — не в git (в `.gitignore`), скопирован туда напрямую
+(`scp`), права `600`, владелец `psybot`.
 
 ### 5. Автозапуск — user-level systemd, не системный
 
@@ -232,7 +230,8 @@ journalctl --user -u psybot -f
 ```bash
 psybot/deploy/deploy.sh
 ```
-(`rsync` кода на сервер, `pip install -r requirements.txt`, `systemctl --user restart psybot`.)
+(`git pull` на сервере через deploy key, `pip install -r requirements.txt`,
+`systemctl --user restart psybot`. Запускать после `git push` изменений в `main`.)
 
 ### 7. Бэкап SQLite (сделано)
 
@@ -255,8 +254,6 @@ Cron пользователя `psybot` на сервере:
 
 - Сменить root-пароль (см. п.1) — нужен root-доступ, который сам себе я не
   могу выдать.
-- Завести приватный GitHub-репозиторий и деплой-ключ, если нужен `git pull`
-  вместо `rsync`.
 - Опционально: расширить sudo для `psybot` (например, до `apt-get`), если
   понадобится ставить системные пакеты в будущем — сейчас `psybot` работает
   почти без sudo (только управление своим systemd-юнитом).
