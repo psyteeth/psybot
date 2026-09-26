@@ -1,0 +1,13 @@
+[Unit]
+Description=Psybot Telegram bot (психостоматология)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/psybot/psybot
+ExecStart=/home/psybot/psybot/.venv/bin/python -m bot.main
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
