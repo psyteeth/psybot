@@ -1,6 +1,9 @@
+import html
 import logging
+import random
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
 from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
@@ -11,7 +14,13 @@ from telegram.ext import (
 )
 
 from bot import db, debounce, hostility, limits, llm
-from bot.config import ADMIN_USERNAME, LIMIT_RELATIONSHIP_MESSAGES, RELATIONSHIP_LIMIT_TEXT
+from bot.config import (
+    ADMIN_USERNAME,
+    LIMIT_RELATIONSHIP_MESSAGES,
+    RELATIONSHIP_LIMIT_TEXT,
+    ROADMAP_URL,
+    TESTS_URL,
+)
 from bot.keyboards import back_to_menu_keyboard
 from bot.sheets import sheets_logger
 
@@ -19,8 +28,8 @@ logger = logging.getLogger(__name__)
 
 (
     A_EVENT, B_NARRATIVE, B_CONFIRM, C_CONSEQUENCE, C_FEELING, D_CONFIRM, D_QUESTION,
-    E_SUMMARY, E_FOLLOWUP,
-) = range(9)
+    E_SUMMARY_CONFIRM, E_SUMMARY_CORRECTION, E_SUMMARY, E_FOLLOWUP,
+) = range(11)
 
 Q_A = (
     "Опиши событие или поведение другого человека, от которого тебе дискомфортно: "
@@ -41,6 +50,23 @@ E_NO_INSIGHT_TEXT = (
     f"разобрать это глубже — приходи на диагностику, пиши {ADMIN_USERNAME}."
 )
 DECLINE_D_TEXT = "Ок, как скажешь. Если захочешь вернуться — я здесь."
+
+SUMMARY_CONFIRM_SUFFIX = "\n\nПохоже ли это на правду?"
+PARANOID_BOT_TEMPLATE = (
+    "Прости, я совсем забыл сказать, что я бот-параноик, и сейчас я ощущаю космический посыл "
+    "передать тебе следующую информацию из космоса: попахивает тем, что тебе хочется {hidden_need}, "
+    "голос передаёт тебе: {punchline}"
+)
+FINAL_INSIGHT_TEMPLATE = (
+    "{opener} сформулировать новую реакцию.\n\n"
+    "В следующий раз в подобной ситуации ты можешь {insertion}\n\n"
+    "Меняй своё мышление, а не других людей.\n"
+    "Психостоматология №1\n\n"
+    f'<a href="{ROADMAP_URL}">Зайти в работу</a>\n'
+    "Пройти серию тестов и получить персональный портрет коммуникации - "
+    f'<a href="{TESTS_URL}">здесь</a>'
+)
+FINAL_INSIGHT_OPENERS = ["Похоже, у тебя получилось", "Кажется, у тебя получилось"]
 
 D_FIELDS = {
     1: "d1_logical", 2: "d2_empirical", 3: "d3_pragmatic", 4: "d4_hedonistic",
@@ -396,18 +422,101 @@ async def _process_d_question(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.effective_message.reply_text(question)
         return D_QUESTION
 
+    return await _send_summary_confirm(update, context, session_id)
+
+
+async def _finish_e(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, insertion: str | None) -> int:
+    db.finish_relationship_session(session_id, exit_step="E", completed=True)
+    await _log_session(session_id)
+
+    if insertion:
+        closing_text = FINAL_INSIGHT_TEMPLATE.format(
+            opener=random.choice(FINAL_INSIGHT_OPENERS), insertion=html.escape(insertion)
+        )
+        await update.effective_message.reply_text(
+            closing_text, reply_markup=back_to_menu_keyboard(), parse_mode=ParseMode.HTML
+        )
+    else:
+        await update.effective_message.reply_text(E_NO_INSIGHT_TEXT, reply_markup=back_to_menu_keyboard())
+
+    context.user_data.pop("rel_session_id", None)
+    context.user_data.pop("rel_e_first_answer", None)
+    context.user_data.pop("rel_summary", None)
+    return ConversationHandler.END
+
+
+async def _send_summary_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> int:
+    row = db.get_relationship_session(session_id)
+    d_answers = {i: row[D_FIELDS[i]] for i in range(1, 9)}
+    summary = await llm.generate_session_summary(
+        row["a_event"], row["b_narrative_confirmed"], row["c_consequence"], d_answers
+    )
+    context.user_data["rel_summary"] = summary
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Да", callback_data="e_confirm:yes")],
+            [InlineKeyboardButton("Хочу кое-то добавить/подправить", callback_data="e_confirm:add")],
+        ]
+    )
+    message = update.callback_query.message if update.callback_query else update.effective_message
+    await message.reply_text(summary + SUMMARY_CONFIRM_SUFFIX, reply_markup=keyboard)
+    return E_SUMMARY_CONFIRM
+
+
+async def e_summary_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    session_id = context.user_data["rel_session_id"]
+
+    if query.data.endswith(":add"):
+        await query.message.reply_text("Что добавить или поправить?")
+        return E_SUMMARY_CORRECTION
+
     e_question = await _ask_e_question(context, session_id)
-    await update.effective_message.reply_text(e_question)
+    await query.message.reply_text(e_question)
     return E_SUMMARY
 
 
-async def _finish_e(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, closing_text: str) -> int:
-    db.finish_relationship_session(session_id, exit_step="E", completed=True)
-    await _log_session(session_id)
-    await update.effective_message.reply_text(closing_text, reply_markup=back_to_menu_keyboard())
-    context.user_data.pop("rel_session_id", None)
-    context.user_data.pop("rel_e_first_answer", None)
-    return ConversationHandler.END
+async def e_summary_correction(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_e_correction", conv_handler=conv_handler, state=E_SUMMARY_CORRECTION,
+        process=lambda text: _process_e_summary_correction(update, context, text),
+    )
+
+
+async def _process_e_summary_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    session_id = context.user_data["rel_session_id"]
+
+    status = await hostility.precheck(
+        update, context, branch="relationships", step="E_correction",
+        bot_question="Что добавить или поправить?", text_override=text,
+    )
+    if status == "crisis":
+        await _close_after_hostility(session_id, "self_harm_crisis")
+        return ConversationHandler.END
+    if status == "hostile":
+        return E_SUMMARY_CORRECTION
+    if status == "closed":
+        await _close_after_hostility(session_id, "hostility_closed")
+        return ConversationHandler.END
+
+    await _bump_messages(session_id)
+    summary = context.user_data.get("rel_summary", "")
+
+    edit_analysis = await llm.analyze_self_serving_edit(summary, text)
+    if edit_analysis["self_serving"]:
+        paranoid_text = PARANOID_BOT_TEMPLATE.format(
+            hidden_need=edit_analysis["hidden_need"], punchline=edit_analysis["punchline"]
+        )
+        await update.effective_message.reply_text(paranoid_text)
+
+    row = db.get_relationship_session(session_id)
+    db.update_relationship_session(session_id, e_summary=f"Поправка к резюме: {text}")
+    narrative_with_correction = f"{row['b_narrative_confirmed']}\n(поправка от пользователя: {text})"
+    e_question = await llm.generate_e_question(row["a_event"], narrative_with_correction)
+    context.user_data["rel_e_question"] = e_question
+    await update.effective_message.reply_text(e_question)
+    return E_SUMMARY
 
 
 async def e_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -478,7 +587,7 @@ async def _process_e_followup(update: Update, context: ContextTypes.DEFAULT_TYPE
     if analysis["has_insight"]:
         return await _finish_e(update, context, session_id, analysis["reflection"])
 
-    return await _finish_e(update, context, session_id, E_NO_INSIGHT_TEXT)
+    return await _finish_e(update, context, session_id, None)
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -502,6 +611,8 @@ conv_handler = ConversationHandler(
         C_FEELING: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_feeling)],
         D_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, d_confirm)],
         D_QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, d_question)],
+        E_SUMMARY_CONFIRM: [CallbackQueryHandler(e_summary_confirm, pattern="^e_confirm:")],
+        E_SUMMARY_CORRECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_summary_correction)],
         E_SUMMARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_summary)],
         E_FOLLOWUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_followup)],
     },
