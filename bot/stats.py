@@ -30,9 +30,11 @@ def _numbers(rows: list[dict], col: str) -> list[int]:
 
 
 def _distribution(rows: list[dict], col: str) -> dict[str, int]:
+    """r.get(col) может прийти int/float — gspread типизирует ячейки по содержимому,
+    а не только по заголовку, поэтому всегда приводим к str перед .strip()."""
     dist: dict[str, int] = {}
     for r in rows:
-        v = (r.get(col) or "").strip()
+        v = str(r.get(col) or "").strip()
         if v:
             dist[v] = dist.get(v, 0) + 1
     return dist
