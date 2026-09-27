@@ -12,7 +12,7 @@ from telegram.ext import (
 )
 
 from bot import db, debounce, hostility, limits, llm
-from bot.config import ADMIN_CHAT_ID, ADMIN_USERNAME
+from bot.config import ADMIN_CHAT_ID, ADMIN_USERNAME, CONCEPT_CHAT_USERNAME
 from bot.keyboards import back_to_menu_keyboard
 from bot.sheets import concept_store, sheets_logger
 
@@ -28,6 +28,10 @@ LIMIT_TEXT = (
 NOT_CONVERGED_TEXT = (
     "Кажется, мы с тобой смотрим на это по-разному, и словами тут вряд ли договоримся. "
     f"Если хочешь обсудить дальше — пиши {ADMIN_USERNAME}."
+)
+OFFTOPIC_TEXT = (
+    f"Это не про концепцию психостоматологии — такое лучше обсудить в чате психостоматологии, "
+    f"{CONCEPT_CHAT_USERNAME}. Чтобы получить туда доступ, напиши {ADMIN_USERNAME} — добавят."
 )
 DISPUTE_STREAK_THRESHOLD = 2
 
@@ -106,6 +110,10 @@ async def _process_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, quest
         return ASKING
 
     db.increment_concept_messages(user.id)
+
+    if await llm.is_offtopic_concept(question):
+        await update.effective_message.reply_text(OFFTOPIC_TEXT, reply_markup=back_to_menu_keyboard())
+        return ASKING
 
     await _maybe_rant_opener(update, question)
 

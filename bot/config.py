@@ -38,6 +38,7 @@ DIAGNOSTICS_POST_URL = "https://t.me/psy_teeth_official/439"
 ROADMAP_URL = "https://psyteeth.github.io/hi/"
 TESTS_URL = "https://t.me/psy_teeth_official/701"
 ADMIN_USERNAME = "@psyteeth"
+CONCEPT_CHAT_USERNAME = "@psy_teeth"
 
 VALID_TEETH_NUMBERS = {
     n
