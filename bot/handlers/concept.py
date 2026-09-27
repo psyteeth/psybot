@@ -12,6 +12,7 @@ from telegram.ext import (
 )
 
 from bot import db, debounce, hostility, limits, llm
+from bot.author_answers import ENTRIES as AUTHOR_ANSWERS
 from bot.config import ADMIN_CHAT_ID, ADMIN_USERNAME, CONCEPT_CHAT_USERNAME
 from bot.keyboards import back_to_menu_keyboard
 from bot.sheets import concept_store, sheets_logger
@@ -178,7 +179,9 @@ async def _process_clarify_reply(update: Update, context: ContextTypes.DEFAULT_T
         context_text += "\n\n" + concept_store.get(relevant_title)
 
     dispute = await llm.is_dispute(raw_question)
-    answer = await llm.answer_concept_question(resolved_question, context_text)
+    similar_nums = await llm.pick_similar_author_answers(resolved_question, AUTHOR_ANSWERS)
+    author_examples = [e for e in AUTHOR_ANSWERS if e["num"] in similar_nums]
+    answer = await llm.answer_concept_question(resolved_question, context_text, author_examples)
 
     streak = context.user_data.get("concept_dispute_streak", 0)
     streak = streak + 1 if dispute else 0

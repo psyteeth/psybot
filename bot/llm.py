@@ -346,18 +346,58 @@ CONCEPT_SYSTEM = (
     "— обсуждай по существу, спокойно, но если позиции явно не сходятся, предложи написать @psyteeth.\n\n"
     "Если среди материалов ниже попадутся примеры вопросов пользователей и ответов автора (тренировочная "
     "база) — это не факты для цитирования, а образец ЖИВОГО ГОЛОСА: ориентируйся на их тон, длину фраз, "
-    "манеру шутить и объяснять, и отвечай в этой же манере, а не казённее и не длиннее."
+    "манеру шутить, троллить и объяснять, и отвечай в этой же манере, а не казённее и не длиннее. Если "
+    "вопрос пользователя близко совпадает с одним из примеров — можешь взять ответ автора почти как есть, "
+    "адаптировав под живую речь. Нецензурную лексику из примеров НЕ копируй дословно — дерзость, иронию "
+    "и остроту тона сохраняй, а мат замени на такую же хлёсткую, но приличную формулировку."
     + GENDER_NEUTRAL_RULE
 )
 
 
-async def answer_concept_question(question: str, context_text: str) -> str:
+async def answer_concept_question(
+    question: str, context_text: str, author_examples: list[dict] | None = None
+) -> str:
+    examples_block = ""
+    if author_examples:
+        parts = []
+        for e in author_examples:
+            part = f"Вопрос: {e['question']}\nОтвет автора: {e['answer']}\nТон: {e['tone']}"
+            if e.get("instruction"):
+                part += f"\nУказание боту: {e['instruction']}"
+            parts.append(part)
+        examples_block = (
+            "\n\nПохожие вопросы из базы автора (образец тона и подачи, не факты для цитирования):\n\n"
+            + "\n\n".join(parts)
+        )
     user_text = (
-        f"{FOUNDATION_FACT}\n\n{BRIDGE_THEORY_FACT}\n\nФрагменты таблицы концепции:\n{context_text[:12000]}\n\n"
-        f"Вопрос пользователя: {question}"
+        f"{FOUNDATION_FACT}\n\n{BRIDGE_THEORY_FACT}\n\nФрагменты таблицы концепции:\n{context_text[:12000]}"
+        f"{examples_block}\n\nВопрос пользователя: {question}"
     )
     answer = await _ask(CONCEPT_SYSTEM, user_text, MODEL_SONNET, max_tokens=1536)
     return answer.replace("**", "").replace("##", "").replace("# ", "")
+
+
+AUTHOR_MATCH_SYSTEM = (
+    "Тебе дан вопрос пользователя и пронумерованный список вопросов из базы примеров ответов автора "
+    "психостоматологии. Найди от 0 до 5 вопросов из списка, ближе всего связанных по смыслу с вопросом "
+    "пользователя (важна суть, не дословное совпадение). Если ничего толком не подходит по теме — верни "
+    "пустой список, не притягивай случайные вопросы. Ответь СТРОГО валидным JSON-массивом номеров без "
+    "пояснений и markdown, например: [3, 41, 102]."
+)
+
+
+async def pick_similar_author_answers(question: str, entries: list[dict]) -> list[int]:
+    if not entries:
+        return []
+    listing = "\n".join(f"{e['num']}. {e['question']}" for e in entries)
+    user_text = f"Вопрос пользователя: {question}\n\nСписок вопросов автора:\n{listing}"
+    try:
+        raw = await _ask(AUTHOR_MATCH_SYSTEM, user_text, MODEL_HAIKU, max_tokens=100)
+        data = json.loads(_strip_code_fence(raw))
+        return [int(n) for n in data if isinstance(n, (int, float))]
+    except Exception:  # noqa: BLE001
+        logger.exception("pick_similar_author_answers упал/не распарсился")
+        return []
 
 
 DISPUTE_DETECT_SYSTEM = (
