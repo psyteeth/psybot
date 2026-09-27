@@ -28,11 +28,18 @@ def build_application():
     application.add_handler(teeth.conv_handler)
     application.add_handler(concept.conv_handler)
 
-    application.add_handler(CommandHandler("start", menu.start_command))
+    # /chatid и /limits — служебные, для админа, нужны в т.ч. внутри групп (узнать id
+    # чата, проверить лимиты). Всё остальное — только личка: бот не должен отвечать/вести
+    # диалог в чатах, которые используются только как источник проверки членства.
+    application.add_handler(CommandHandler("start", menu.start_command, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("limits", menu.limits_command))
     application.add_handler(CommandHandler("chatid", menu.chatid_command))
-    application.add_handler(CallbackQueryHandler(menu.back_to_menu_callback, pattern="^menu:back$"))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu.fallback_text))
+    application.add_handler(
+        CallbackQueryHandler(menu.back_to_menu_callback, pattern="^menu:back$")
+    )
+    application.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, menu.fallback_text)
+    )
 
     return application
 
