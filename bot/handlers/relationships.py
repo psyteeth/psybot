@@ -103,7 +103,9 @@ async def _start_session(update: Update, context: ContextTypes.DEFAULT_TYPE, via
     user = update.effective_user
     send = update.callback_query.edit_message_text if via_query else update.effective_message.reply_text
 
-    if db.count_relationship_sessions(user.id) >= await limits.get_limit(user.id, "relationships"):
+    if db.count_relationship_sessions_this_month(user.id) >= await limits.get_limit(
+        context.bot, user.id, "relationships"
+    ):
         db.log_limit_hit(user.id, "relationships")
         await sheets_logger.append(
             "Лимиты", [db.now(), user.id, user.username or "", "Отношения", "упёрся в лимит"]

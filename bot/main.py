@@ -30,6 +30,7 @@ def build_application():
 
     application.add_handler(CommandHandler("start", menu.start_command))
     application.add_handler(CommandHandler("limits", menu.limits_command))
+    application.add_handler(CommandHandler("chatid", menu.chatid_command))
     application.add_handler(CallbackQueryHandler(menu.back_to_menu_callback, pattern="^menu:back$"))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu.fallback_text))
 

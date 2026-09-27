@@ -4,7 +4,7 @@ from telegram import Update
 from telegram.ext import ContextTypes
 
 from bot import db, limits, llm
-from bot.config import ADMIN_CHAT_ID
+from bot.config import ADMIN_CHAT_ID, NO_ACCESS_TEXT
 from bot.keyboards import main_menu_keyboard
 
 logger = logging.getLogger(__name__)
@@ -24,7 +24,16 @@ BRANCH_HINT = {
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str = WELCOME_TEXT) -> None:
     user = update.effective_user
     db.upsert_user(user.id, user.username)
-    keyboard = await main_menu_keyboard(user.id)
+
+    if not await limits.has_access(context.bot, user.id):
+        if update.callback_query:
+            await update.callback_query.answer()
+            await update.callback_query.edit_message_text(NO_ACCESS_TEXT)
+        else:
+            await update.effective_message.reply_text(NO_ACCESS_TEXT)
+        return
+
+    keyboard = await main_menu_keyboard(context.bot, user.id)
     if update.callback_query:
         await update.callback_query.answer()
         await update.callback_query.edit_message_text(text, reply_markup=keyboard)
@@ -65,15 +74,27 @@ async def limits_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.effective_message.reply_text("user_id должен быть числом.")
         return
 
-    data = await limits.summary(target_id)
-    lines = [f"Лимиты для user_id {target_id}:"]
+    tier = await limits.get_tier(context.bot, target_id)
+    data = await limits.summary(context.bot, target_id)
+    lines = [f"Лимиты для user_id {target_id} (тариф: {tier}):"]
     for info in data.values():
-        lines.append(f"{info['label']}: осталось {info['left']} из {info['limit']} (использовано {info['used']})")
+        left = "∞" if info["left"] == float("inf") else info["left"]
+        lim = "∞" if info["limit"] == float("inf") else info["limit"]
+        lines.append(f"{info['label']}: осталось {left} из {lim} (использовано {info['used']})")
     lines.append(
         "\nЧтобы поменять лимит вручную — впиши строку в лист «Лимиты (ручные)» таблицы логов: "
-        "user_id | ветка (Отношения/Зубы/Концепция) | лимит. Подхватится в течение 5 минут."
+        "user_id | ветка (Отношения/Зубы/Концепция) | лимит (число или «безлимит»). Подхватится в "
+        "течение 5 минут. Чтобы дать тариф «родственник» — впиши user_id в лист «Родственники»."
     )
     await update.effective_message.reply_text("\n".join(lines))
+
+
+async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/chatid — показывает id текущего чата. Нужен один раз, чтобы узнать id приватного
+    «чата исцеления отношений» и вписать его в RELATIONSHIPS_CHAT_ID в .env (бот должен
+    быть добавлен в чат участником)."""
+    chat = update.effective_chat
+    await update.effective_message.reply_text(f"chat_id этого чата: {chat.id}")
 
 
 async def fallback_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

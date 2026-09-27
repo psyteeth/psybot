@@ -19,6 +19,7 @@ from bot.config import (
     GOOGLE_SERVICE_ACCOUNT_JSON,
     LIMIT_OVERRIDES_REFRESH_SECONDS,
     LOG_SPREADSHEET_ID,
+    UNLIMITED,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,9 @@ HOSTILITY_HEADER = [
 LIMIT_OVERRIDES_HEADER = ["user_id", "ветка", "лимит", "комментарий"]
 LIMIT_OVERRIDES_TAB = "Лимиты (ручные)"
 
+RELATIVES_HEADER = ["user_id", "комментарий"]
+RELATIVES_TAB = "Родственники"
+
 SHEET_TABS = {
     "Отношения": RELATIONSHIP_HEADER,
     "Зубы": TEETH_HEADER,
@@ -61,6 +65,7 @@ SHEET_TABS = {
     "Лимиты": LIMITS_HEADER,
     "Выпады": HOSTILITY_HEADER,
     LIMIT_OVERRIDES_TAB: LIMIT_OVERRIDES_HEADER,
+    RELATIVES_TAB: RELATIVES_HEADER,
 }
 
 
@@ -203,16 +208,23 @@ class LimitOverridesStore:
             ws.append_row(LIMIT_OVERRIDES_HEADER)
             return {}
 
-        result: dict[tuple[int, str], int] = {}
+        result: dict[tuple[int, str], float] = {}
         for record in ws.get_all_records():
             try:
                 user_id = int(record.get("user_id"))
                 branch_key = BRANCH_LABEL_TO_KEY.get(str(record.get("ветка", "")).strip().lower())
-                limit = int(record.get("лимит"))
             except (TypeError, ValueError):
                 continue
             if branch_key is None:
                 continue
+            raw_limit = str(record.get("лимит", "")).strip().lower()
+            if raw_limit in ("безлимит", "unlimited", "инф", "inf", "∞"):
+                limit = UNLIMITED
+            else:
+                try:
+                    limit = int(raw_limit)
+                except ValueError:
+                    continue
             result[(user_id, branch_key)] = limit
         return result
 
@@ -228,10 +240,60 @@ class LimitOverridesStore:
             except Exception:  # noqa: BLE001
                 logger.exception("Не удалось обновить лист ручных лимитов, используем старый кэш")
 
-    def get(self, user_id: int, branch: str, default: int) -> int:
+    def get(self, user_id: int, branch: str, default=None):
         return self._overrides.get((user_id, branch), default)
+
+    def has_any(self, user_id: int) -> bool:
+        return any(uid == user_id for uid, _branch in self._overrides)
+
+
+class RelativesStore:
+    """Список user_id «родственников» из листа «Родственники» — тариф не определить
+    автоматически (нет членства в чате), поэтому это ручной список, админ вписывает id.
+    Формат листа: user_id | комментарий."""
+
+    def __init__(self) -> None:
+        self._client = _build_client()
+        self._ids: set[int] = set()
+        self._last_refresh = 0.0
+        self._lock = asyncio.Lock()
+
+    def _refresh_sync(self) -> set[int]:
+        if not self._client or not LOG_SPREADSHEET_ID:
+            return set()
+        sh = self._client.open_by_key(LOG_SPREADSHEET_ID)
+        try:
+            ws = sh.worksheet(RELATIVES_TAB)
+        except gspread.WorksheetNotFound:
+            ws = sh.add_worksheet(title=RELATIVES_TAB, rows=500, cols=len(RELATIVES_HEADER) + 1)
+            ws.append_row(RELATIVES_HEADER)
+            return set()
+
+        result: set[int] = set()
+        for record in ws.get_all_records():
+            try:
+                result.add(int(record.get("user_id")))
+            except (TypeError, ValueError):
+                continue
+        return result
+
+    async def ensure_fresh(self) -> None:
+        if (time.time() - self._last_refresh) <= LIMIT_OVERRIDES_REFRESH_SECONDS and self._last_refresh:
+            return
+        async with self._lock:
+            if (time.time() - self._last_refresh) <= LIMIT_OVERRIDES_REFRESH_SECONDS and self._last_refresh:
+                return
+            try:
+                self._ids = await asyncio.to_thread(self._refresh_sync)
+                self._last_refresh = time.time()
+            except Exception:  # noqa: BLE001
+                logger.exception("Не удалось обновить лист «Родственники», используем старый кэш")
+
+    def contains(self, user_id: int) -> bool:
+        return user_id in self._ids
 
 
 sheets_logger = SheetsLogger()
 concept_store = ConceptStore()
 limit_overrides = LimitOverridesStore()
+relatives = RelativesStore()

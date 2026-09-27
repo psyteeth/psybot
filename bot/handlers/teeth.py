@@ -20,6 +20,7 @@ from bot.config import (
     ROADMAP_URL,
     TEETH_CHART_PATH,
     VALID_TEETH_NUMBERS,
+    limit_exhausted_text,
 )
 from bot.keyboards import back_to_menu_keyboard
 from bot.sheets import sheets_logger
@@ -112,14 +113,13 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     db.upsert_user(user.id, user.username)
 
-    if db.count_teeth_sessions(user.id) >= await limits.get_limit(user.id, "teeth"):
+    if db.count_teeth_sessions_this_month(user.id) >= await limits.get_limit(context.bot, user.id, "teeth"):
         db.log_limit_hit(user.id, "teeth")
         await sheets_logger.append(
             "Лимиты", [db.now(), user.id, user.username or "", "Зубы", "упёрся в лимит"]
         )
         await query.edit_message_text(
-            "Сессии по зубам в тест-драйве закончились. Хочешь продолжить — приходи на "
-            f"бесплатную диагностику. Пиши {ADMIN_USERNAME}.",
+            limit_exhausted_text("Зубы"),
             reply_markup=back_to_menu_keyboard(),
         )
         return ConversationHandler.END

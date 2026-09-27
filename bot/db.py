@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS teeth_sessions (
 
 CREATE TABLE IF NOT EXISTS concept_usage (
     user_id INTEGER PRIMARY KEY,
-    message_count INTEGER NOT NULL DEFAULT 0
+    message_count INTEGER NOT NULL DEFAULT 0,
+    period TEXT
 );
 
 CREATE TABLE IF NOT EXISTS limit_hits (
@@ -69,6 +70,15 @@ CREATE TABLE IF NOT EXISTS limit_hits (
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _month_start_iso() -> str:
+    start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return start.isoformat()
+
+
+def _current_period() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m")
 
 
 @contextmanager
@@ -86,6 +96,10 @@ def get_conn():
 def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        try:
+            conn.execute("ALTER TABLE concept_usage ADD COLUMN period TEXT")
+        except sqlite3.OperationalError:
+            pass  # колонка уже есть (миграция на уже существующей базе)
 
 
 # --- Пользователи ---
@@ -106,6 +120,15 @@ def count_relationship_sessions(user_id: int) -> int:
         row = conn.execute(
             "SELECT COUNT(*) AS c FROM relationship_sessions WHERE user_id=?",
             (user_id,),
+        ).fetchone()
+        return row["c"]
+
+
+def count_relationship_sessions_this_month(user_id: int) -> int:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM relationship_sessions WHERE user_id=? AND started_at>=?",
+            (user_id, _month_start_iso()),
         ).fetchone()
         return row["c"]
 
@@ -172,6 +195,15 @@ def count_teeth_sessions(user_id: int) -> int:
         return row["c"]
 
 
+def count_teeth_sessions_this_month(user_id: int) -> int:
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM teeth_sessions WHERE user_id=? AND started_at>=?",
+            (user_id, _month_start_iso()),
+        ).fetchone()
+        return row["c"]
+
+
 def create_teeth_session(user_id: int, username: Optional[str]) -> int:
     session_num = count_teeth_sessions(user_id) + 1
     with get_conn() as conn:
@@ -203,22 +235,31 @@ def finish_teeth_session(session_id: int, completed: bool) -> None:
 def get_concept_message_count(user_id: int) -> int:
     with get_conn() as conn:
         row = conn.execute(
-            "SELECT message_count FROM concept_usage WHERE user_id=?", (user_id,)
+            "SELECT message_count, period FROM concept_usage WHERE user_id=?", (user_id,)
         ).fetchone()
-        return row["message_count"] if row else 0
+    if not row or row["period"] != _current_period():
+        return 0
+    return row["message_count"]
 
 
 def increment_concept_messages(user_id: int) -> int:
+    period = _current_period()
     with get_conn() as conn:
-        conn.execute(
-            "INSERT INTO concept_usage (user_id, message_count) VALUES (?, 1) "
-            "ON CONFLICT(user_id) DO UPDATE SET message_count = message_count + 1",
-            (user_id,),
-        )
         row = conn.execute(
-            "SELECT message_count FROM concept_usage WHERE user_id=?", (user_id,)
+            "SELECT message_count, period FROM concept_usage WHERE user_id=?", (user_id,)
         ).fetchone()
-        return row["message_count"]
+        if row and row["period"] == period:
+            conn.execute(
+                "UPDATE concept_usage SET message_count = message_count + 1 WHERE user_id=?",
+                (user_id,),
+            )
+            return row["message_count"] + 1
+        conn.execute(
+            "INSERT INTO concept_usage (user_id, message_count, period) VALUES (?, 1, ?) "
+            "ON CONFLICT(user_id) DO UPDATE SET message_count=1, period=excluded.period",
+            (user_id, period),
+        )
+        return 1
 
 
 # --- Лимиты ---

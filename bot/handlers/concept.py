@@ -13,7 +13,7 @@ from telegram.ext import (
 
 from bot import db, debounce, hostility, limits, llm
 from bot.author_answers import ENTRIES as AUTHOR_ANSWERS
-from bot.config import ADMIN_CHAT_ID, ADMIN_USERNAME, CONCEPT_CHAT_USERNAME
+from bot.config import ADMIN_CHAT_ID, ADMIN_USERNAME, CONCEPT_CHAT_USERNAME, limit_exhausted_text
 from bot.keyboards import back_to_menu_keyboard
 from bot.sheets import concept_store, sheets_logger
 
@@ -22,10 +22,7 @@ logger = logging.getLogger(__name__)
 ASKING, CLARIFY = range(2)
 
 INTRO_TEXT = "Спрашивай что угодно о концепции психостоматологии — отвечу по нашим материалам."
-LIMIT_TEXT = (
-    "Вопросы по концепции в тест-драйве закончились. Хочешь продолжить — приходи на "
-    f"бесплатную диагностику. Пиши {ADMIN_USERNAME}."
-)
+LIMIT_TEXT = limit_exhausted_text("Концепция")
 NOT_CONVERGED_TEXT = (
     "Кажется, мы с тобой смотрим на это по-разному, и словами тут вряд ли договоримся. "
     f"Если хочешь обсудить дальше — пиши {ADMIN_USERNAME}."
@@ -53,7 +50,7 @@ RANT_OPENERS = [
 
 async def _check_limit(update: Update, context: ContextTypes.DEFAULT_TYPE, user, via_query: bool) -> bool:
     """True, если лимит исчерпан и ответ уже отправлен."""
-    if db.get_concept_message_count(user.id) >= await limits.get_limit(user.id, "concept"):
+    if db.get_concept_message_count(user.id) >= await limits.get_limit(context.bot, user.id, "concept"):
         db.log_limit_hit(user.id, "concept")
         await sheets_logger.append(
             "Лимиты", [db.now(), user.id, user.username or "", "Концепция", "упёрся в лимит"]

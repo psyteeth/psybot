@@ -27,11 +27,8 @@ TEETH_CHART_PATH = str(ASSETS_DIR / "teeth_chart.jpg")
 MODEL_SONNET = "claude-sonnet-5"
 MODEL_HAIKU = "claude-haiku-4-5-20251001"
 
-# --- Лимиты тест-драйва (константы, чтобы менять без переписывания кода) ---
-LIMIT_RELATIONSHIP_SESSIONS = 3
+# --- Лимит сообщений внутри ОДНОГО разбора «Отношения» (не помесячный) ---
 LIMIT_RELATIONSHIP_MESSAGES = 40
-LIMIT_TEETH_SESSIONS = 10
-LIMIT_CONCEPT_MESSAGES = 30
 
 # --- Ссылки и тексты ---
 DIAGNOSTICS_POST_URL = "https://t.me/psy_teeth_official/439"
@@ -39,6 +36,33 @@ ROADMAP_URL = "https://psyteeth.github.io/hi/"
 TESTS_URL = "https://t.me/psy_teeth_official/701"
 ADMIN_USERNAME = "@psyteeth"
 CONCEPT_CHAT_USERNAME = "@psy_teeth"
+
+# --- Доступ по чатам: тариф определяется членством в Telegram-чатах, лимиты помесячные ---
+# «Чат исцеления отношений» — рабочий проект автора, участники получают безлимит.
+# Приватный чат без публичного @username — id узнать через /chatid (см. menu.py),
+# вписать в .env после того, как бота добавят туда участником.
+RELATIONSHIPS_CHAT_ID = os.environ.get("RELATIONSHIPS_CHAT_ID", "")
+# «Чат психостоматологии» — публичный чат, тот же, куда бот шлёт офф-топик редиректы.
+PSYTEETH_CHAT_ID = os.environ.get("PSYTEETH_CHAT_ID", "") or CONCEPT_CHAT_USERNAME
+MEMBERSHIP_CACHE_SECONDS = 10 * 60  # не дёргать getChatMember на каждое сообщение
+
+UNLIMITED = float("inf")
+
+TIER_DEFAULTS = {
+    # участник «чата исцеления отношений» — безлимит везде
+    "chat_unlimited": {"relationships": UNLIMITED, "teeth": UNLIMITED, "concept": UNLIMITED},
+    # родственник участника — ручной список в листе «Родственники»
+    "relative": {"relationships": 10, "teeth": 10, "concept": 30},
+    # участник публичного чата психостоматологии
+    "chat_member": {"relationships": 10, "teeth": 30, "concept": 50},
+    # ни в одном чате и не в списке родственников — бот не работает
+    "none": {"relationships": 0, "teeth": 0, "concept": 0},
+}
+
+NO_ACCESS_TEXT = (
+    "Бот сейчас доступен только участникам чата психостоматологии. Чтобы получить доступ, напиши "
+    f"{ADMIN_USERNAME} — добавят в чат {CONCEPT_CHAT_USERNAME}, и бот заработает."
+)
 
 VALID_TEETH_NUMBERS = {
     n
@@ -56,7 +80,11 @@ HOSTILITY_MAX_PUNCHLINES = 3
 # --- Объединение подряд идущих сообщений перед обработкой шага ---
 DEBOUNCE_SECONDS = 2.5
 
-RELATIONSHIP_LIMIT_TEXT = (
-    "Три разбора в тест-драйве закончились. Хочешь продолжить — приходи на "
-    f"бесплатную диагностику. Пиши {ADMIN_USERNAME}."
-)
+def limit_exhausted_text(branch_label: str) -> str:
+    return (
+        f"Лимит по «{branch_label}» на этот месяц закончился. Обновится в начале следующего "
+        f"месяца. Если нужно больше — пиши {ADMIN_USERNAME}."
+    )
+
+
+RELATIONSHIP_LIMIT_TEXT = limit_exhausted_text("Отношения")
