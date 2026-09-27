@@ -121,10 +121,21 @@ async def _log_session(session_id: int) -> None:
 
 async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
     user = update.effective_user
     db.upsert_user(user.id, user.username)
 
+    # allow_reentry=True означает, что этот энтри-поинт проверяется на КАЖДОМ тапе
+    # "Отношения", даже посреди уже идущего разбора. Быстрый повторный тап (двойной клик,
+    # нетерпеливость) иначе плодит новые сессии впустую, сжирая лимит без единого ответа
+    # пользователя — реальный случай: 3 сессии за 1 секунду от одного человека.
+    existing_id = context.user_data.get("rel_session_id")
+    if existing_id is not None:
+        existing_row = db.get_relationship_session(existing_id)
+        if existing_row is not None and existing_row["ended_at"] is None:
+            await query.answer("Разбор уже идёт — отвечай в чате выше 👆")
+            return None
+
+    await query.answer()
     return await _start_session(update, context, via_query=True)
 
 

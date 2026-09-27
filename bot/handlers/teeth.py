@@ -109,9 +109,18 @@ def _fetch_teeth_row(session_id: int) -> list:
 
 async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
     user = update.effective_user
     db.upsert_user(user.id, user.username)
+
+    # см. relationships.entry() — тот же двойной-тап-плодит-сессии баг, тот же фикс.
+    existing_id = context.user_data.get("teeth_session_id")
+    if existing_id is not None:
+        existing_row = db.get_teeth_session(existing_id)
+        if existing_row is not None and existing_row["ended_at"] is None:
+            await query.answer("Сессия уже идёт — отвечай в чате выше 👆")
+            return None
+
+    await query.answer()
 
     if db.count_teeth_sessions_this_month(user.id) >= await limits.get_limit(context.bot, user.id, "teeth"):
         db.log_limit_hit(user.id, "teeth")

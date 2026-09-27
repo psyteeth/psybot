@@ -244,6 +244,11 @@ def create_teeth_session(user_id: int, username: Optional[str]) -> int:
         return cur.lastrowid
 
 
+def get_teeth_session(session_id: int) -> Optional[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM teeth_sessions WHERE id=?", (session_id,)).fetchone()
+
+
 def update_teeth_session(session_id: int, **fields) -> None:
     if not fields:
         return
