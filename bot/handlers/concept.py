@@ -246,5 +246,6 @@ conv_handler = ConversationHandler(
         CallbackQueryHandler(cancel, pattern="^menu:back$"),
     ],
     name="concept_conversation",
+    persistent=True,
     allow_reentry=True,
 )

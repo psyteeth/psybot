@@ -24,10 +24,26 @@ psybot/
       concept.py         — ветка «Концепция»
   assets/teeth_chart.jpg — схема FDI
   deploy/                — systemd unit, deploy.sh, backup_db.sh
-  data/                   — bot.db (не в git) и бэкапы
+  data/                   — bot.db, bot_persistence.pickle (оба не в git) и бэкапы
   requirements.txt
   .env.example
 ```
+
+## Персистентность разговоров (переживает рестарт/деплой)
+
+`ApplicationBuilder().persistence(PicklePersistence(...))` в `bot/main.py` —
+состояние каждого `ConversationHandler` (все три помечены `persistent=True`) и
+`user_data` сохраняются в `data/bot_persistence.pickle`, автосохранение раз в
+60 сек и при штатной остановке процесса (`systemctl restart` шлёт SIGTERM,
+PTB перед выходом сбрасывает persistence).
+
+Без этого КАЖДЫЙ деплой обнулял бы состояние разговора у ВСЕХ, кто в этот
+момент был в середине разбора — не только у тестировщика, который его
+вызвал (реальный баг, пойманный на проде: пользователь ответил на E-вопрос
+ровно во время деплоя, бота «отбросило» в главное меню). `bot/debounce.py`
+намеренно хранит буфер сообщений и хэндл отложенной джобы в собственных
+модульных словарях, а не в `user_data` — job-объект JobQueue не picklable,
+и класть его в персистентный `user_data` сломало бы сохранение целиком.
 
 ## Переменные окружения
 

@@ -1,10 +1,23 @@
 import datetime
 import logging
 
-from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    PicklePersistence,
+    filters,
+)
 
 from bot import db
-from bot.config import STATS_WEEKLY_HOUR_UTC, STATS_WEEKLY_MINUTE_UTC, STATS_WEEKLY_WEEKDAY, TELEGRAM_BOT_TOKEN
+from bot.config import (
+    PERSISTENCE_PATH,
+    STATS_WEEKLY_HOUR_UTC,
+    STATS_WEEKLY_MINUTE_UTC,
+    STATS_WEEKLY_WEEKDAY,
+    TELEGRAM_BOT_TOKEN,
+)
 from bot.handlers import concept, menu, relationships, teeth
 
 logging.basicConfig(
@@ -20,7 +33,12 @@ def build_application():
 
     db.init_db()
 
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    # Без этого состояние разговоров (ConversationHandler) и user_data живут только в
+    # памяти процесса — рестарт (деплой, падение) обнуляет ВСЕ активные разборы для всех
+    # пользователей разом, не только у того, кто вызвал рестарт. PicklePersistence переживает
+    # рестарт; debounce.py намеренно не кладёт в user_data ничего непикловского (см. его docstring).
+    persistence = PicklePersistence(filepath=PERSISTENCE_PATH)
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).persistence(persistence).build()
 
     # Порядок важен: ветки должны идти до общих /start и текстового фолбэка,
     # чтобы их собственные fallback-обработчики (/cancel, /start, menu:back)

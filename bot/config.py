@@ -19,6 +19,7 @@ ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)
 DB_PATH = str(DATA_DIR / "bot.db")
+PERSISTENCE_PATH = str(DATA_DIR / "bot_persistence.pickle")
 
 ASSETS_DIR = BASE_DIR / "assets"
 TEETH_CHART_PATH = str(ASSETS_DIR / "teeth_chart.jpg")

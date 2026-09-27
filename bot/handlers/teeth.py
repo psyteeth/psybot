@@ -300,4 +300,5 @@ conv_handler = ConversationHandler(
         CallbackQueryHandler(cancel, pattern="^menu:back$"),
     ],
     name="teeth_conversation",
+    persistent=True,
 )

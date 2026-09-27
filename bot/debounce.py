@@ -11,7 +11,12 @@
 (процесс шага, следующий вопрос, переход состояния) происходит в отложенной
 джобе через JobQueue, которая по завершении сама выставляет новое состояние в
 ConversationHandler.
-"""
+
+Буфер и джоба живут в модульных словарях, а НЕ в context.user_data: user_data
+персистентен на диск (PicklePersistence, см. bot/main.py) и должен оставаться
+picklable — job-объект JobQueue таким не является. Плата за это — сообщение,
+попавшее ровно в момент рестарта процесса (окно DEBOUNCE_SECONDS), потеряется;
+это гораздо дешевле, чем терять picklability всего user_data."""
 import logging
 
 from telegram import Update
@@ -21,13 +26,8 @@ from bot.config import DEBOUNCE_SECONDS
 
 logger = logging.getLogger(__name__)
 
-
-def _buffer_key(step_id: str) -> str:
-    return f"debounce::{step_id}::buffer"
-
-
-def _job_key(step_id: str) -> str:
-    return f"debounce::{step_id}::job"
+_buffers: dict[tuple[int, str], list[str]] = {}
+_jobs: dict[tuple[int, str], object] = {}
 
 
 async def collect(
@@ -48,18 +48,17 @@ async def collect(
     Возвращает `state` — обработчик, вызвавший `collect`, должен вернуть это же
     значение как есть, ничего больше не делая.
     """
-    buffer_key = _buffer_key(step_id)
-    job_key = _job_key(step_id)
+    user = update.effective_user
+    key = (user.id, step_id)
 
     text = update.effective_message.text or ""
-    context.user_data.setdefault(buffer_key, []).append(text)
+    _buffers.setdefault(key, []).append(text)
 
-    old_job = context.user_data.pop(job_key, None)
+    old_job = _jobs.pop(key, None)
     if old_job is not None:
         old_job.schedule_removal()
 
     chat = update.effective_chat
-    user = update.effective_user
     conv_key = (chat.id, user.id)
 
     try:
@@ -68,8 +67,8 @@ async def collect(
         pass
 
     async def _fire(job_context: ContextTypes.DEFAULT_TYPE) -> None:
-        combined = "\n".join(context.user_data.pop(buffer_key, []))
-        context.user_data.pop(job_key, None)
+        combined = "\n".join(_buffers.pop(key, []))
+        _jobs.pop(key, None)
         try:
             new_state = await process(combined)
         except Exception:  # noqa: BLE001
@@ -78,5 +77,5 @@ async def collect(
         conv_handler._update_state(new_state, conv_key)  # noqa: SLF001
 
     job = context.application.job_queue.run_once(_fire, DEBOUNCE_SECONDS)
-    context.user_data[job_key] = job
+    _jobs[key] = job
     return state

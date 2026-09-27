@@ -836,5 +836,6 @@ conv_handler = ConversationHandler(
         CallbackQueryHandler(cancel, pattern="^menu:back$"),
     ],
     name="relationships_conversation",
+    persistent=True,
     allow_reentry=True,
 )
