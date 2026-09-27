@@ -1,6 +1,7 @@
 import html
 import logging
 import random
+import re
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -16,6 +17,7 @@ from telegram.ext import (
 from bot import db, debounce, hostility, limits, llm
 from bot.config import (
     ADMIN_USERNAME,
+    ENABLE_PRIOR_EVENT_QUESTION,
     LIMIT_RELATIONSHIP_MESSAGES,
     RELATIONSHIP_LIMIT_TEXT,
     ROADMAP_URL,
@@ -27,9 +29,11 @@ from bot.sheets import sheets_logger
 logger = logging.getLogger(__name__)
 
 (
-    A_EVENT, B_NARRATIVE, B_CONFIRM, C_CONSEQUENCE, C_FEELING, D_CONFIRM, D_QUESTION,
-    E_SUMMARY_CONFIRM, E_SUMMARY_CORRECTION, E_SUMMARY, E_FOLLOWUP,
-) = range(11)
+    A_EVENT, A_PRIOR_EVENT, A_OTHER_PERSON,
+    B_NARRATIVE, B_CONFIRM, C_CONSEQUENCE, C_FEELING, C_DISCOMFORT,
+    D_CONFIRM, D_QUESTION,
+    E_DISCOMFORT_AFTER, E_SUMMARY_CONFIRM, E_SUMMARY_CORRECTION, E_SUMMARY, E_FOLLOWUP,
+) = range(15)
 
 Q_A = (
     "Опиши событие или поведение другого человека, от которого тебе дискомфортно: "
@@ -50,6 +54,20 @@ E_NO_INSIGHT_TEXT = (
     f"разобрать это глубже — приходи на диагностику, пиши {ADMIN_USERNAME}."
 )
 DECLINE_D_TEXT = "Ок, как скажешь. Если захочешь вернуться — я здесь."
+
+PRIOR_EVENT_QUESTION = "А что было до этого? Может, чуть раньше что-то уже задело?"
+OTHER_PERSON_QUESTION = "А кто это для тебя?"
+DISCOMFORT_BEFORE_Q = "Насколько тебе сейчас дискомфортно от этой ситуации, от 0 до 10?"
+DISCOMFORT_AFTER_Q = "И ещё раз, от 0 до 10: насколько тебе дискомфортно от этой ситуации сейчас?"
+DISCOMFORT_RETRY_TEXT = "Напиши, пожалуйста, просто число от 0 до 10."
+
+
+def _parse_discomfort(text: str) -> int | None:
+    m = re.fullmatch(r"\s*(\d{1,2})\s*[.!]?\s*", text)
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n if 0 <= n <= 10 else None
 
 SUMMARY_CONFIRM_SUFFIX = "\n\nПохоже ли это на правду?"
 PARANOID_BOT_TEMPLATE = (
@@ -74,6 +92,12 @@ D_FIELDS = {
 }
 
 
+def _shift_value(before, after):
+    if before is None or after is None:
+        return ""
+    return before - after
+
+
 def _row_for_sheets(row) -> list:
     return [
         row["started_at"], row["user_id"], row["username"] or "", row["session_num"],
@@ -82,6 +106,11 @@ def _row_for_sheets(row) -> list:
         row["d5_catastrophe_scale"], row["d6_historical"], row["d7_double_standard"], row["d8_semantic"],
         row["e_summary"], row["exit_step"] or "", "да" if row["completed"] else "нет",
         row["message_count"], row["ended_at"] or "",
+        row["event_before"] or "", row["other_person"] or "",
+        row["discomfort_before"] if row["discomfort_before"] is not None else "",
+        row["discomfort_after"] if row["discomfort_after"] is not None else "",
+        _shift_value(row["discomfort_before"], row["discomfort_after"]),
+        row["reflection_before_e"] or "",
     ]
 
 
@@ -121,7 +150,7 @@ async def _start_session(update: Update, context: ContextTypes.DEFAULT_TYPE, via
 
 
 async def _close_after_hostility(session_id: int, exit_step: str) -> None:
-    db.finish_relationship_session(session_id, exit_step=exit_step, completed=False)
+    db.finish_relationship_session(session_id, exit_step=exit_step)
     await _log_session(session_id)
 
 
@@ -147,15 +176,47 @@ async def _ask_feeling_question(session_id: int) -> str:
     return "Как ты себя чувствуешь в этот момент?"
 
 
+def _pick_reflection_quotes(row) -> tuple[str | None, str]:
+    """Самые содержательные ответы D1-D8 по длине (словам) — цитируем дословно,
+    ничего не пересказываем и не интерпретируем (см. ТЗ-доп. №2, п.2.3)."""
+    candidates = [
+        row[f] for f in (
+            "d1_logical", "d2_empirical", "d3_pragmatic", "d4_hedonistic",
+            "d5_catastrophe_scale", "d6_historical", "d7_double_standard", "d8_semantic",
+        )
+    ]
+    candidates = [c for c in candidates if c]
+    if not candidates:
+        return None, ""
+    top = sorted(candidates, key=lambda t: len(t.split()), reverse=True)[:2]
+    if len(top) == 1:
+        text = f'На одном из вопросов ты сказал(а): "{top[0]}".'
+    else:
+        text = f'На одном из вопросов ты сказал(а): "{top[0]}". А на другом: "{top[1]}".'
+    return text, " | ".join(top)
+
+
+async def _start_e_finale(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> int:
+    """Общая точка входа в финал разбора — что при нормальном прохождении всех D1-D8,
+    что при форсированном сворачивании по лимиту 40 сообщений (см. _maybe_wrap_to_summary).
+    Цитирует содержательные ответы (2.3), затем переспрашивает дискомфорт (2.1), и только
+    потом идёт Voss-резюме/подтверждение."""
+    row = db.get_relationship_session(session_id)
+    quote_text, stored_quotes = _pick_reflection_quotes(row)
+    if quote_text:
+        await update.effective_message.reply_text(quote_text)
+    db.update_relationship_session(session_id, reflection_before_e=stored_quotes)
+    await update.effective_message.reply_text(DISCOMFORT_AFTER_Q)
+    return E_DISCOMFORT_AFTER
+
+
 async def _maybe_wrap_to_summary(
     update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, count: int
-) -> bool:
+) -> int | None:
     if count > LIMIT_RELATIONSHIP_MESSAGES:
         await update.effective_message.reply_text(WRAP_TEXT)
-        question = await _ask_e_question(context, session_id)
-        await update.effective_message.reply_text(question)
-        return True
-    return False
+        return await _start_e_finale(update, context, session_id)
+    return None
 
 
 async def a_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -184,11 +245,85 @@ async def _process_a_event(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     db.update_relationship_session(session_id, a_event=text)
 
     if await llm.detect_crisis(text):
-        db.finish_relationship_session(session_id, exit_step="crisis", completed=False)
+        db.finish_relationship_session(session_id, exit_step="crisis")
         await _log_session(session_id)
         await update.effective_message.reply_text(CRISIS_TEXT, reply_markup=back_to_menu_keyboard())
         return ConversationHandler.END
 
+    if ENABLE_PRIOR_EVENT_QUESTION:
+        await update.effective_message.reply_text(PRIOR_EVENT_QUESTION)
+        return A_PRIOR_EVENT
+
+    return await _classify_or_ask_other_person(update, context, session_id)
+
+
+async def _classify_or_ask_other_person(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int
+) -> int:
+    row = db.get_relationship_session(session_id)
+    other = await llm.classify_other_person(row["a_event"])
+    if other:
+        db.update_relationship_session(session_id, other_person=other)
+        await update.effective_message.reply_text(Q_B)
+        return B_NARRATIVE
+    await update.effective_message.reply_text(OTHER_PERSON_QUESTION)
+    return A_OTHER_PERSON
+
+
+async def a_prior_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_a_prior", conv_handler=conv_handler, state=A_PRIOR_EVENT,
+        process=lambda text: _process_a_prior_event(update, context, text),
+    )
+
+
+async def _process_a_prior_event(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    session_id = context.user_data["rel_session_id"]
+
+    status = await hostility.precheck(
+        update, context, branch="relationships", step="A_prior",
+        bot_question=PRIOR_EVENT_QUESTION, text_override=text,
+    )
+    if status == "crisis":
+        await _close_after_hostility(session_id, "self_harm_crisis")
+        return ConversationHandler.END
+    if status == "hostile":
+        return A_PRIOR_EVENT
+    if status == "closed":
+        await _close_after_hostility(session_id, "hostility_closed")
+        return ConversationHandler.END
+
+    await _bump_messages(session_id)
+    db.update_relationship_session(session_id, event_before=text)
+    return await _classify_or_ask_other_person(update, context, session_id)
+
+
+async def a_other_person(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_a_other", conv_handler=conv_handler, state=A_OTHER_PERSON,
+        process=lambda text: _process_a_other_person(update, context, text),
+    )
+
+
+async def _process_a_other_person(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    session_id = context.user_data["rel_session_id"]
+
+    status = await hostility.precheck(
+        update, context, branch="relationships", step="A_other",
+        bot_question=OTHER_PERSON_QUESTION, text_override=text,
+    )
+    if status == "crisis":
+        await _close_after_hostility(session_id, "self_harm_crisis")
+        return ConversationHandler.END
+    if status == "hostile":
+        return A_OTHER_PERSON
+    if status == "closed":
+        await _close_after_hostility(session_id, "hostility_closed")
+        return ConversationHandler.END
+
+    await _bump_messages(session_id)
+    resolved = await llm.classify_other_person(text) or "другое"
+    db.update_relationship_session(session_id, other_person=resolved)
     await update.effective_message.reply_text(Q_B)
     return B_NARRATIVE
 
@@ -265,8 +400,9 @@ async def _process_b_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
     confirmed = context.user_data.pop("rel_pending_narrative")
     db.update_relationship_session(session_id, b_narrative_confirmed=confirmed)
 
-    if await _maybe_wrap_to_summary(update, context, session_id, count):
-        return E_SUMMARY
+    wrap_state = await _maybe_wrap_to_summary(update, context, session_id, count)
+    if wrap_state is not None:
+        return wrap_state
 
     await update.effective_message.reply_text(
         Q_C_TEMPLATE.format(narrative_short="то, как ты хочешь, ")
@@ -301,8 +437,9 @@ async def _process_c_consequence(update: Update, context: ContextTypes.DEFAULT_T
     count = await _bump_messages(session_id)
     db.update_relationship_session(session_id, c_consequence=text)
 
-    if await _maybe_wrap_to_summary(update, context, session_id, count):
-        return E_SUMMARY
+    wrap_state = await _maybe_wrap_to_summary(update, context, session_id, count)
+    if wrap_state is not None:
+        return wrap_state
 
     feeling_question = await _ask_feeling_question(session_id)
     context.user_data["rel_feeling_question"] = feeling_question
@@ -339,10 +476,47 @@ async def _process_c_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE,
     combined_consequence = f"{row['c_consequence']}\nЧувство: {text}"
     db.update_relationship_session(session_id, c_consequence=combined_consequence)
 
-    if await _maybe_wrap_to_summary(update, context, session_id, count):
-        return E_SUMMARY
+    wrap_state = await _maybe_wrap_to_summary(update, context, session_id, count)
+    if wrap_state is not None:
+        return wrap_state
 
-    advice = await llm.generate_i_would_advice(row["a_event"], row["b_narrative_confirmed"], combined_consequence)
+    await update.effective_message.reply_text(DISCOMFORT_BEFORE_Q)
+    return C_DISCOMFORT
+
+
+async def c_discomfort(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_c_discomfort", conv_handler=conv_handler, state=C_DISCOMFORT,
+        process=lambda text: _process_c_discomfort(update, context, text),
+    )
+
+
+async def _process_c_discomfort(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    session_id = context.user_data["rel_session_id"]
+
+    status = await hostility.precheck(
+        update, context, branch="relationships", step="C_discomfort",
+        bot_question=DISCOMFORT_BEFORE_Q, text_override=text,
+    )
+    if status == "crisis":
+        await _close_after_hostility(session_id, "self_harm_crisis")
+        return ConversationHandler.END
+    if status == "hostile":
+        return C_DISCOMFORT
+    if status == "closed":
+        await _close_after_hostility(session_id, "hostility_closed")
+        return ConversationHandler.END
+
+    value = _parse_discomfort(text)
+    if value is None:
+        await update.effective_message.reply_text(DISCOMFORT_RETRY_TEXT)
+        return C_DISCOMFORT
+
+    await _bump_messages(session_id)
+    db.update_relationship_session(session_id, discomfort_before=value)
+
+    row = db.get_relationship_session(session_id)
+    advice = await llm.generate_i_would_advice(row["a_event"], row["b_narrative_confirmed"], row["c_consequence"])
     await update.effective_message.reply_text(advice)
     context.user_data["rel_d_offer_text"] = advice
     return D_CONFIRM
@@ -376,7 +550,7 @@ async def _process_d_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     agreed = await llm.classify_yes_no(text)
     if not agreed:
-        db.finish_relationship_session(session_id, exit_step="declined_D", completed=False)
+        db.finish_relationship_session(session_id, exit_step="declined_D")
         await _log_session(session_id)
         await update.effective_message.reply_text(DECLINE_D_TEXT, reply_markup=back_to_menu_keyboard())
         context.user_data.pop("rel_session_id", None)
@@ -413,8 +587,9 @@ async def _process_d_question(update: Update, context: ContextTypes.DEFAULT_TYPE
     idx = context.user_data["rel_d_index"]
     db.update_relationship_session(session_id, **{D_FIELDS[idx]: text})
 
-    if await _maybe_wrap_to_summary(update, context, session_id, count):
-        return E_SUMMARY
+    wrap_state = await _maybe_wrap_to_summary(update, context, session_id, count)
+    if wrap_state is not None:
+        return wrap_state
 
     if idx < 8:
         idx += 1
@@ -424,11 +599,44 @@ async def _process_d_question(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.effective_message.reply_text(question)
         return D_QUESTION
 
+    return await _start_e_finale(update, context, session_id)
+
+
+async def e_discomfort_after(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_e_discomfort", conv_handler=conv_handler, state=E_DISCOMFORT_AFTER,
+        process=lambda text: _process_e_discomfort_after(update, context, text),
+    )
+
+
+async def _process_e_discomfort_after(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    session_id = context.user_data["rel_session_id"]
+
+    status = await hostility.precheck(
+        update, context, branch="relationships", step="E_discomfort",
+        bot_question=DISCOMFORT_AFTER_Q, text_override=text,
+    )
+    if status == "crisis":
+        await _close_after_hostility(session_id, "self_harm_crisis")
+        return ConversationHandler.END
+    if status == "hostile":
+        return E_DISCOMFORT_AFTER
+    if status == "closed":
+        await _close_after_hostility(session_id, "hostility_closed")
+        return ConversationHandler.END
+
+    value = _parse_discomfort(text)
+    if value is None:
+        await update.effective_message.reply_text(DISCOMFORT_RETRY_TEXT)
+        return E_DISCOMFORT_AFTER
+
+    await _bump_messages(session_id)
+    db.update_relationship_session(session_id, discomfort_after=value)
     return await _send_summary_confirm(update, context, session_id)
 
 
 async def _finish_e(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, insertion: str | None) -> int:
-    db.finish_relationship_session(session_id, exit_step="E", completed=True)
+    db.finish_relationship_session(session_id, exit_step="E")
     await _log_session(session_id)
 
     if insertion:
@@ -597,7 +805,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     session_id = context.user_data.pop("rel_session_id", None)
     if session_id:
-        db.finish_relationship_session(session_id, exit_step="cancelled", completed=False)
+        db.finish_relationship_session(session_id, exit_step="cancelled")
         await _log_session(session_id)
     await show_menu(update, context)
     return ConversationHandler.END
@@ -607,12 +815,16 @@ conv_handler = ConversationHandler(
     entry_points=[CallbackQueryHandler(entry, pattern="^menu:relationships$")],
     states={
         A_EVENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, a_event)],
+        A_PRIOR_EVENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, a_prior_event)],
+        A_OTHER_PERSON: [MessageHandler(filters.TEXT & ~filters.COMMAND, a_other_person)],
         B_NARRATIVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, b_narrative)],
         B_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, b_confirm)],
         C_CONSEQUENCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_consequence)],
         C_FEELING: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_feeling)],
+        C_DISCOMFORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_discomfort)],
         D_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, d_confirm)],
         D_QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, d_question)],
+        E_DISCOMFORT_AFTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_discomfort_after)],
         E_SUMMARY_CONFIRM: [CallbackQueryHandler(e_summary_confirm, pattern="^e_confirm:")],
         E_SUMMARY_CORRECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_summary_correction)],
         E_SUMMARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_summary)],

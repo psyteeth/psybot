@@ -19,6 +19,7 @@ from bot.config import (
     GOOGLE_SERVICE_ACCOUNT_JSON,
     LIMIT_OVERRIDES_REFRESH_SECONDS,
     LOG_SPREADSHEET_ID,
+    TEST_USER_IDS,
     UNLIMITED,
 )
 
@@ -36,20 +37,27 @@ RELATIONSHIP_HEADER = [
     "D4_гедонистический", "D5_шкала_катастроф", "D6_историческое",
     "D7_двойной_стандарт", "D8_семантическое", "E_итог", "шаг_выхода",
     "завершён", "число_сообщений", "timestamp_end",
+    # ТЗ-доп. №2, раздел 2 — добавлены в конец, чтобы не сломать старые строки
+    "событие_до", "кто_другой", "дискомфорт_до", "дискомфорт_после", "сдвиг",
+    "отражение_перед_E",
+    "тест",
 ]
 TEETH_HEADER = [
     "timestamp", "user_id", "username", "номер_сессии", "номер_зуба",
     "самое_страшное", "как_себя_чувствует", "острые_симптомы", "завершена",
+    "тест",
 ]
 CONCEPT_HEADER = [
     "timestamp", "user_id", "username", "вопрос", "ответ", "спор", "передано_админу",
     "вопрос_уточнённый",
+    "тест",
 ]
-LIMITS_HEADER = ["timestamp", "user_id", "username", "ветка", "событие"]
+LIMITS_HEADER = ["timestamp", "user_id", "username", "ветка", "событие", "тест"]
 HOSTILITY_HEADER = [
     "timestamp", "user_id", "username", "ветка", "шаг", "текст_выпада", "target",
     "confidence", "скрытая_потребность", "категория_панчлайна", "текст_ответа",
     "реакция_пользователя", "номер_выпада_в_сессии", "сессия_закрыта",
+    "тест",
 ]
 
 LIMIT_OVERRIDES_HEADER = ["user_id", "ветка", "лимит", "комментарий"]
@@ -80,6 +88,14 @@ def _build_client() -> Optional[gspread.Client]:
     except Exception:
         logger.exception("Не удалось инициализировать клиент Google Sheets")
         return None
+
+
+def _test_flag(row: list) -> str:
+    """user_id — вторая колонка (индекс 1) во всех пяти лог-листах."""
+    try:
+        return "да" if int(row[1]) in TEST_USER_IDS else "нет"
+    except (IndexError, ValueError, TypeError):
+        return "нет"
 
 
 class SheetsLogger:
@@ -117,7 +133,7 @@ class SheetsLogger:
 
     async def append(self, tab: str, row: list) -> None:
         try:
-            await asyncio.to_thread(self._append_sync, tab, row)
+            await asyncio.to_thread(self._append_sync, tab, [*row, _test_flag(row)])
         except Exception:  # noqa: BLE001
             logger.exception("append() к Sheets упал, разговор продолжается без лога")
 

@@ -1,9 +1,10 @@
+import datetime
 import logging
 
 from telegram.ext import ApplicationBuilder, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 
 from bot import db
-from bot.config import TELEGRAM_BOT_TOKEN
+from bot.config import STATS_WEEKLY_HOUR_UTC, STATS_WEEKLY_MINUTE_UTC, STATS_WEEKLY_WEEKDAY, TELEGRAM_BOT_TOKEN
 from bot.handlers import concept, menu, relationships, teeth
 
 logging.basicConfig(
@@ -33,12 +34,20 @@ def build_application():
     # диалог в чатах, которые используются только как источник проверки членства.
     application.add_handler(CommandHandler("start", menu.start_command, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("limits", menu.limits_command))
+    application.add_handler(CommandHandler("stats", menu.stats_command))
     application.add_handler(CommandHandler("chatid", menu.chatid_command))
     application.add_handler(
         CallbackQueryHandler(menu.back_to_menu_callback, pattern="^menu:back$")
     )
     application.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE, menu.fallback_text)
+    )
+
+    application.job_queue.run_daily(
+        menu.weekly_stats_job,
+        time=datetime.time(hour=STATS_WEEKLY_HOUR_UTC, minute=STATS_WEEKLY_MINUTE_UTC, tzinfo=datetime.timezone.utc),
+        days=(STATS_WEEKLY_WEEKDAY,),
+        name="weekly_stats",
     )
 
     return application

@@ -36,7 +36,12 @@ CREATE TABLE IF NOT EXISTS relationship_sessions (
     d7_double_standard TEXT,
     d8_semantic TEXT,
     e_summary TEXT,
-    exit_step TEXT
+    exit_step TEXT,
+    event_before TEXT,
+    other_person TEXT,
+    discomfort_before INTEGER,
+    discomfort_after INTEGER,
+    reflection_before_e TEXT
 );
 
 CREATE TABLE IF NOT EXISTS teeth_sessions (
@@ -93,13 +98,24 @@ def get_conn():
         conn.close()
 
 
+MIGRATIONS = [
+    "ALTER TABLE concept_usage ADD COLUMN period TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN event_before TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN other_person TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN discomfort_before INTEGER",
+    "ALTER TABLE relationship_sessions ADD COLUMN discomfort_after INTEGER",
+    "ALTER TABLE relationship_sessions ADD COLUMN reflection_before_e TEXT",
+]
+
+
 def init_db() -> None:
     with get_conn() as conn:
         conn.executescript(SCHEMA)
-        try:
-            conn.execute("ALTER TABLE concept_usage ADD COLUMN period TEXT")
-        except sqlite3.OperationalError:
-            pass  # колонка уже есть (миграция на уже существующей базе)
+        for stmt in MIGRATIONS:
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # колонка уже есть (миграция на уже существующей базе)
 
 
 # --- Пользователи ---
@@ -176,7 +192,20 @@ def get_relationship_session(session_id: int) -> Optional[sqlite3.Row]:
         ).fetchone()
 
 
-def finish_relationship_session(session_id: int, exit_step: str, completed: bool) -> None:
+RELATIONSHIP_REQUIRED_FIELDS = [
+    "a_event", "b_narrative_confirmed", "c_consequence",
+    "d1_logical", "d2_empirical", "d3_pragmatic", "d4_hedonistic",
+    "d5_catastrophe_scale", "d6_historical", "d7_double_standard", "d8_semantic",
+    "e_summary",
+]
+
+
+def finish_relationship_session(session_id: int, exit_step: str) -> None:
+    """completed вычисляется ЗДЕСЬ из реального содержимого полей, а не принимается
+    аргументом — раньше вызывающий код мог передать completed=True, даже если A-D
+    не были заполнены (например, разбор форсированно свернули после 40 сообщений)."""
+    row = get_relationship_session(session_id)
+    completed = all(row[f] for f in RELATIONSHIP_REQUIRED_FIELDS) if row else False
     update_relationship_session(
         session_id,
         ended_at=now(),

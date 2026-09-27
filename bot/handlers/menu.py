@@ -3,7 +3,7 @@ import logging
 from telegram import Update
 from telegram.ext import ContextTypes
 
-from bot import db, limits, llm
+from bot import db, limits, llm, stats
 from bot.config import ADMIN_CHAT_ID, NO_ACCESS_TEXT
 from bot.keyboards import main_menu_keyboard
 
@@ -87,6 +87,26 @@ async def limits_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "течение 5 минут. Чтобы дать тариф «родственник» — впиши user_id в лист «Родственники»."
     )
     await update.effective_message.reply_text("\n".join(lines))
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stats — сводка по реальным (не тестовым) данным. Только для ADMIN_CHAT_ID."""
+    caller_id = update.effective_user.id
+    if not ADMIN_CHAT_ID or str(caller_id) != str(ADMIN_CHAT_ID):
+        return
+    text = await stats.compute_summary()
+    await update.effective_message.reply_text(text)
+
+
+async def weekly_stats_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Автосводка раз в неделю (понедельник 10:00 по Бангкоку), см. bot/main.py."""
+    if not ADMIN_CHAT_ID:
+        return
+    text = await stats.compute_summary()
+    try:
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"📊 Еженедельная сводка\n\n{text}")
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось отправить еженедельную сводку админу")
 
 
 async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

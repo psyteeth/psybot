@@ -122,6 +122,34 @@ async def reformulate_narrative(event: str, raw_narrative: str, correction: str 
     return await _ask(REFORMULATE_SYSTEM, user_text, MODEL_SONNET, max_tokens=200)
 
 
+OTHER_PERSON_OPTIONS = [
+    "муж", "жена", "партнёр", "мама", "папа", "ребёнок",
+    "родственник", "начальник", "коллега", "друг", "другое",
+]
+
+OTHER_PERSON_SYSTEM = (
+    "Ты классификатор для психостоматологического бота, ветка «Отношения». По тексту пользователя "
+    "(описание события или прямой ответ на вопрос «кто это для тебя») определи, кем приходится "
+    "пользователю другой человек из ситуации. Варианты СТРОГО из списка: "
+    + ", ".join(OTHER_PERSON_OPTIONS) + ". Если из текста однозначно не понятно, кто это (например, "
+    "текст вообще не называет и не намекает на роль человека) — верни null. Ответь СТРОГО валидным "
+    'JSON без markdown: {"other_person": "<один вариант из списка>" или null}.'
+)
+
+
+async def classify_other_person(text: str) -> str | None:
+    try:
+        raw = await _ask(OTHER_PERSON_SYSTEM, text, MODEL_HAIKU, max_tokens=50)
+        data = json.loads(_strip_code_fence(raw))
+        value = data.get("other_person")
+        if value in OTHER_PERSON_OPTIONS:
+            return value
+        return None
+    except Exception:  # noqa: BLE001
+        logger.exception("classify_other_person упал/не распарсился")
+        return None
+
+
 CONFIRM_CLASSIFY_SYSTEM = (
     "Ты классификатор. Бот задал пользователю уточняющий вопрос («Правильно понимаю, что...?»). "
     "Пользователь ответил. Определи: он подтвердил формулировку (confirm) или поправляет её (correct)? "
