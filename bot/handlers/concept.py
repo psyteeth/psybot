@@ -76,6 +76,7 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
 
     context.user_data["concept_dispute_streak"] = 0
+    context.user_data.pop("concept_last_topic", None)
     hostility.reset_session(context)
     await query.edit_message_text(INTRO_TEXT, reply_markup=back_to_menu_keyboard())
     return ASKING
@@ -109,7 +110,8 @@ async def _process_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, quest
 
     db.increment_concept_messages(user.id)
 
-    if await llm.is_offtopic_concept(question):
+    prior_topic = context.user_data.get("concept_last_topic")
+    if await llm.is_offtopic_concept(question, prior_topic=prior_topic):
         await update.effective_message.reply_text(OFFTOPIC_TEXT, reply_markup=back_to_menu_keyboard())
         return ASKING
 
@@ -189,6 +191,7 @@ async def _process_clarify_reply(update: Update, context: ContextTypes.DEFAULT_T
         answer = f"{answer}\n\n{NOT_CONVERGED_TEXT}"
 
     await update.effective_message.reply_text(answer, reply_markup=back_to_menu_keyboard())
+    context.user_data["concept_last_topic"] = resolved_question
 
     await sheets_logger.append(
         "Концепция",
