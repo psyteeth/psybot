@@ -31,6 +31,14 @@ NOT_CONVERGED_TEXT = (
 )
 DISPUTE_STREAK_THRESHOLD = 2
 
+MAX_CLARIFY_ROUNDS = 3
+CLARIFY_OPENERS = [
+    "Так, давай разберёмся: ",
+    "Так-так-так, давай ещё раз, попытаюсь тебя понять: ",
+    "Давай я тебя ещё раз помучаю, потому что я не просто бот — я тупой бот, поэтому прости меня "
+    "за это, ещё раз спрошу: ",
+]
+
 RANT_OPENERS = [
     "Ого, походу, разметелило тебя там 😄 Слышу, без драмы.",
     "Чувствую жар в вопросе 🔥 Окей, без паники, разберёмся.",
@@ -102,9 +110,10 @@ async def _process_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, quest
     await _maybe_rant_opener(update, question)
 
     context.user_data["concept_raw_question"] = question
+    context.user_data["concept_clarify_round"] = 1
     clarified = await llm.clarify_question(question)
     context.user_data["concept_pending_clarified"] = clarified
-    await update.effective_message.reply_text(clarified)
+    await update.effective_message.reply_text(CLARIFY_OPENERS[0] + clarified)
     return CLARIFY
 
 
@@ -139,15 +148,20 @@ async def _process_clarify_reply(update: Update, context: ContextTypes.DEFAULT_T
     await _maybe_rant_opener(update, text)
 
     raw_question = context.user_data.get("concept_raw_question", "")
-    verdict = await llm.classify_confirmation(text)
+    round_ = context.user_data.get("concept_clarify_round", 1)
+
+    verdict = await llm.classify_confirmation(text) if round_ < MAX_CLARIFY_ROUNDS else "confirm"
 
     if verdict == "correct":
+        round_ += 1
+        context.user_data["concept_clarify_round"] = round_
         clarified = await llm.clarify_question(raw_question, correction=text)
         context.user_data["concept_pending_clarified"] = clarified
-        await update.effective_message.reply_text(clarified)
+        await update.effective_message.reply_text(CLARIFY_OPENERS[round_ - 1] + clarified)
         return CLARIFY
 
     resolved_question = context.user_data.pop("concept_pending_clarified", raw_question)
+    context.user_data.pop("concept_clarify_round", None)
 
     await concept_store.ensure_fresh()
     context_text = concept_store.main_narrative()
