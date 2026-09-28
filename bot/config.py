@@ -105,6 +105,9 @@ COUNT_SELF_REFUSED_TOWARD_LIMIT = False
 # по умолчанию НЕ считается в месячный лимит.
 COUNT_CRISIS_TOWARD_LIMIT = False
 
+# --- Ветка «Отношения»: «избегание или интеграция» (ТЗ-доп. №5) ---
+EXIT_INTENT_CONFIDENCE_THRESHOLD = 0.7
+
 # --- /stats: часовой пояс автосводки для админа (понедельник 10:00 Бангкок = 03:00 UTC) ---
 STATS_WEEKLY_WEEKDAY = 0  # 0 = понедельник (Monday в датах JobQueue)
 STATS_WEEKLY_HOUR_UTC = 3

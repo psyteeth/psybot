@@ -134,9 +134,12 @@ OTHER_PERSON_SYSTEM = (
     "Ты классификатор для психостоматологического бота, ветка «Отношения». По тексту пользователя "
     "(описание события или прямой ответ на вопрос «кто это для тебя») определи, кем приходится "
     "пользователю другой человек из ситуации. Варианты СТРОГО из списка: "
-    + ", ".join(OTHER_PERSON_OPTIONS) + ". Если из текста однозначно не понятно, кто это (например, "
-    "текст вообще не называет и не намекает на роль человека) — верни null. Ответь СТРОГО валидным "
-    'JSON без markdown: {"other_person": "<один вариант из списка>" или null}.'
+    + ", ".join(OTHER_PERSON_OPTIONS) + ". Рабочий контекст — зарплата, платить больше/меньше, "
+    "увольнение/уволиться, работа, задачи, дедлайн, директор, руководитель, выжимает (в рабочем "
+    "смысле) — указывает на «начальник», даже без прямого слова «начальник». Если из текста "
+    "однозначно не понятно, кто это (например, текст вообще не называет и не намекает на роль "
+    "человека) — верни null. Ответь СТРОГО валидным JSON без markdown: "
+    '{"other_person": "<один вариант из списка>" или null}.'
 )
 
 
@@ -263,7 +266,8 @@ DISPUTE_BASE_QUESTIONS = {
     2: "Эмпирическое. Правда ли это? Можешь ли ты знать абсолютно точно, что [он/она] должен был [...]? Где доказательства?",
     3: "Прагматическое. Как ты реагируешь, когда веришь в эту мысль? Помогает ли это убеждение получить то, чего ты хочешь?",
     4: "Гедонистический калькулятор. Что тебе даёт держаться за это убеждение и чего оно тебе стоит — сейчас и в долгую?",
-    5: "Шкала катастроф. От 0 до 100: насколько плохо то, что произошло? Где на этой шкале настоящие катастрофы?",
+    # 5 (шкала катастроф) — больше НЕ через adapt_dispute_question, фиксированный текст с опорой
+    # 100 (см. relationships.py::D5_QUESTION_TEMPLATE, ТЗ-доп. №5) — LLM не смягчает формулировку.
     6: "Историческое. Всегда ли в твоей жизни люди делали так, как «должны»? Откуда у тебя это правило?",
     7: "Двойной стандарт. Ты сам всегда поступаешь так, как требуешь от [него/неё]? Посоветовал бы ты близкому другу требовать этого?",
     8: "Семантическая переформулировка. Если заменить «[он/она] должен» на «я бы предпочёл, чтобы…», что меняется в ощущении?",
@@ -287,6 +291,104 @@ async def adapt_dispute_question(index: int, narrative: str) -> str:
     except Exception:  # noqa: BLE001
         logger.exception("adapt_dispute_question упал, используем базовую формулировку")
         return base
+
+
+# ---------------------------------------------------------------------------
+# ТЗ-доп. №5: шкала катастроф с опорой 100, «избегание или интеграция»
+# ---------------------------------------------------------------------------
+
+SCALE_REVISE_SYSTEM = (
+    "Пользователь оценил ситуацию на 100 из 100 по шкале катастроф. Бот спросил его: «это так же, "
+    "как лежать без рук и ног и жить с этой болью годами?». Определи по ответу пользователя: он "
+    "НАЗЫВАЕТ НОВОЕ число от 0 до 100 взамен прежней оценки (например «ну наверное не 100, скорее "
+    "70», «окей, пусть будет 60») — тогда верни это новое число. Если он просто подтверждает "
+    "прежнюю оценку, соглашается или не называет никакого нового числа — верни null. Ответь СТРОГО "
+    'валидным JSON без markdown: {"revised": <целое число 0-100> или null}.'
+)
+
+
+async def extract_revised_scale(text: str) -> int | None:
+    try:
+        raw = await _ask(SCALE_REVISE_SYSTEM, text, MODEL_HAIKU, max_tokens=30)
+        data = json.loads(_strip_code_fence(raw))
+        revised = data.get("revised")
+        if revised is None:
+            return None
+        revised = int(revised)
+        return revised if 0 <= revised <= 100 else None
+    except Exception:  # noqa: BLE001
+        logger.exception("extract_revised_scale упал/не распарсился")
+        return None
+
+
+EXIT_INTENT_SYSTEM = (
+    "Ты классификатор для ветки «Отношения» психостоматологического бота. Определи, говорит ли "
+    "пользователь о намерении ВЫЙТИ ИЗ КОНТАКТА с человеком из разбора: уволиться, уйти, развестись, "
+    "перестать общаться, заблокировать, «не терпеть», «с такими не общаюсь», «больше не буду с ним/"
+    "ней разговаривать» и т.п. — а не просто описывает чувства/факты без намерения разрыва контакта. "
+    "Ответь СТРОГО валидным JSON без markdown: "
+    '{"exit_intent": true или false, "confidence": число от 0.0 до 1.0}.'
+)
+
+
+async def classify_exit_intent(text: str) -> dict:
+    try:
+        raw = await _ask(EXIT_INTENT_SYSTEM, text, MODEL_HAIKU, max_tokens=50)
+        data = json.loads(_strip_code_fence(raw))
+        return {
+            "exit_intent": bool(data.get("exit_intent", False)),
+            "confidence": float(data.get("confidence", 0.0)),
+        }
+    except Exception:  # noqa: BLE001
+        logger.exception("classify_exit_intent упал/не распарсился")
+        return {"exit_intent": False, "confidence": 0.0}
+
+
+DISOWNED_BEHAVIOR_SYSTEM = (
+    "Ты — ассистент психостоматологического бота, ветка «Отношения». Тебе даны событие (A) и "
+    "долженствование пользователя (B) про другого человека. Опиши КОРОТКОЙ фразой (3-6 слов, через "
+    "запятую, в форме глаголов-инфинитивов) конкретное поведение ДРУГОГО человека, которое "
+    "пользователь описывает как проблемное — например «приказывать, требовать подчинения, ставить "
+    "свои интересы выше», «обесценивать, повышать голос», «игнорировать, не отвечать». Только "
+    "поведение, без оценок и без имён. Ответь только этой фразой, без пояснений."
+)
+
+
+async def extract_disowned_behavior(event: str, narrative: str) -> str:
+    user_text = f"Событие (A): {event}\nДолженствование (B): {narrative}"
+    try:
+        return await _ask(DISOWNED_BEHAVIOR_SYSTEM, user_text, MODEL_HAIKU, max_tokens=60)
+    except Exception:  # noqa: BLE001
+        logger.exception("extract_disowned_behavior упал")
+        return "вести себя так же, как он"
+
+
+AVOIDANCE_INTEGRATION_SYSTEM = (
+    "Ты классификатор для ветки «Отношения» психостоматологического бота. Пользователь только что "
+    "выразил намерение выйти из контакта с человеком из разбора (уволиться, уйти, перестать "
+    "общаться и т.п.). Бот спросил его прямо: это больше про то, что он сам лучше, а другой человек "
+    "плохой, и с такими не по пути (избегание) — или про то, что он сам начинает позволять себе "
+    "вести себя так же, как тот человек, — учится у него этому поведению (интеграция)? Определи по "
+    "ответу пользователя:\n"
+    '- "avoidance" — явно про первое: другой плохой, я лучше, ухожу, чтобы не сталкиваться.\n'
+    '- "integration" — явно про второе: замечает у себя такое же поведение, перенимает его.\n'
+    '- "unclear" — ответ не даёт понять однозначно, или человек говорит про оба варианта сразу, '
+    "или уклоняется.\n\n"
+    "Ответь СТРОГО одним словом: avoidance, integration или unclear."
+)
+
+
+async def classify_avoidance_integration(text: str) -> str:
+    try:
+        result = await _ask(AVOIDANCE_INTEGRATION_SYSTEM, text, MODEL_SONNET, max_tokens=10)
+        result = result.lower().strip()
+        for verdict in ("avoidance", "integration", "unclear"):
+            if verdict in result:
+                return verdict
+        return "unclear"
+    except Exception:  # noqa: BLE001
+        logger.exception("classify_avoidance_integration упал")
+        return "unclear"
 
 
 E_ANALYZE_SYSTEM = (
@@ -846,17 +948,32 @@ SESSION_SUMMARY_SYSTEM = (
     + GENDER_NEUTRAL_RULE
 )
 
+NO_FALSE_IMPROVEMENT_RULE = (
+    " ЖЁСТКОЕ ПРАВИЛО: цифра дискомфорта у человека НЕ снизилась (было {before}, стало {after}) — "
+    "категорически ЗАПРЕЩЕНО писать фразы вроде «тебе уже легче», «видно, что стало спокойнее», "
+    "«твоё состояние улучшается» или любой намёк на то, что стало лучше. Можешь нейтрально "
+    "отметить, что ощущение не изменилось, или просто не упоминать динамику дискомфорта вообще."
+)
+
 
 async def generate_session_summary(
-    event: str, narrative: str, consequence: str, d_answers: dict[int, str]
+    event: str,
+    narrative: str,
+    consequence: str,
+    d_answers: dict[int, str],
+    discomfort_before: int | None = None,
+    discomfort_after: int | None = None,
 ) -> str:
     d_text = "\n".join(f"D{i}: {d_answers.get(i, '')}" for i in range(1, 9) if d_answers.get(i))
     user_text = (
         f"Событие (A): {event}\nДолженствование (B): {narrative}\nСледствие/чувство (C): {consequence}\n"
         f"Ответы на восемь оспариваний:\n{d_text}"
     )
+    system = SESSION_SUMMARY_SYSTEM
+    if discomfort_before is not None and discomfort_after is not None and discomfort_after >= discomfort_before:
+        system += NO_FALSE_IMPROVEMENT_RULE.format(before=discomfort_before, after=discomfort_after)
     try:
-        return await _ask(SESSION_SUMMARY_SYSTEM, user_text, MODEL_SONNET, max_tokens=400)
+        return await _ask(system, user_text, MODEL_SONNET, max_tokens=400)
     except Exception:  # noqa: BLE001
         logger.exception("generate_session_summary упал")
         return "Похоже, мы разобрали и событие, и то, чего ты ждал(а) от другого человека, и что при этом чувствуешь(ла)."

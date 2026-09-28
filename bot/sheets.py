@@ -44,6 +44,9 @@ RELATIONSHIP_HEADER = [
     "запрос_на_себя", "шаг_проверки", "исходный_ответ", "переформулирован", "отказ_самообвинение",
     # ТЗ-доп. №4
     "примечание",
+    # ТЗ-доп. №5
+    "D5_комментарий", "D5_исходное",
+    "выход_из_контакта", "шаг_выхода_из_контакта", "избегание_или_интеграция", "ответ_на_уточнение",
     "тест",
 ]
 TEETH_HEADER = [
@@ -66,6 +69,10 @@ HOSTILITY_HEADER = [
 
 ADMIN_MESSAGES_HEADER = ["timestamp", "user_id", "текст", "статус", "тест"]
 
+DIALOGUES_HEADER = [
+    "timestamp", "user_id", "username", "ветка", "номер_разбора", "шаг", "кто", "текст", "тест",
+]
+
 LIMIT_OVERRIDES_HEADER = ["user_id", "ветка", "лимит", "комментарий"]
 LIMIT_OVERRIDES_TAB = "Лимиты (ручные)"
 
@@ -79,6 +86,7 @@ SHEET_TABS = {
     "Лимиты": LIMITS_HEADER,
     "Выпады": HOSTILITY_HEADER,
     "Админ-сообщения": ADMIN_MESSAGES_HEADER,
+    "Диалоги": DIALOGUES_HEADER,
     LIMIT_OVERRIDES_TAB: LIMIT_OVERRIDES_HEADER,
     RELATIVES_TAB: RELATIVES_HEADER,
 }

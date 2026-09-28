@@ -47,7 +47,13 @@ CREATE TABLE IF NOT EXISTS relationship_sessions (
     self_original_answer TEXT,
     self_reformulated INTEGER NOT NULL DEFAULT 0,
     self_refused INTEGER NOT NULL DEFAULT 0,
-    note TEXT
+    note TEXT,
+    d5_comment TEXT,
+    d5_original INTEGER,
+    exit_intent INTEGER NOT NULL DEFAULT 0,
+    exit_intent_step TEXT,
+    avoidance_or_integration TEXT,
+    exit_intent_answer TEXT
 );
 
 CREATE TABLE IF NOT EXISTS teeth_sessions (
@@ -117,6 +123,12 @@ MIGRATIONS = [
     "ALTER TABLE relationship_sessions ADD COLUMN self_reformulated INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE relationship_sessions ADD COLUMN self_refused INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE relationship_sessions ADD COLUMN note TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN d5_comment TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN d5_original INTEGER",
+    "ALTER TABLE relationship_sessions ADD COLUMN exit_intent INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE relationship_sessions ADD COLUMN exit_intent_step TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN avoidance_or_integration TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN exit_intent_answer TEXT",
 ]
 
 

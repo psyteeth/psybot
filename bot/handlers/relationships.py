@@ -18,6 +18,7 @@ from bot import db, debounce, hostility, limits, llm
 from bot.config import (
     ADMIN_USERNAME,
     ENABLE_PRIOR_EVENT_QUESTION,
+    EXIT_INTENT_CONFIDENCE_THRESHOLD,
     LIMIT_RELATIONSHIP_MESSAGES,
     RELATIONSHIP_LIMIT_TEXT,
     ROADMAP_URL,
@@ -30,12 +31,17 @@ from bot.sheets import sheets_logger
 
 logger = logging.getLogger(__name__)
 
+# Новые состояния (D5_QUESTION, D5_HUNDRED_FOLLOWUP, EXIT_INTENT_CLARIFY) дописаны В КОНЕЦ,
+# а не вставлены по смыслу между старыми — persistent=True хранит состояние как целое число
+# на диске (PicklePersistence), и перенумерация уже существующих состояний сломала бы разборы,
+# начатые до деплоя этого изменения.
 (
     A_EVENT, A_PRIOR_EVENT, A_OTHER_PERSON,
     B_NARRATIVE, B_CONFIRM, C_CONSEQUENCE, C_FEELING, C_DISCOMFORT,
     D_CONFIRM, D_QUESTION,
     E_DISCOMFORT_AFTER, E_SUMMARY_CONFIRM, E_SUMMARY_CORRECTION, E_SUMMARY, E_FOLLOWUP,
-) = range(15)
+    D5_QUESTION, D5_HUNDRED_FOLLOWUP, EXIT_INTENT_CLARIFY,
+) = range(18)
 
 Q_A = (
     "Опиши событие или поведение другого человека, от которого тебе дискомфортно: "
@@ -66,6 +72,57 @@ def _parse_discomfort(text: str) -> int | None:
         return None
     n = int(m.group(1))
     return n if 0 <= n <= 10 else None
+
+
+# --- ТЗ-доп. №5, раздел 1: шкала катастроф с опорой 100 ---
+D5_QUESTION_TEMPLATE = (
+    "Шкала катастроф от 0 до 100. Сейчас будет жёстко.\n\n"
+    "100 — это полная жопа: ты попал в катастрофу, лежишь в больнице, у тебя нет рук или ног, всё "
+    "болит, и так ты будешь жить ещё много лет.\n\n"
+    "Оцени по этой шкале, от 0 до этого 100, то, что происходит у тебя: {situation}"
+)
+D5_HUNDRED_FOLLOWUP_Q = "Это так же, как лежать без рук и ног и жить с этой болью годами?"
+SCALE_100_RETRY_TEXT = "Напиши, пожалуйста, просто число от 0 до 100."
+
+
+def _parse_scale_100(text: str) -> int | None:
+    m = re.fullmatch(r"\s*(\d{1,3})\s*[.!]?\s*", text)
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n if 0 <= n <= 100 else None
+
+
+# --- ТЗ-доп. №5, раздел 2: избегание или интеграция ---
+EXIT_INTENT_STEP1_TEMPLATE = (
+    "Стоп, это очень важный момент, на него стоит обратить внимание.\n\n"
+    "Скажи честно: это больше про то, что ты лучше, а он плохой, и с такими тебе не по пути? Или "
+    "про то, что ты начинаешь позволять себе вести себя так же, как он, — {behavior} — по "
+    "отношению к людям?"
+)
+AVOIDANCE_TEXT = (
+    "Если это избегание — ты лучше, он плохой, и с такими ты больше не общаешься, — "
+    "психостоматология рекомендует здесь хорошенечко подумать."
+)
+INTEGRATION_TEXT = (
+    "Если ты начинаешь позволять себе вести себя так же — {behavior} — по отношению к людям, это "
+    "очень интересный момент. Обрати на него внимание: может быть, это начало чего-то нового в "
+    "жизни."
+)
+EXIT_INTENT_CLOSING_TEXT = (
+    f"Хочется подробностей — приходи в работу с зубами: {ROADMAP_URL} или пиши {ADMIN_USERNAME}."
+)
+
+
+async def _check_exit_intent(context: ContextTypes.DEFAULT_TYPE, session_id: int, step: str, text: str) -> None:
+    """Запоминает только ПЕРВОЕ срабатывание за сессию (шаг_выхода_из_контакта — одно значение),
+    дальше не тратим лишние вызовы классификатора."""
+    if context.user_data.get("exit_intent_flagged"):
+        return
+    verdict = await llm.classify_exit_intent(text)
+    if verdict["exit_intent"] and verdict["confidence"] >= EXIT_INTENT_CONFIDENCE_THRESHOLD:
+        context.user_data["exit_intent_flagged"] = True
+        db.update_relationship_session(session_id, exit_intent=1, exit_intent_step=step)
 
 
 SELF_REFUSAL_TEXT = (
@@ -126,12 +183,37 @@ def _row_for_sheets(row) -> list:
         "да" if row["self_reformulated"] else "нет",
         "да" if row["self_refused"] else "нет",
         row["note"] or "",
+        row["d5_comment"] or "",
+        row["d5_original"] if row["d5_original"] is not None else "",
+        "да" if row["exit_intent"] else "нет",
+        row["exit_intent_step"] or "",
+        row["avoidance_or_integration"] or "",
+        row["exit_intent_answer"] or "",
     ]
 
 
 async def _log_session(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> None:
     row = db.get_relationship_session(session_id)
     await sheets_logger.append("Отношения", _row_for_sheets(row))
+
+
+async def _log_turn(session_id: int, user, step: str, who: str, text: str) -> None:
+    """ТЗ-доп. №5, п.3.1 — полный лог диалога, одна строка на реплику (и бота, и человека),
+    отдельно от итоговой строки в «Отношения»."""
+    row = db.get_relationship_session(session_id)
+    session_num = row["session_num"] if row else ""
+    await sheets_logger.append(
+        "Диалоги",
+        [db.now(), user.id, user.username or "", "relationships", session_num, step, who, (text or "")[:2000]],
+    )
+
+
+async def _send(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, step: str, text: str, **kwargs):
+    """reply_text + запись реплики бота в «Диалоги» одним вызовом."""
+    target = update.callback_query.message if update.callback_query else update.effective_message
+    result = await target.reply_text(text, **kwargs)
+    await _log_turn(session_id, update.effective_user, step, "бот", text)
+    return result
 
 
 async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -172,6 +254,7 @@ async def _start_session(update: Update, context: ContextTypes.DEFAULT_TYPE, via
     context.user_data["rel_session_id"] = session_id
     hostility.reset_session(context)
     await send(Q_A)
+    await _log_turn(session_id, user, "A", "бот", Q_A)
     return A_EVENT
 
 
@@ -191,7 +274,7 @@ async def _refuse_self_target(update: Update, context: ContextTypes.DEFAULT_TYPE
     db.update_relationship_session(session_id, self_refused=1)
     db.finish_relationship_session(session_id, exit_step="отказ_самообвинение")
     await _log_session(update, context, session_id)
-    await update.effective_message.reply_text(SELF_REFUSAL_TEXT, reply_markup=menu_and_teeth_keyboard())
+    await _send(update, context, session_id, "self_target_refusal", SELF_REFUSAL_TEXT, reply_markup=menu_and_teeth_keyboard())
     await hostility.maybe_send_self_harm_note(update, context)
     context.user_data.pop("rel_session_id", None)
     context.user_data.pop("rel_self_attempts", None)
@@ -229,7 +312,7 @@ async def _check_self_target(
     context.user_data["rel_self_attempts"] = attempts + 1
     other_person = classification.get("other_person") or (row["other_person"] if step == "B" else None)
     reframe = await llm.generate_self_reframe(step, text, other_person)
-    await update.effective_message.reply_text(reframe)
+    await _send(update, context, session_id, step, reframe)
     return A_EVENT if step == "A" else B_NARRATIVE
 
 
@@ -252,12 +335,13 @@ async def _ask_feeling_question(session_id: int) -> str:
 
 
 def _pick_reflection_quotes(row) -> tuple[str | None, str]:
-    """Самые содержательные ответы D1-D8 по длине (словам) — цитируем дословно,
-    ничего не пересказываем и не интерпретируем (см. ТЗ-доп. №2, п.2.3)."""
+    """Самые содержательные ответы D1-D4/D6-D8 по длине (словам) — цитируем дословно,
+    ничего не пересказываем и не интерпретируем (см. ТЗ-доп. №2, п.2.3). D5 — число, не
+    описательный текст, в цитаты не годится (ТЗ-доп. №5)."""
     candidates = [
         row[f] for f in (
             "d1_logical", "d2_empirical", "d3_pragmatic", "d4_hedonistic",
-            "d5_catastrophe_scale", "d6_historical", "d7_double_standard", "d8_semantic",
+            "d6_historical", "d7_double_standard", "d8_semantic",
         )
     ]
     candidates = [c for c in candidates if c]
@@ -279,9 +363,9 @@ async def _start_e_finale(update: Update, context: ContextTypes.DEFAULT_TYPE, se
     row = db.get_relationship_session(session_id)
     quote_text, stored_quotes = _pick_reflection_quotes(row)
     if quote_text:
-        await update.effective_message.reply_text(quote_text)
+        await _send(update, context, session_id, "E_reflection", quote_text)
     db.update_relationship_session(session_id, reflection_before_e=stored_quotes)
-    await update.effective_message.reply_text(DISCOMFORT_AFTER_Q)
+    await _send(update, context, session_id, "E_discomfort_after", DISCOMFORT_AFTER_Q)
     return E_DISCOMFORT_AFTER
 
 
@@ -289,7 +373,7 @@ async def _maybe_wrap_to_summary(
     update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, count: int
 ) -> int | None:
     if count > LIMIT_RELATIONSHIP_MESSAGES:
-        await update.effective_message.reply_text(WRAP_TEXT)
+        await _send(update, context, session_id, "wrap", WRAP_TEXT)
         return await _start_e_finale(update, context, session_id)
     return None
 
@@ -303,6 +387,7 @@ async def a_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _process_a_event(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     session_id = context.user_data["rel_session_id"]
+    await _log_turn(session_id, update.effective_user, "A", "человек", text)
 
     status = await hostility.precheck(
         update, context, branch="relationships", step="A", bot_question=Q_A, text_override=text
@@ -324,7 +409,7 @@ async def _process_a_event(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         return self_state
 
     if ENABLE_PRIOR_EVENT_QUESTION:
-        await update.effective_message.reply_text(PRIOR_EVENT_QUESTION)
+        await _send(update, context, session_id, "A_prior", PRIOR_EVENT_QUESTION)
         return A_PRIOR_EVENT
 
     return await _classify_or_ask_other_person(update, context, session_id)
@@ -337,9 +422,9 @@ async def _classify_or_ask_other_person(
     other = await llm.classify_other_person(row["a_event"])
     if other:
         db.update_relationship_session(session_id, other_person=other)
-        await update.effective_message.reply_text(Q_B)
+        await _send(update, context, session_id, "B", Q_B)
         return B_NARRATIVE
-    await update.effective_message.reply_text(OTHER_PERSON_QUESTION)
+    await _send(update, context, session_id, "A_other", OTHER_PERSON_QUESTION)
     return A_OTHER_PERSON
 
 
@@ -352,6 +437,7 @@ async def a_prior_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _process_a_prior_event(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     session_id = context.user_data["rel_session_id"]
+    await _log_turn(session_id, update.effective_user, "A_prior", "человек", text)
 
     status = await hostility.precheck(
         update, context, branch="relationships", step="A_prior",
@@ -380,6 +466,7 @@ async def a_other_person(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _process_a_other_person(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     session_id = context.user_data["rel_session_id"]
+    await _log_turn(session_id, update.effective_user, "A_other", "человек", text)
 
     status = await hostility.precheck(
         update, context, branch="relationships", step="A_other",
@@ -397,7 +484,7 @@ async def _process_a_other_person(update: Update, context: ContextTypes.DEFAULT_
     await _bump_messages(session_id)
     resolved = await llm.classify_other_person(text) or "другое"
     db.update_relationship_session(session_id, other_person=resolved)
-    await update.effective_message.reply_text(Q_B)
+    await _send(update, context, session_id, "B", Q_B)
     return B_NARRATIVE
 
 
@@ -410,6 +497,7 @@ async def b_narrative(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _process_b_narrative(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     session_id = context.user_data["rel_session_id"]
+    await _log_turn(session_id, update.effective_user, "B", "человек", text)
 
     status = await hostility.precheck(
         update, context, branch="relationships", step="B", bot_question=Q_B, text_override=text
@@ -434,7 +522,7 @@ async def _process_b_narrative(update: Update, context: ContextTypes.DEFAULT_TYP
     row = db.get_relationship_session(session_id)
     reformulated = await llm.reformulate_narrative(row["a_event"], text)
     context.user_data["rel_pending_narrative"] = reformulated
-    await update.effective_message.reply_text(reformulated)
+    await _send(update, context, session_id, "B_confirm", reformulated)
     return B_CONFIRM
 
 
@@ -448,6 +536,7 @@ async def b_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _process_b_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     session_id = context.user_data["rel_session_id"]
     pending_question = context.user_data.get("rel_pending_narrative", "")
+    await _log_turn(session_id, update.effective_user, "B_confirm", "человек", text)
 
     status = await hostility.precheck(
         update, context, branch="relationships", step="B_confirm",
@@ -471,7 +560,7 @@ async def _process_b_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
             row["a_event"], context.user_data["rel_raw_narrative"], correction=text
         )
         context.user_data["rel_pending_narrative"] = reformulated
-        await update.effective_message.reply_text(reformulated)
+        await _send(update, context, session_id, "B_confirm", reformulated)
         return B_CONFIRM
 
     confirmed = context.user_data.pop("rel_pending_narrative")
@@ -481,9 +570,8 @@ async def _process_b_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if wrap_state is not None:
         return wrap_state
 
-    await update.effective_message.reply_text(
-        Q_C_TEMPLATE.format(narrative_short="то, как ты хочешь, ")
-    )
+    c_question = Q_C_TEMPLATE.format(narrative_short="то, как ты хочешь, ")
+    await _send(update, context, session_id, "C", c_question)
     return C_CONSEQUENCE
 
 
@@ -496,6 +584,7 @@ async def c_consequence(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _process_c_consequence(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     session_id = context.user_data["rel_session_id"]
+    await _log_turn(session_id, update.effective_user, "C", "человек", text)
 
     status = await hostility.precheck(
         update, context, branch="relationships", step="C",
@@ -514,13 +603,15 @@ async def _process_c_consequence(update: Update, context: ContextTypes.DEFAULT_T
     count = await _bump_messages(session_id)
     db.update_relationship_session(session_id, c_consequence=text)
 
+    await _check_exit_intent(context, session_id, "C", text)
+
     wrap_state = await _maybe_wrap_to_summary(update, context, session_id, count)
     if wrap_state is not None:
         return wrap_state
 
     feeling_question = await _ask_feeling_question(session_id)
     context.user_data["rel_feeling_question"] = feeling_question
-    await update.effective_message.reply_text(feeling_question)
+    await _send(update, context, session_id, "C_feeling", feeling_question)
     return C_FEELING
 
 
@@ -534,6 +625,7 @@ async def c_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _process_c_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     session_id = context.user_data["rel_session_id"]
     feeling_question = context.user_data.get("rel_feeling_question", "")
+    await _log_turn(session_id, update.effective_user, "C_feeling", "человек", text)
 
     status = await hostility.precheck(
         update, context, branch="relationships", step="C_feeling",
@@ -553,11 +645,13 @@ async def _process_c_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE,
     combined_consequence = f"{row['c_consequence']}\nЧувство: {text}"
     db.update_relationship_session(session_id, c_consequence=combined_consequence)
 
+    await _check_exit_intent(context, session_id, "C_feeling", text)
+
     wrap_state = await _maybe_wrap_to_summary(update, context, session_id, count)
     if wrap_state is not None:
         return wrap_state
 
-    await update.effective_message.reply_text(DISCOMFORT_BEFORE_Q)
+    await _send(update, context, session_id, "C_discomfort", DISCOMFORT_BEFORE_Q)
     return C_DISCOMFORT
 
 
@@ -570,6 +664,7 @@ async def c_discomfort(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _process_c_discomfort(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     session_id = context.user_data["rel_session_id"]
+    await _log_turn(session_id, update.effective_user, "C_discomfort", "человек", text)
 
     status = await hostility.precheck(
         update, context, branch="relationships", step="C_discomfort",
@@ -586,7 +681,7 @@ async def _process_c_discomfort(update: Update, context: ContextTypes.DEFAULT_TY
 
     value = _parse_discomfort(text)
     if value is None:
-        await update.effective_message.reply_text(DISCOMFORT_RETRY_TEXT)
+        await _send(update, context, session_id, "C_discomfort", DISCOMFORT_RETRY_TEXT)
         return C_DISCOMFORT
 
     await _bump_messages(session_id)
@@ -594,7 +689,7 @@ async def _process_c_discomfort(update: Update, context: ContextTypes.DEFAULT_TY
 
     row = db.get_relationship_session(session_id)
     advice = await llm.generate_i_would_advice(row["a_event"], row["b_narrative_confirmed"], row["c_consequence"])
-    await update.effective_message.reply_text(advice)
+    await _send(update, context, session_id, "D_confirm", advice)
     context.user_data["rel_d_offer_text"] = advice
     return D_CONFIRM
 
@@ -609,6 +704,7 @@ async def d_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _process_d_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     session_id = context.user_data["rel_session_id"]
     offer_text = context.user_data.get("rel_d_offer_text", "")
+    await _log_turn(session_id, update.effective_user, "D_confirm", "человек", text)
 
     status = await hostility.precheck(
         update, context, branch="relationships", step="D_confirm",
@@ -629,7 +725,7 @@ async def _process_d_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if not agreed:
         db.finish_relationship_session(session_id, exit_step="declined_D")
         await _log_session(update, context, session_id)
-        await update.effective_message.reply_text(DECLINE_D_TEXT, reply_markup=back_to_menu_keyboard())
+        await _send(update, context, session_id, "D_confirm", DECLINE_D_TEXT, reply_markup=back_to_menu_keyboard())
         await hostility.maybe_send_self_harm_note(update, context)
         context.user_data.pop("rel_session_id", None)
         return ConversationHandler.END
@@ -637,7 +733,7 @@ async def _process_d_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
     row = db.get_relationship_session(session_id)
     question = await llm.adapt_dispute_question(1, row["b_narrative_confirmed"])
     context.user_data["rel_d_index"] = 1
-    await update.effective_message.reply_text(question)
+    await _send(update, context, session_id, "D1", question)
     return D_QUESTION
 
 
@@ -650,6 +746,8 @@ async def d_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _process_d_question(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     session_id = context.user_data["rel_session_id"]
+    idx = context.user_data["rel_d_index"]
+    await _log_turn(session_id, update.effective_user, f"D{idx}", "человек", text)
 
     # По умолчанию модуль панчлайнов на шаге D выключен: сопротивление вроде
     # «да это бред, он всё равно виноват» — материал самого разбора, не выпад
@@ -662,8 +760,9 @@ async def _process_d_question(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
 
     count = await _bump_messages(session_id)
-    idx = context.user_data["rel_d_index"]
     db.update_relationship_session(session_id, **{D_FIELDS[idx]: text})
+
+    await _check_exit_intent(context, session_id, f"D{idx}", text)
 
     wrap_state = await _maybe_wrap_to_summary(update, context, session_id, count)
     if wrap_state is not None:
@@ -672,12 +771,87 @@ async def _process_d_question(update: Update, context: ContextTypes.DEFAULT_TYPE
     if idx < 8:
         idx += 1
         context.user_data["rel_d_index"] = idx
+        if idx == 5:
+            row = db.get_relationship_session(session_id)
+            question = D5_QUESTION_TEMPLATE.format(situation=row["a_event"])
+            await _send(update, context, session_id, "D5", question)
+            return D5_QUESTION
         row = db.get_relationship_session(session_id)
         question = await llm.adapt_dispute_question(idx, row["b_narrative_confirmed"])
-        await update.effective_message.reply_text(question)
+        await _send(update, context, session_id, f"D{idx}", question)
         return D_QUESTION
 
     return await _start_e_finale(update, context, session_id)
+
+
+async def d5_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_d5", conv_handler=conv_handler, state=D5_QUESTION,
+        process=lambda text: _process_d5_question(update, context, text),
+    )
+
+
+async def _process_d5_question(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    session_id = context.user_data["rel_session_id"]
+    await _log_turn(session_id, update.effective_user, "D5", "человек", text)
+
+    status = await hostility.precheck(
+        update, context, branch="relationships", step="D5", skip_hostility=True, text_override=text
+    )
+    if status == "crisis":
+        await _close_after_hostility(update, context, session_id, "crisis")
+        return ConversationHandler.END
+
+    value = _parse_scale_100(text)
+    if value is None:
+        await _send(update, context, session_id, "D5", SCALE_100_RETRY_TEXT)
+        return D5_QUESTION
+
+    await _bump_messages(session_id)
+    db.update_relationship_session(session_id, d5_catastrophe_scale=value, d5_comment=text)
+
+    if value == 100:
+        await _send(update, context, session_id, "D5_hundred", D5_HUNDRED_FOLLOWUP_Q)
+        return D5_HUNDRED_FOLLOWUP
+
+    return await _advance_past_d5(update, context, session_id)
+
+
+async def _advance_past_d5(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> int:
+    row = db.get_relationship_session(session_id)
+    context.user_data["rel_d_index"] = 6
+    question = await llm.adapt_dispute_question(6, row["b_narrative_confirmed"])
+    await _send(update, context, session_id, "D6", question)
+    return D_QUESTION
+
+
+async def d5_hundred_followup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_d5_hundred", conv_handler=conv_handler, state=D5_HUNDRED_FOLLOWUP,
+        process=lambda text: _process_d5_hundred_followup(update, context, text),
+    )
+
+
+async def _process_d5_hundred_followup(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    session_id = context.user_data["rel_session_id"]
+    await _log_turn(session_id, update.effective_user, "D5_hundred", "человек", text)
+
+    status = await hostility.precheck(
+        update, context, branch="relationships", step="D5_hundred", skip_hostility=True, text_override=text
+    )
+    if status == "crisis":
+        await _close_after_hostility(update, context, session_id, "crisis")
+        return ConversationHandler.END
+
+    await _bump_messages(session_id)
+
+    # Принимаем ответ как есть, не спорим — но если человек сам называет новое число вместо
+    # прежних 100, записываем ревизию, исходную оценку сохраняя отдельно (ТЗ-доп. №5, п.1).
+    revised = await llm.extract_revised_scale(text)
+    if revised is not None and revised != 100:
+        db.update_relationship_session(session_id, d5_original=100, d5_catastrophe_scale=revised)
+
+    return await _advance_past_d5(update, context, session_id)
 
 
 async def e_discomfort_after(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -689,6 +863,7 @@ async def e_discomfort_after(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 async def _process_e_discomfort_after(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     session_id = context.user_data["rel_session_id"]
+    await _log_turn(session_id, update.effective_user, "E_discomfort", "человек", text)
 
     status = await hostility.precheck(
         update, context, branch="relationships", step="E_discomfort",
@@ -705,7 +880,7 @@ async def _process_e_discomfort_after(update: Update, context: ContextTypes.DEFA
 
     value = _parse_discomfort(text)
     if value is None:
-        await update.effective_message.reply_text(DISCOMFORT_RETRY_TEXT)
+        await _send(update, context, session_id, "E_discomfort", DISCOMFORT_RETRY_TEXT)
         return E_DISCOMFORT_AFTER
 
     await _bump_messages(session_id)
@@ -715,21 +890,81 @@ async def _process_e_discomfort_after(update: Update, context: ContextTypes.DEFA
 
 async def _finish_e(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, insertion: str | None) -> int:
     db.finish_relationship_session(session_id, exit_step="E")
-    await _log_session(update, context, session_id)
 
     if insertion:
         closing_text = FINAL_INSIGHT_TEMPLATE.format(
             opener=random.choice(FINAL_INSIGHT_OPENERS), insertion=html.escape(insertion)
         )
-        await update.effective_message.reply_text(
-            closing_text, reply_markup=back_to_menu_keyboard(), parse_mode=ParseMode.HTML
+        await _send(
+            update, context, session_id, "E_finish", closing_text,
+            reply_markup=back_to_menu_keyboard(), parse_mode=ParseMode.HTML,
         )
     else:
-        await update.effective_message.reply_text(E_NO_INSIGHT_TEXT, reply_markup=back_to_menu_keyboard())
+        await _send(update, context, session_id, "E_finish", E_NO_INSIGHT_TEXT, reply_markup=back_to_menu_keyboard())
 
+    # «Избегание или интеграция» (ТЗ-доп. №5, раздел 2) — если хоть раз сработало на C-D8/E,
+    # разбор не заканчивается тут же, а продолжается ещё одним обменом. Лог в Sheets поэтому
+    # откладывается до полного разрешения (иначе пришлось бы потом патчить уже отправленную строку).
+    if context.user_data.get("exit_intent_flagged"):
+        row = db.get_relationship_session(session_id)
+        behavior = await llm.extract_disowned_behavior(row["a_event"], row["b_narrative_confirmed"])
+        context.user_data["exit_intent_behavior"] = behavior
+        question = EXIT_INTENT_STEP1_TEMPLATE.format(behavior=behavior)
+        await _send(update, context, session_id, "exit_intent_check", question)
+        return EXIT_INTENT_CLARIFY
+
+    await _log_session(update, context, session_id)
     await hostility.maybe_send_self_harm_note(update, context)
-
     context.user_data.pop("rel_session_id", None)
+    context.user_data.pop("rel_e_first_answer", None)
+    context.user_data.pop("rel_summary", None)
+    return ConversationHandler.END
+
+
+async def exit_intent_clarify(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_exit_intent", conv_handler=conv_handler, state=EXIT_INTENT_CLARIFY,
+        process=lambda text: _process_exit_intent_clarify(update, context, text),
+    )
+
+
+async def _process_exit_intent_clarify(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    session_id = context.user_data["rel_session_id"]
+    await _log_turn(session_id, update.effective_user, "exit_intent_check", "человек", text)
+
+    status = await hostility.precheck(
+        update, context, branch="relationships", step="exit_intent_check", text_override=text
+    )
+    if status == "crisis":
+        await _close_after_hostility(update, context, session_id, "crisis")
+        return ConversationHandler.END
+    if status == "hostile":
+        return EXIT_INTENT_CLARIFY
+    if status == "closed":
+        await _close_after_hostility(update, context, session_id, "hostility_closed")
+        return ConversationHandler.END
+
+    await _bump_messages(session_id)
+    verdict = await llm.classify_avoidance_integration(text)
+    behavior = context.user_data.get("exit_intent_behavior", "вести себя так же, как он")
+    db.update_relationship_session(session_id, avoidance_or_integration=verdict, exit_intent_answer=text)
+
+    parts = []
+    if verdict in ("avoidance", "unclear"):
+        parts.append(AVOIDANCE_TEXT)
+    if verdict in ("integration", "unclear"):
+        parts.append(INTEGRATION_TEXT.format(behavior=behavior))
+    parts.append(EXIT_INTENT_CLOSING_TEXT)
+    await _send(
+        update, context, session_id, "exit_intent_check", "\n\n".join(parts),
+        reply_markup=back_to_menu_keyboard(),
+    )
+
+    await _log_session(update, context, session_id)
+    await hostility.maybe_send_self_harm_note(update, context)
+    context.user_data.pop("rel_session_id", None)
+    context.user_data.pop("exit_intent_flagged", None)
+    context.user_data.pop("exit_intent_behavior", None)
     context.user_data.pop("rel_e_first_answer", None)
     context.user_data.pop("rel_summary", None)
     return ConversationHandler.END
@@ -739,7 +974,8 @@ async def _send_summary_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     row = db.get_relationship_session(session_id)
     d_answers = {i: row[D_FIELDS[i]] for i in range(1, 9)}
     summary = await llm.generate_session_summary(
-        row["a_event"], row["b_narrative_confirmed"], row["c_consequence"], d_answers
+        row["a_event"], row["b_narrative_confirmed"], row["c_consequence"], d_answers,
+        discomfort_before=row["discomfort_before"], discomfort_after=row["discomfort_after"],
     )
     context.user_data["rel_summary"] = summary
     keyboard = InlineKeyboardMarkup(
@@ -748,8 +984,10 @@ async def _send_summary_confirm(update: Update, context: ContextTypes.DEFAULT_TY
             [InlineKeyboardButton("Хочу кое-то добавить/подправить", callback_data="e_confirm:add")],
         ]
     )
-    message = update.callback_query.message if update.callback_query else update.effective_message
-    await message.reply_text(summary + SUMMARY_CONFIRM_SUFFIX, reply_markup=keyboard)
+    await _send(
+        update, context, session_id, "E_summary_confirm", summary + SUMMARY_CONFIRM_SUFFIX,
+        reply_markup=keyboard,
+    )
     return E_SUMMARY_CONFIRM
 
 
@@ -757,13 +995,14 @@ async def e_summary_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     query = update.callback_query
     await query.answer()
     session_id = context.user_data["rel_session_id"]
+    await _log_turn(session_id, update.effective_user, "E_summary_confirm", "человек", query.data)
 
     if query.data.endswith(":add"):
-        await query.message.reply_text("Что добавить или поправить?")
+        await _send(update, context, session_id, "E_summary_correction", "Что добавить или поправить?")
         return E_SUMMARY_CORRECTION
 
     e_question = await _ask_e_question(context, session_id)
-    await query.message.reply_text(e_question)
+    await _send(update, context, session_id, "E", e_question)
     return E_SUMMARY
 
 
@@ -776,6 +1015,7 @@ async def e_summary_correction(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def _process_e_summary_correction(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     session_id = context.user_data["rel_session_id"]
+    await _log_turn(session_id, update.effective_user, "E_summary_correction", "человек", text)
 
     status = await hostility.precheck(
         update, context, branch="relationships", step="E_correction",
@@ -798,14 +1038,17 @@ async def _process_e_summary_correction(update: Update, context: ContextTypes.DE
         paranoid_text = PARANOID_BOT_TEMPLATE.format(
             hidden_need=edit_analysis["hidden_need"], punchline=edit_analysis["punchline"]
         )
-        await update.effective_message.reply_text(paranoid_text)
+        await _send(update, context, session_id, "E_summary_correction", paranoid_text)
 
     row = db.get_relationship_session(session_id)
     db.update_relationship_session(session_id, e_summary=f"Поправка к резюме: {text}")
+
+    await _check_exit_intent(context, session_id, "E_correction", text)
+
     narrative_with_correction = f"{row['b_narrative_confirmed']}\n(поправка от пользователя: {text})"
     e_question = await llm.generate_e_question(row["a_event"], narrative_with_correction)
     context.user_data["rel_e_question"] = e_question
-    await update.effective_message.reply_text(e_question)
+    await _send(update, context, session_id, "E", e_question)
     return E_SUMMARY
 
 
@@ -819,6 +1062,7 @@ async def e_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _process_e_summary(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     session_id = context.user_data["rel_session_id"]
     e_question = context.user_data.get("rel_e_question", "")
+    await _log_turn(session_id, update.effective_user, "E", "человек", text)
 
     status = await hostility.precheck(
         update, context, branch="relationships", step="E", bot_question=e_question, text_override=text
@@ -835,6 +1079,8 @@ async def _process_e_summary(update: Update, context: ContextTypes.DEFAULT_TYPE,
     await _bump_messages(session_id)
     db.update_relationship_session(session_id, e_summary=text)
 
+    await _check_exit_intent(context, session_id, "E", text)
+
     row = db.get_relationship_session(session_id)
     analysis = await llm.analyze_e_insight(row["a_event"], row["b_narrative_confirmed"], "", text)
     if analysis["has_insight"]:
@@ -842,7 +1088,7 @@ async def _process_e_summary(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     followup = await llm.ask_e_followup(row["b_narrative_confirmed"], text)
     context.user_data["rel_e_first_answer"] = text
-    await update.effective_message.reply_text(followup)
+    await _send(update, context, session_id, "E_followup", followup)
     return E_FOLLOWUP
 
 
@@ -855,6 +1101,7 @@ async def e_followup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _process_e_followup(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     session_id = context.user_data["rel_session_id"]
+    await _log_turn(session_id, update.effective_user, "E_followup", "человек", text)
 
     status = await hostility.precheck(
         update, context, branch="relationships", step="E_followup", text_override=text
@@ -871,6 +1118,8 @@ async def _process_e_followup(update: Update, context: ContextTypes.DEFAULT_TYPE
     await _bump_messages(session_id)
     first_answer = context.user_data.get("rel_e_first_answer", "")
     db.update_relationship_session(session_id, e_summary=f"{first_answer}\n{text}")
+
+    await _check_exit_intent(context, session_id, "E_followup", text)
 
     row = db.get_relationship_session(session_id)
     analysis = await llm.analyze_e_insight(row["a_event"], row["b_narrative_confirmed"], first_answer, text)
@@ -905,11 +1154,14 @@ conv_handler = ConversationHandler(
         C_DISCOMFORT: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_discomfort)],
         D_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, d_confirm)],
         D_QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, d_question)],
+        D5_QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, d5_question)],
+        D5_HUNDRED_FOLLOWUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, d5_hundred_followup)],
         E_DISCOMFORT_AFTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_discomfort_after)],
         E_SUMMARY_CONFIRM: [CallbackQueryHandler(e_summary_confirm, pattern="^e_confirm:")],
         E_SUMMARY_CORRECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_summary_correction)],
         E_SUMMARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_summary)],
         E_FOLLOWUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_followup)],
+        EXIT_INTENT_CLARIFY: [MessageHandler(filters.TEXT & ~filters.COMMAND, exit_intent_clarify)],
     },
     fallbacks=[
         CommandHandler("cancel", cancel),

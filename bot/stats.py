@@ -11,8 +11,10 @@ logger = logging.getLogger(__name__)
 
 D_COLUMNS = [
     ("D1_логическое", "D1"), ("D2_эмпирическое", "D2"), ("D3_прагматическое", "D3"),
-    ("D4_гедонистический", "D4"), ("D5_шкала_катастроф", "D5"), ("D6_историческое", "D6"),
+    ("D4_гедонистический", "D4"), ("D6_историческое", "D6"),
     ("D7_двойной_стандарт", "D7"), ("D8_семантическое", "D8"),
+    # D5 (шкала катастроф) — теперь число, средняя длина ответа в словах для него
+    # бессмысленна (ТЗ-доп. №5).
 ]
 
 
@@ -108,6 +110,11 @@ def _compute_sync() -> str:
             f"Запрос «на себя»: сработал {len(self_triggered)} раз, переформулировали {pct_reform}%, "
             f"отказов {len(self_refused)}"
         )
+
+    exit_intent_dist = _distribution(rel, "избегание_или_интеграция")
+    if exit_intent_dist:
+        exit_intent_count = sum(1 for r in rel if str(r.get("выход_из_контакта", "")).strip().lower() == "да")
+        lines.append(f"Выход из контакта: сработал {exit_intent_count} раз ({_fmt_dist(exit_intent_dist)})")
 
     return "\n".join(lines) if lines else "Данных пока нет (или все строки помечены как тест)."
 
