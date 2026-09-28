@@ -75,7 +75,7 @@ def _parse_discomfort(text: str) -> int | None:
 # --- ТЗ-доп. №5, раздел 1: шкала катастроф с опорой 100 ---
 D5_QUESTION_TEMPLATE = (
     "Шкала катастроф от 0 до 100. Сейчас будет жёстко.\n\n"
-    "100 — это полная жопа: ты попал в катастрофу, лежишь в больнице, у тебя нет рук или ног, всё "
+    "100 — это полная жопа: ты в катастрофе, лежишь в больнице, у тебя нет рук или ног, всё "
     "болит, и так ты будешь жить ещё много лет.\n\n"
     "Оцени по этой шкале, от 0 до этого 100, то, что происходит у тебя: {situation}"
 )
@@ -1140,6 +1140,15 @@ async def _process_e_summary(update: Update, context: ContextTypes.DEFAULT_TYPE,
     await _check_exit_intent(context, session_id, "E", text)
 
     row = db.get_relationship_session(session_id)
+
+    # Живой баг: E_QUESTION_SYSTEM раньше сразу утверждал, что мысль «теряет силу» — а человек мог
+    # прямо ответить, что стало ХУЖЕ. Теперь вопрос честный (не предполагает результат), и если
+    # ответ явно про «не изменилось/стало хуже» — не продолжаем выискивать инсайт, а закрываем
+    # честно (тот же текст, что и при отсутствии инсайта, приглашение на диагностику).
+    shift = await llm.classify_e_shift(text)
+    if shift == "same_or_worse":
+        return await _finish_e(update, context, session_id, None)
+
     analysis = await llm.analyze_e_insight(row["a_event"], row["b_narrative_confirmed"], "", text)
     if analysis["has_insight"]:
         return await _finish_e(update, context, session_id, analysis["reflection"])

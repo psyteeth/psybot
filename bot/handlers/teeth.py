@@ -40,6 +40,34 @@ ACUTE_TEXT = (
     f"психостоматологию на диагностику: пиши {ADMIN_USERNAME}."
 )
 
+# Живой кейс: человек проходит диагностику не за себя, а за другого (мать — за дочь). Бот должен
+# отнестись к этому с подозрением, а не просто продолжать как ни в чём не бывало.
+OTHER_PERSON_MINOR_TEXT = (
+    "Смотрю, это про другого человека, а не про тебя — и, кажется, самому диагностику пока рано "
+    "проходить. В таком случае это лучше делать через расстановку. Если понадобится помощь — "
+    f"приходи на диагностику, пиши {ADMIN_USERNAME}."
+)
+OTHER_PERSON_ADULT_QUESTION = (
+    "Смотрю, ты спрашиваешь за другого взрослого человека, а не за себя — почему сам(а) он/она не "
+    "проходит диагностику?"
+)
+OTHER_PERSON_ANXIOUS_TEXT = (
+    "Может не понравится это слышать, но когда за взрослого человека диагностику проходят вместо "
+    "него, это попахивает провалом сепарации — не самое лучшее, что стоит вносить в отношения с "
+    "близким человеком.\n\n"
+    "По опыту специалистов психостоматологии: те, кто спрашивает так — из тревоги, вины или "
+    "беспокойства за другого, а не из любопытства — чаще сами не живут свою жизнь и мешают жить "
+    "другому."
+)
+
+
+def _other_person_note_text(subject_age: str, motivation: str) -> str:
+    if subject_age == "minor":
+        return OTHER_PERSON_MINOR_TEXT
+    if motivation == "anxious":
+        return f"{OTHER_PERSON_ADULT_QUESTION}\n\n{OTHER_PERSON_ANXIOUS_TEXT}"
+    return OTHER_PERSON_ADULT_QUESTION
+
 Q_TOOTH = "Какой зуб тебя беспокоит? Напиши номер по схеме."
 Q_SCARY = (
     "В контексте того, что уже произошло с твоим зубом, что самое страшное для тебя может "
@@ -304,6 +332,12 @@ async def _process_ask_scary(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     await _log_turn(session_id, update.effective_user, "ask_scary", "человек", text)
     db.update_teeth_session(session_id, scary_thing=text)
+
+    subject = await llm.classify_diagnosis_subject(text)
+    if subject["subject"] == "other":
+        note_text = _other_person_note_text(subject["subject_age"], subject["motivation"])
+        await _send(update, context, session_id, "ask_scary", note_text, msg_type="уточнение")
+
     await _send(update, context, session_id, "ask_feeling", Q_FEELING)
     return ASK_FEELING
 

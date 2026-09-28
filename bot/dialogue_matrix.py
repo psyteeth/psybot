@@ -102,7 +102,11 @@ def aggregate_cells(dialogue_rows: list[dict], step_to_label: dict, row_labels: 
         if not text:
             continue
         key = _label_key(step, who, step_to_label, row_labels)
-        cells.setdefault(key, []).append(f"{who}: {text}")
+        # в «прочее» без шага реплика теряет происхождение (несколько разных шагов сваливаются
+        # в одну ячейку) — помечаем [шаг] для трассируемости; в подписанных строках это и так
+        # видно из самой метки строки, там не дублируем.
+        entry = f"[{step}] {who}: {text}" if key == "прочее" else f"{who}: {text}"
+        cells.setdefault(key, []).append(entry)
     return {k: "\n".join(v) for k, v in cells.items()}
 
 
