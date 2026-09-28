@@ -21,3 +21,12 @@ async def main_menu_keyboard(bot: Bot, user_id: int) -> InlineKeyboardMarkup:
 
 def back_to_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[InlineKeyboardButton("В меню", callback_data="menu:back")]])
+
+
+def menu_and_teeth_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("В меню", callback_data="menu:back")],
+            [InlineKeyboardButton("Зубы", callback_data="menu:teeth")],
+        ]
+    )

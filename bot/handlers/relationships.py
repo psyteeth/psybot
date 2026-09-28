@@ -21,9 +21,11 @@ from bot.config import (
     LIMIT_RELATIONSHIP_MESSAGES,
     RELATIONSHIP_LIMIT_TEXT,
     ROADMAP_URL,
+    SELF_TARGET_CONFIDENCE_THRESHOLD,
+    SELF_TARGET_MAX_ATTEMPTS,
     TESTS_URL,
 )
-from bot.keyboards import back_to_menu_keyboard
+from bot.keyboards import back_to_menu_keyboard, menu_and_teeth_keyboard
 from bot.sheets import sheets_logger
 
 logger = logging.getLogger(__name__)
@@ -69,6 +71,17 @@ def _parse_discomfort(text: str) -> int | None:
     n = int(m.group(1))
     return n if 0 <= n <= 10 else None
 
+
+SELF_REFUSAL_TEXT = (
+    "Тогда сейчас разбирать не будем. Разбор работает, когда тебя бесит кто-то другой, — приходи, "
+    "когда такое случится.\n\n"
+    "А то, что ты переживаешь из-за себя, — во-первых, может говорить об оголяющихся шейках зубов. "
+    f"С этим можно прийти на диагностику: пиши {ADMIN_USERNAME}. Во-вторых, это просто не "
+    "соответствует логике разбора.\n\n"
+    "И не надо тут на вопрос «кто тебя бесит» отвечать «я сам». Мы в Психостоматологии №1 знаем, "
+    "что это петушиный крик псевдосвятости."
+)
+
 SUMMARY_CONFIRM_SUFFIX = "\n\nПохоже ли это на правду?"
 PARANOID_BOT_TEMPLATE = (
     "Прости, я совсем забыл сказать, что я бот-параноик, и сейчас я ощущаю космический посыл "
@@ -111,6 +124,11 @@ def _row_for_sheets(row) -> list:
         row["discomfort_after"] if row["discomfort_after"] is not None else "",
         _shift_value(row["discomfort_before"], row["discomfort_after"]),
         row["reflection_before_e"] or "",
+        "да" if row["self_request"] else "нет",
+        row["self_check_step"] or "",
+        row["self_original_answer"] or "",
+        "да" if row["self_reformulated"] else "нет",
+        "да" if row["self_refused"] else "нет",
     ]
 
 
@@ -167,6 +185,51 @@ async def _close_after_hostility(session_id: int, exit_step: str) -> None:
 
 async def _bump_messages(session_id: int) -> int:
     return db.increment_relationship_messages(session_id)
+
+
+async def _refuse_self_target(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> int:
+    db.update_relationship_session(session_id, self_refused=1)
+    db.finish_relationship_session(session_id, exit_step="отказ_самообвинение")
+    await _log_session(session_id)
+    await update.effective_message.reply_text(SELF_REFUSAL_TEXT, reply_markup=menu_and_teeth_keyboard())
+    context.user_data.pop("rel_session_id", None)
+    context.user_data.pop("rel_self_attempts", None)
+    return ConversationHandler.END
+
+
+async def _check_self_target(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, step: str, text: str
+) -> object:
+    """Запрос «проблема во мне» (ТЗ-доп. №3). Возвращает None, если проверка не сработала
+    (target=other) — вызывающий обработчик продолжает как обычно. Иначе уже отправила ответ
+    пользователю (переформулировка или отказ) и вернула состояние, которое должен вернуть
+    вызывающий обработчик как есть."""
+    classification = await llm.classify_self_target(text)
+    effective = classification["target"]
+    if effective == "unclear":
+        effective = "self" if classification["confidence"] < SELF_TARGET_CONFIDENCE_THRESHOLD else "other"
+
+    attempts = context.user_data.get("rel_self_attempts", 0)
+
+    if effective != "self":
+        if attempts > 0:
+            db.update_relationship_session(session_id, self_reformulated=1)
+        return None
+
+    row = db.get_relationship_session(session_id)
+    if not row["self_request"]:
+        db.update_relationship_session(
+            session_id, self_request=1, self_check_step=step, self_original_answer=text
+        )
+
+    if attempts >= SELF_TARGET_MAX_ATTEMPTS:
+        return await _refuse_self_target(update, context, session_id)
+
+    context.user_data["rel_self_attempts"] = attempts + 1
+    other_person = classification.get("other_person") or (row["other_person"] if step == "B" else None)
+    reframe = await llm.generate_self_reframe(step, text, other_person)
+    await update.effective_message.reply_text(reframe)
+    return A_EVENT if step == "A" else B_NARRATIVE
 
 
 async def _ask_e_question(context: ContextTypes.DEFAULT_TYPE, session_id: int) -> str:
@@ -260,6 +323,10 @@ async def _process_a_event(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         await _log_session(session_id)
         await update.effective_message.reply_text(CRISIS_TEXT, reply_markup=back_to_menu_keyboard())
         return ConversationHandler.END
+
+    self_state = await _check_self_target(update, context, session_id, "A", text)
+    if self_state is not None:
+        return self_state
 
     if ENABLE_PRIOR_EVENT_QUESTION:
         await update.effective_message.reply_text(PRIOR_EVENT_QUESTION)
@@ -364,6 +431,10 @@ async def _process_b_narrative(update: Update, context: ContextTypes.DEFAULT_TYP
     await _bump_messages(session_id)
     db.update_relationship_session(session_id, b_narrative_raw=text)
     context.user_data["rel_raw_narrative"] = text
+
+    self_state = await _check_self_target(update, context, session_id, "B", text)
+    if self_state is not None:
+        return self_state
 
     row = db.get_relationship_session(session_id)
     reformulated = await llm.reformulate_narrative(row["a_event"], text)

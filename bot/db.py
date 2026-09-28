@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from bot.config import DB_PATH
+from bot.config import COUNT_SELF_REFUSED_TOWARD_LIMIT, DB_PATH
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -41,7 +41,12 @@ CREATE TABLE IF NOT EXISTS relationship_sessions (
     other_person TEXT,
     discomfort_before INTEGER,
     discomfort_after INTEGER,
-    reflection_before_e TEXT
+    reflection_before_e TEXT,
+    self_request INTEGER NOT NULL DEFAULT 0,
+    self_check_step TEXT,
+    self_original_answer TEXT,
+    self_reformulated INTEGER NOT NULL DEFAULT 0,
+    self_refused INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS teeth_sessions (
@@ -105,6 +110,11 @@ MIGRATIONS = [
     "ALTER TABLE relationship_sessions ADD COLUMN discomfort_before INTEGER",
     "ALTER TABLE relationship_sessions ADD COLUMN discomfort_after INTEGER",
     "ALTER TABLE relationship_sessions ADD COLUMN reflection_before_e TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN self_request INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE relationship_sessions ADD COLUMN self_check_step TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN self_original_answer TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN self_reformulated INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE relationship_sessions ADD COLUMN self_refused INTEGER NOT NULL DEFAULT 0",
 ]
 
 
@@ -141,11 +151,14 @@ def count_relationship_sessions(user_id: int) -> int:
 
 
 def count_relationship_sessions_this_month(user_id: int) -> int:
+    query = "SELECT COUNT(*) AS c FROM relationship_sessions WHERE user_id=? AND started_at>=?"
+    params: list = [user_id, _month_start_iso()]
+    if not COUNT_SELF_REFUSED_TOWARD_LIMIT:
+        # разбор, закрытый отказом («запрос на себя», ТЗ-доп. №3) по сути не начался —
+        # не должен списываться из месячного лимита.
+        query += " AND self_refused=0"
     with get_conn() as conn:
-        row = conn.execute(
-            "SELECT COUNT(*) AS c FROM relationship_sessions WHERE user_id=? AND started_at>=?",
-            (user_id, _month_start_iso()),
-        ).fetchone()
+        row = conn.execute(query, params).fetchone()
         return row["c"]
 
 

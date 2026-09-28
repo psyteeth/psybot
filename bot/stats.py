@@ -99,6 +99,16 @@ def _compute_sync() -> str:
         suffix = f" ({_fmt_dist(cat_dist)})" if cat_dist else ""
         lines.append(f"Выпадов: {len(hostility_rows)}{suffix}")
 
+    self_triggered = [r for r in rel if str(r.get("запрос_на_себя", "")).strip().lower() == "да"]
+    if self_triggered:
+        self_reformulated = [r for r in self_triggered if str(r.get("переформулирован", "")).strip().lower() == "да"]
+        self_refused = [r for r in rel if str(r.get("отказ_самообвинение", "")).strip().lower() == "да"]
+        pct_reform = round(100 * len(self_reformulated) / len(self_triggered))
+        lines.append(
+            f"Запрос «на себя»: сработал {len(self_triggered)} раз, переформулировали {pct_reform}%, "
+            f"отказов {len(self_refused)}"
+        )
+
     return "\n".join(lines) if lines else "Данных пока нет (или все строки помечены как тест)."
 
 
