@@ -101,14 +101,17 @@ def _compute_sync() -> str:
         suffix = f" ({_fmt_dist(cat_dist)})" if cat_dist else ""
         lines.append(f"Выпадов: {len(hostility_rows)}{suffix}")
 
-    self_triggered = [r for r in rel if str(r.get("запрос_на_себя", "")).strip().lower() == "да"]
-    if self_triggered:
-        self_reformulated = [r for r in self_triggered if str(r.get("переформулирован", "")).strip().lower() == "да"]
-        self_refused = [r for r in rel if str(r.get("отказ_самообвинение", "")).strip().lower() == "да"]
-        pct_reform = round(100 * len(self_reformulated) / len(self_triggered))
+    # ТЗ-доп. №6, ч.2 — дожим конкретного ответа на A/B (заменяет старый self_target-блок,
+    # который больше ничего не пишет: колонки запрос_на_себя/переформулирован остались
+    # только в старых строках).
+    dozhim_dist = _distribution(rel, "исход_проверки")
+    if dozhim_dist:
+        lines.append(f"Дожим A/B (исход): {_fmt_dist(dozhim_dist)}")
+    dozhim_attempts = [a for a in (_numbers(rel, "попытки_A") + _numbers(rel, "попытки_B")) if a > 0]
+    if dozhim_attempts:
         lines.append(
-            f"Запрос «на себя»: сработал {len(self_triggered)} раз, переформулировали {pct_reform}%, "
-            f"отказов {len(self_refused)}"
+            f"Дожим: потребовалась доп. попытка в {len(dozhim_attempts)} шагах A/B, среднее "
+            f"число попыток при этом {round(statistics.mean(dozhim_attempts), 1)}"
         )
 
     exit_intent_dist = _distribution(rel, "избегание_или_интеграция")
@@ -125,3 +128,52 @@ async def compute_summary() -> str:
     except Exception:  # noqa: BLE001
         logger.exception("compute_summary упал")
         return "Не удалось построить сводку — см. логи бота."
+
+
+def _render_dialog_sync(query_arg: str) -> str:
+    """ТЗ-доп. №6, ч.1 — /dialog <session_id или username>: полный текст сессии из «Диалоги».
+    Если query_arg совпадает с session_id — берём её. Иначе ищем последнюю сессию с таким
+    username (без учёта регистра)."""
+    client = _build_client()
+    if not client or not LOG_SPREADSHEET_ID:
+        return ""
+    sh = client.open_by_key(LOG_SPREADSHEET_ID)
+    records = sh.worksheet("Диалоги").get_all_records()
+    if not records:
+        return ""
+
+    session_ids = {str(r.get("session_id", "")) for r in records}
+    if query_arg in session_ids:
+        target_session_id = query_arg
+    else:
+        matching = [
+            r for r in records
+            if str(r.get("username", "")).strip().lower() == query_arg.strip().lower()
+        ]
+        if not matching:
+            return ""
+        matching.sort(key=lambda r: str(r.get("timestamp", "")))
+        target_session_id = str(matching[-1].get("session_id", ""))
+        if not target_session_id:
+            return ""
+
+    session_rows = [r for r in records if str(r.get("session_id", "")) == target_session_id]
+    if not session_rows:
+        return ""
+    session_rows.sort(key=lambda r: str(r.get("timestamp", "")))
+
+    lines = [f"session_id: {target_session_id}"]
+    for r in session_rows:
+        who = str(r.get("кто", ""))
+        step = str(r.get("шаг", ""))
+        text = str(r.get("текст", ""))
+        lines.append(f"[{step}] {who}: {text}")
+    return "\n".join(lines)
+
+
+async def render_dialog(query_arg: str) -> str:
+    try:
+        return await asyncio.to_thread(_render_dialog_sync, query_arg)
+    except Exception:  # noqa: BLE001
+        logger.exception("render_dialog упал")
+        return ""

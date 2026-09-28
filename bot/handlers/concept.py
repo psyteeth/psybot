@@ -33,6 +33,23 @@ OFFTOPIC_TEXT = (
 )
 DISPUTE_STREAK_THRESHOLD = 2
 
+
+async def _log_turn(context: ContextTypes.DEFAULT_TYPE, user, step: str, who: str, text: str, msg_type: str = "обычный") -> None:
+    """ТЗ-доп. №6, ч.1 — линейный лог ветки «Концепция» (без матрицы: шаги не фиксированные).
+    session_id — на время одного цикла вопрос→(уточнения)→ответ, живёт в user_data."""
+    session_id = context.user_data.get("concept_session_id", "")
+    await sheets_logger.append(
+        "Диалоги",
+        [db.now(), user.id, session_id, user.username or "", "concept", "", step, who, (text or "")[:2000], msg_type],
+    )
+
+
+async def _send(update: Update, context: ContextTypes.DEFAULT_TYPE, step: str, text: str, msg_type: str = "обычный", **kwargs):
+    target = update.callback_query.message if update.callback_query else update.effective_message
+    result = await target.reply_text(text, **kwargs)
+    await _log_turn(context, update.effective_user, step, "бот", text, msg_type)
+    return result
+
 MAX_CLARIFY_ROUNDS = 3
 CLARIFY_OPENERS = [
     "Так, давай разберёмся: ",
@@ -77,8 +94,10 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     context.user_data["concept_dispute_streak"] = 0
     context.user_data.pop("concept_last_topic", None)
+    context.user_data.pop("concept_session_id", None)
     hostility.reset_session(context)
     await query.edit_message_text(INTRO_TEXT, reply_markup=back_to_menu_keyboard())
+    await _log_turn(context, user, "intro", "бот", INTRO_TEXT)
     return ASKING
 
 
@@ -111,9 +130,14 @@ async def _process_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, quest
 
     db.increment_concept_messages(user.id)
 
+    # session_id разбора — на весь цикл вопрос→(уточнения)→ответ (ТЗ-доп. №6, ч.1)
+    context.user_data["concept_session_id"] = f"{user.id}_{db.now()}"
+    await _log_turn(context, user, "ask", "человек", question)
+
     prior_topic = context.user_data.get("concept_last_topic")
     if await llm.is_offtopic_concept(question, prior_topic=prior_topic):
-        await update.effective_message.reply_text(OFFTOPIC_TEXT, reply_markup=back_to_menu_keyboard())
+        await _send(update, context, "offtopic", OFFTOPIC_TEXT, msg_type="отказ", reply_markup=back_to_menu_keyboard())
+        context.user_data.pop("concept_session_id", None)
         return ASKING
 
     await _maybe_rant_opener(update, question)
@@ -122,7 +146,7 @@ async def _process_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, quest
     context.user_data["concept_clarify_round"] = 1
     clarified = await llm.clarify_question(question)
     context.user_data["concept_pending_clarified"] = clarified
-    await update.effective_message.reply_text(CLARIFY_OPENERS[0] + clarified)
+    await _send(update, context, "clarify", CLARIFY_OPENERS[0] + clarified, msg_type="уточнение")
     return CLARIFY
 
 
@@ -155,6 +179,7 @@ async def _process_clarify_reply(update: Update, context: ContextTypes.DEFAULT_T
 
     db.increment_concept_messages(user.id)
 
+    await _log_turn(context, user, "clarify", "человек", text)
     await _maybe_rant_opener(update, text)
 
     raw_question = context.user_data.get("concept_raw_question", "")
@@ -167,7 +192,7 @@ async def _process_clarify_reply(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data["concept_clarify_round"] = round_
         clarified = await llm.clarify_question(raw_question, correction=text)
         context.user_data["concept_pending_clarified"] = clarified
-        await update.effective_message.reply_text(CLARIFY_OPENERS[round_ - 1] + clarified)
+        await _send(update, context, "clarify", CLARIFY_OPENERS[round_ - 1] + clarified, msg_type="уточнение")
         return CLARIFY
 
     resolved_question = context.user_data.pop("concept_pending_clarified", raw_question)
@@ -192,8 +217,9 @@ async def _process_clarify_reply(update: Update, context: ContextTypes.DEFAULT_T
     if escalated:
         answer = f"{answer}\n\n{NOT_CONVERGED_TEXT}"
 
-    await update.effective_message.reply_text(answer, reply_markup=back_to_menu_keyboard())
+    await _send(update, context, "answer", answer, reply_markup=back_to_menu_keyboard())
     context.user_data["concept_last_topic"] = resolved_question
+    context.user_data.pop("concept_session_id", None)
 
     await sheets_logger.append(
         "Концепция",

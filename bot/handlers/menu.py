@@ -111,6 +111,26 @@ async def weekly_stats_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         logger.exception("Не удалось отправить еженедельную сводку админу")
 
 
+async def dialog_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/dialog <session_id или username> — ТЗ-доп. №6, ч.1: полный текст последней (или
+    указанной) сессии из листа «Диалоги» простым текстом. Только для ADMIN_CHAT_ID."""
+    caller_id = update.effective_user.id
+    if not ADMIN_CHAT_ID or str(caller_id) != str(ADMIN_CHAT_ID):
+        return
+
+    if not context.args:
+        await update.effective_message.reply_text("Использование: /dialog <session_id или username>")
+        return
+
+    query_arg = context.args[0].lstrip("@")
+    text = await stats.render_dialog(query_arg)
+    if not text:
+        await update.effective_message.reply_text("Не нашёл такую сессию/пользователя в «Диалоги».")
+        return
+    for start in range(0, len(text), 3500):
+        await update.effective_message.reply_text(text[start:start + 3500])
+
+
 async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/send <user_id> <текст> — только для ADMIN_CHAT_ID: отправляет сообщение указанному
     пользователю от имени бота и логирует отправку. Текст берём из сырого текста сообщения

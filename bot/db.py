@@ -53,7 +53,10 @@ CREATE TABLE IF NOT EXISTS relationship_sessions (
     exit_intent INTEGER NOT NULL DEFAULT 0,
     exit_intent_step TEXT,
     avoidance_or_integration TEXT,
-    exit_intent_answer TEXT
+    exit_intent_answer TEXT,
+    attempts_a INTEGER NOT NULL DEFAULT 0,
+    attempts_b INTEGER NOT NULL DEFAULT 0,
+    dozhim_outcome TEXT
 );
 
 CREATE TABLE IF NOT EXISTS teeth_sessions (
@@ -129,6 +132,9 @@ MIGRATIONS = [
     "ALTER TABLE relationship_sessions ADD COLUMN exit_intent_step TEXT",
     "ALTER TABLE relationship_sessions ADD COLUMN avoidance_or_integration TEXT",
     "ALTER TABLE relationship_sessions ADD COLUMN exit_intent_answer TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN attempts_a INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE relationship_sessions ADD COLUMN attempts_b INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE relationship_sessions ADD COLUMN dozhim_outcome TEXT",
 ]
 
 

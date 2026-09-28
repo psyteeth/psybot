@@ -13,7 +13,7 @@ from telegram.ext import (
     filters,
 )
 
-from bot import db, debounce, hostility, limits, llm
+from bot import db, debounce, dialogue_matrix, hostility, limits, llm
 from bot.config import (
     ADMIN_USERNAME,
     DIAGNOSTICS_POST_URL,
@@ -85,13 +85,55 @@ FINAL_TEMPLATE = (
 )
 
 
-async def _check_acute(update: Update, text: str, session_id: int) -> bool:
+def _dialogue_session_id(row) -> str:
+    """session_id для склейки «Диалоги»/«Диалоги (матрица)» с «Зубы» (ТЗ-доп. №6) —
+    считается на лету из user_id+started_at, отдельная колонка в БД не нужна."""
+    return f"{row['user_id']}_{row['started_at']}"
+
+
+async def _log_turn(session_id: int, user, step: str, who: str, text: str, msg_type: str = "обычный") -> None:
+    """ТЗ-доп. №6, ч.1 — полный лог диалога ветки «Зубы», одна строка на реплику."""
+    row = db.get_teeth_session(session_id)
+    session_num = row["session_num"] if row else ""
+    dialogue_session_id = _dialogue_session_id(row) if row else ""
+    await sheets_logger.append(
+        "Диалоги",
+        [
+            db.now(), user.id, dialogue_session_id, user.username or "", "teeth",
+            session_num, step, who, (text or "")[:2000], msg_type,
+        ],
+    )
+
+
+async def _send(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, step: str, text: str,
+    msg_type: str = "обычный", **kwargs,
+):
+    """reply_text + запись реплики бота в «Диалоги» одним вызовом."""
+    target = update.callback_query.message if update.callback_query else update.effective_message
+    result = await target.reply_text(text, **kwargs)
+    await _log_turn(session_id, update.effective_user, step, "бот", text, msg_type)
+    return result
+
+
+async def _log_and_build_matrix(session_id: int) -> None:
+    row = db.get_teeth_session(session_id)
+    try:
+        await dialogue_matrix.build_teeth_matrix_column(
+            _dialogue_session_id(row), row["username"] or "", row["started_at"]
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось построить столбец матрицы Зубы для сессии %s", session_id)
+
+
+async def _check_acute(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, session_id: int) -> bool:
     if ACUTE_RE.search(text):
         db.update_teeth_session(session_id, acute_symptoms=1)
         db.finish_teeth_session(session_id, completed=False)
-        await update.effective_message.reply_text(ACUTE_TEXT, reply_markup=back_to_menu_keyboard())
+        await _send(update, context, session_id, "acute", ACUTE_TEXT, msg_type="отказ", reply_markup=back_to_menu_keyboard())
         session = _fetch_teeth_row(session_id)
         await sheets_logger.append("Зубы", session)
+        await _log_and_build_matrix(session_id)
         return True
     return False
 
@@ -104,6 +146,7 @@ def _fetch_teeth_row(session_id: int) -> list:
         row["tooth_number"], row["scary_thing"], row["feeling_word"],
         "да" if row["acute_symptoms"] else "нет",
         "да" if row["completed"] else "нет",
+        _dialogue_session_id(row),
     ]
 
 
@@ -139,7 +182,7 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     with open(TEETH_CHART_PATH, "rb") as photo:
         await query.message.reply_photo(photo)
-    await query.message.reply_text(Q_TOOTH)
+    await _send(update, context, session_id, "ask_tooth", Q_TOOTH)
     return ASK_TOOTH
 
 
@@ -156,7 +199,7 @@ async def _process_ask_tooth(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     status = await hostility.precheck(
         update, context, branch="teeth", step="ask_tooth",
-        acute_check=lambda: _check_acute(update, text, session_id),
+        acute_check=lambda: _check_acute(update, context, text, session_id),
         bot_question=Q_TOOTH, text_override=text,
     )
     if status in ("crisis", "acute", "closed"):
@@ -167,13 +210,17 @@ async def _process_ask_tooth(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if status == "hostile":
         return ASK_TOOTH
 
+    await _log_turn(session_id, update.effective_user, "ask_tooth", "человек", text)
+
     digits = re.sub(r"\D", "", text)
     if digits and digits.isdigit() and text.strip() == digits:
         number = int(digits)
         if number in VALID_TEETH_NUMBERS:
             return await _ask_confirmation(update, context, number)
-        await update.effective_message.reply_text(
-            "Такого номера нет на схеме. Глянь ещё раз картинку и напиши номер (11-18, 21-28, 31-38, 41-48)."
+        await _send(
+            update, context, session_id, "ask_tooth",
+            "Такого номера нет на схеме. Глянь ещё раз картинку и напиши номер (11-18, 21-28, 31-38, 41-48).",
+            msg_type="уточнение",
         )
         return ASK_TOOTH
 
@@ -181,13 +228,16 @@ async def _process_ask_tooth(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if candidate and candidate in VALID_TEETH_NUMBERS:
         return await _ask_confirmation(update, context, candidate)
 
-    await update.effective_message.reply_text(
-        "Не понял, какой это зуб. Посмотри на схему и напиши номер цифрами."
+    await _send(
+        update, context, session_id, "ask_tooth",
+        "Не понял, какой это зуб. Посмотри на схему и напиши номер цифрами.",
+        msg_type="уточнение",
     )
     return ASK_TOOTH
 
 
 async def _ask_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE, number: int) -> int:
+    session_id = context.user_data["teeth_session_id"]
     context.user_data["teeth_candidate"] = number
     keyboard = InlineKeyboardMarkup(
         [
@@ -197,29 +247,34 @@ async def _ask_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             ]
         ]
     )
-    await update.effective_message.reply_text(
-        f"Правильно понимаю: {describe_tooth(number)}, зуб {number}?", reply_markup=keyboard
+    await _send(
+        update, context, session_id, "confirm_tooth",
+        f"Правильно понимаю: {describe_tooth(number)}, зуб {number}?", reply_markup=keyboard,
     )
     return CONFIRM_TOOTH
 
 
 async def confirm_tooth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    session_id = context.user_data["teeth_session_id"]
     await query.answer()
+    await _log_turn(session_id, update.effective_user, "confirm_tooth", "человек", query.data, msg_type="кнопка")
     if query.data.endswith(":no"):
         context.user_data.pop("teeth_candidate", None)
         await query.edit_message_text("Хорошо, напиши номер по схеме ещё раз.")
+        await _log_turn(session_id, update.effective_user, "ask_tooth", "бот", "Хорошо, напиши номер по схеме ещё раз.", msg_type="уточнение")
         return ASK_TOOTH
     number = context.user_data.pop("teeth_candidate")
-    await query.edit_message_text(f"Принято — {describe_tooth(number)} (зуб {number}).")
+    confirm_text = f"Принято — {describe_tooth(number)} (зуб {number})."
+    await query.edit_message_text(confirm_text)
+    await _log_turn(session_id, update.effective_user, "confirm_tooth", "бот", confirm_text)
     return await _accept_tooth(update, context, number, via_query=True)
 
 
 async def _accept_tooth(update, context, number: int, via_query: bool = False) -> int:
     session_id = context.user_data["teeth_session_id"]
     db.update_teeth_session(session_id, tooth_number=number)
-    message = update.callback_query.message if via_query else update.effective_message
-    await message.reply_text(Q_SCARY)
+    await _send(update, context, session_id, "ask_scary", Q_SCARY)
     return ASK_SCARY
 
 
@@ -236,7 +291,7 @@ async def _process_ask_scary(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     status = await hostility.precheck(
         update, context, branch="teeth", step="ask_scary",
-        acute_check=lambda: _check_acute(update, text, session_id),
+        acute_check=lambda: _check_acute(update, context, text, session_id),
         bot_question=Q_SCARY, text_override=text,
     )
     if status in ("crisis", "acute", "closed"):
@@ -247,8 +302,9 @@ async def _process_ask_scary(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if status == "hostile":
         return ASK_SCARY
 
+    await _log_turn(session_id, update.effective_user, "ask_scary", "человек", text)
     db.update_teeth_session(session_id, scary_thing=text)
-    await update.effective_message.reply_text(Q_FEELING)
+    await _send(update, context, session_id, "ask_feeling", Q_FEELING)
     return ASK_FEELING
 
 
@@ -265,7 +321,7 @@ async def _process_ask_feeling(update: Update, context: ContextTypes.DEFAULT_TYP
 
     status = await hostility.precheck(
         update, context, branch="teeth", step="ask_feeling",
-        acute_check=lambda: _check_acute(update, text, session_id),
+        acute_check=lambda: _check_acute(update, context, text, session_id),
         bot_question=Q_FEELING, text_override=text,
     )
     if status in ("crisis", "acute", "closed"):
@@ -276,15 +332,17 @@ async def _process_ask_feeling(update: Update, context: ContextTypes.DEFAULT_TYP
     if status == "hostile":
         return ASK_FEELING
 
+    await _log_turn(session_id, update.effective_user, "ask_feeling", "человек", text)
     db.update_teeth_session(session_id, feeling_word=text)
     db.finish_teeth_session(session_id, completed=True)
     await sheets_logger.append("Зубы", _fetch_teeth_row(session_id))
     insert = html.escape(await llm.normalize_feeling_insert(text))
-    await update.effective_message.reply_text(
-        FINAL_TEMPLATE.format(insert=insert),
-        reply_markup=back_to_menu_keyboard(),
-        parse_mode=ParseMode.HTML,
+    final_text = FINAL_TEMPLATE.format(insert=insert)
+    await _send(
+        update, context, session_id, "final", final_text,
+        reply_markup=back_to_menu_keyboard(), parse_mode=ParseMode.HTML,
     )
+    await _log_and_build_matrix(session_id)
     await hostility.maybe_send_self_harm_note(update, context)
     return ConversationHandler.END
 

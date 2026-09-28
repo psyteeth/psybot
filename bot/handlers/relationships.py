@@ -14,7 +14,7 @@ from telegram.ext import (
     filters,
 )
 
-from bot import db, debounce, hostility, limits, llm
+from bot import db, debounce, dialogue_matrix, hostility, limits, llm
 from bot.config import (
     ADMIN_USERNAME,
     ENABLE_PRIOR_EVENT_QUESTION,
@@ -22,8 +22,6 @@ from bot.config import (
     LIMIT_RELATIONSHIP_MESSAGES,
     RELATIONSHIP_LIMIT_TEXT,
     ROADMAP_URL,
-    SELF_TARGET_CONFIDENCE_THRESHOLD,
-    SELF_TARGET_MAX_ATTEMPTS,
     TESTS_URL,
 )
 from bot.keyboards import back_to_menu_keyboard, menu_and_teeth_keyboard
@@ -189,30 +187,53 @@ def _row_for_sheets(row) -> list:
         row["exit_intent_step"] or "",
         row["avoidance_or_integration"] or "",
         row["exit_intent_answer"] or "",
+        _dialogue_session_id(row),
+        row["attempts_a"] if row["attempts_a"] is not None else "",
+        row["attempts_b"] if row["attempts_b"] is not None else "",
+        row["dozhim_outcome"] or "",
     ]
+
+
+def _dialogue_session_id(row) -> str:
+    """session_id для склейки «Диалоги»/«Диалоги (матрица)» с «Отношения»/«Зубы»
+    (ТЗ-доп. №6) — считается на лету из user_id+started_at, отдельная колонка в БД не нужна."""
+    return f"{row['user_id']}_{row['started_at']}"
 
 
 async def _log_session(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> None:
     row = db.get_relationship_session(session_id)
     await sheets_logger.append("Отношения", _row_for_sheets(row))
+    try:
+        await dialogue_matrix.build_relationship_matrix_column(
+            _dialogue_session_id(row), row["username"] or "", row["started_at"]
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось построить столбец матрицы для сессии %s", session_id)
 
 
-async def _log_turn(session_id: int, user, step: str, who: str, text: str) -> None:
-    """ТЗ-доп. №5, п.3.1 — полный лог диалога, одна строка на реплику (и бота, и человека),
-    отдельно от итоговой строки в «Отношения»."""
+async def _log_turn(session_id: int, user, step: str, who: str, text: str, msg_type: str = "обычный") -> None:
+    """ТЗ-доп. №5, п.3.1 / ТЗ-доп. №6, ч.1 — полный лог диалога, одна строка на реплику (и
+    бота, и человека), отдельно от итоговой строки в «Отношения»."""
     row = db.get_relationship_session(session_id)
     session_num = row["session_num"] if row else ""
+    dialogue_session_id = _dialogue_session_id(row) if row else ""
     await sheets_logger.append(
         "Диалоги",
-        [db.now(), user.id, user.username or "", "relationships", session_num, step, who, (text or "")[:2000]],
+        [
+            db.now(), user.id, dialogue_session_id, user.username or "", "relationships",
+            session_num, step, who, (text or "")[:2000], msg_type,
+        ],
     )
 
 
-async def _send(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, step: str, text: str, **kwargs):
+async def _send(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, step: str, text: str,
+    msg_type: str = "обычный", **kwargs,
+):
     """reply_text + запись реплики бота в «Диалоги» одним вызовом."""
     target = update.callback_query.message if update.callback_query else update.effective_message
     result = await target.reply_text(text, **kwargs)
-    await _log_turn(session_id, update.effective_user, step, "бот", text)
+    await _log_turn(session_id, update.effective_user, step, "бот", text, msg_type)
     return result
 
 
@@ -270,49 +291,84 @@ async def _bump_messages(session_id: int) -> int:
     return db.increment_relationship_messages(session_id)
 
 
-async def _refuse_self_target(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> int:
-    db.update_relationship_session(session_id, self_refused=1)
-    db.finish_relationship_session(session_id, exit_step="отказ_самообвинение")
-    await _log_session(update, context, session_id)
-    await _send(update, context, session_id, "self_target_refusal", SELF_REFUSAL_TEXT, reply_markup=menu_and_teeth_keyboard())
-    await hostility.maybe_send_self_harm_note(update, context)
-    context.user_data.pop("rel_session_id", None)
-    context.user_data.pop("rel_self_attempts", None)
-    return ConversationHandler.END
+DOZHIM_ATTEMPT1_TEXT = {
+    "A": (
+        "Я слышу, но не понимаю. Вопрос-то был: что тебя в нём бесит?\n"
+        "Продолжи предложение: «Меня в нём бесит то, что он…» (или «она…»)."
+    ),
+    "B": (
+        "Я слышу, но не понимаю. Вопрос-то был: как, по-твоему, он должен был бы себя вести?\n"
+        "Продолжи: «Он должен был бы…» (или «она должна была бы…»)."
+    ),
+}
+DOZHIM_ATTEMPT2_TEXT = {
+    "A": (
+        "Слышь, давай без этого, мозги не еби. Ответь конкретно: что тебя бесит, раздражает, "
+        "триггерит, печалит, задевает в поведении другого?\n"
+        "Продолжи: «Меня в нём бесит то, что он…»"
+    ),
+    "B": (
+        "Слышь, давай без этого, мозги не еби. Ответь конкретно: как, по-твоему, он должен был бы "
+        "себя вести?\n"
+        "Продолжи: «Он должен был бы…»"
+    ),
+}
+DOZHIM_EVASIVE_CLOSE_TEXT = (
+    "Слышишь, что-то не то происходит. Где-то ты юлишь. Как будешь готов конкретно сказать, чем "
+    "тебя раздражает другой, — начинай заново, и я тебе помогу.\n\n"
+    f"Если считаешь, что это ошибка, напиши администратору {ADMIN_USERNAME} — он решит этот вопрос."
+)
+DOZHIM_SELF_CLOSE_TEXT = (
+    SELF_REFUSAL_TEXT + "\n\n"
+    f"Если считаешь, что это ошибка, напиши администратору {ADMIN_USERNAME} — он решит этот вопрос."
+)
 
 
-async def _check_self_target(
+async def _check_dozhim(
     update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, step: str, text: str
 ) -> object:
-    """Запрос «проблема во мне» (ТЗ-доп. №3). Возвращает None, если проверка не сработала
-    (target=other) — вызывающий обработчик продолжает как обычно. Иначе уже отправила ответ
-    пользователю (переформулировка или отказ) и вернула состояние, которое должен вернуть
-    вызывающий обработчик как есть."""
-    classification = await llm.classify_self_target(text)
-    effective = classification["target"]
-    if effective == "unclear":
-        effective = "self" if classification["confidence"] < SELF_TARGET_CONFIDENCE_THRESHOLD else "other"
+    """Дожим конкретного ответа на A и B (ТЗ-доп. №6, ч.2 — заменяет разделы 2-3 ТЗ-доп. №3
+    целиком). Своя лестница из 3 попыток на A и своя на B. Возвращает None, если ответ принят
+    (target=other И concrete_behavior=true) — вызывающий обработчик продолжает как обычно.
+    Иначе уже отправила ответ пользователю и вернула состояние."""
+    attempts_key = f"rel_dozhim_{step.lower()}_attempts"
+    attempts = context.user_data.get(attempts_key, 0)
 
-    attempts = context.user_data.get("rel_self_attempts", 0)
+    classification = await llm.classify_concrete_answer(step, text)
+    accepted = classification["target"] == "other" and classification["concrete_behavior"]
 
-    if effective != "self":
-        if attempts > 0:
-            db.update_relationship_session(session_id, self_reformulated=1)
+    if accepted:
+        outcome = "принят с первого раза" if attempts == 0 else "переформулировал"
+        db.update_relationship_session(
+            session_id, **{f"attempts_{step.lower()}": attempts, "dozhim_outcome": outcome}
+        )
         return None
 
-    row = db.get_relationship_session(session_id)
-    if not row["self_request"]:
+    attempts += 1
+    context.user_data[attempts_key] = attempts
+
+    if attempts >= 3:
+        is_self = classification["target"] == "self"
+        outcome = "отказ_самообвинение" if is_self else "отказ_юлит"
+        close_text = DOZHIM_SELF_CLOSE_TEXT if is_self else DOZHIM_EVASIVE_CLOSE_TEXT
         db.update_relationship_session(
-            session_id, self_request=1, self_check_step=step, self_original_answer=text
+            session_id, self_refused=1,
+            **{f"attempts_{step.lower()}": attempts, "dozhim_outcome": outcome},
         )
+        db.finish_relationship_session(session_id, exit_step=outcome)
+        await _log_session(update, context, session_id)
+        await _send(
+            update, context, session_id, f"проверка_{step}", close_text, msg_type="отказ",
+            reply_markup=menu_and_teeth_keyboard(),
+        )
+        await hostility.maybe_send_self_harm_note(update, context)
+        context.user_data.pop("rel_session_id", None)
+        context.user_data.pop("rel_dozhim_a_attempts", None)
+        context.user_data.pop("rel_dozhim_b_attempts", None)
+        return ConversationHandler.END
 
-    if attempts >= SELF_TARGET_MAX_ATTEMPTS:
-        return await _refuse_self_target(update, context, session_id)
-
-    context.user_data["rel_self_attempts"] = attempts + 1
-    other_person = classification.get("other_person") or (row["other_person"] if step == "B" else None)
-    reframe = await llm.generate_self_reframe(step, text, other_person)
-    await _send(update, context, session_id, step, reframe)
+    prompt = DOZHIM_ATTEMPT1_TEXT[step] if attempts == 1 else DOZHIM_ATTEMPT2_TEXT[step]
+    await _send(update, context, session_id, f"проверка_{step}", prompt, msg_type="уточнение")
     return A_EVENT if step == "A" else B_NARRATIVE
 
 
@@ -404,9 +460,9 @@ async def _process_a_event(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     await _bump_messages(session_id)
     db.update_relationship_session(session_id, a_event=text)
 
-    self_state = await _check_self_target(update, context, session_id, "A", text)
-    if self_state is not None:
-        return self_state
+    dozhim_state = await _check_dozhim(update, context, session_id, "A", text)
+    if dozhim_state is not None:
+        return dozhim_state
 
     if ENABLE_PRIOR_EVENT_QUESTION:
         await _send(update, context, session_id, "A_prior", PRIOR_EVENT_QUESTION)
@@ -515,9 +571,9 @@ async def _process_b_narrative(update: Update, context: ContextTypes.DEFAULT_TYP
     db.update_relationship_session(session_id, b_narrative_raw=text)
     context.user_data["rel_raw_narrative"] = text
 
-    self_state = await _check_self_target(update, context, session_id, "B", text)
-    if self_state is not None:
-        return self_state
+    dozhim_state = await _check_dozhim(update, context, session_id, "B", text)
+    if dozhim_state is not None:
+        return dozhim_state
 
     row = db.get_relationship_session(session_id)
     reformulated = await llm.reformulate_narrative(row["a_event"], text)
@@ -995,7 +1051,9 @@ async def e_summary_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     query = update.callback_query
     await query.answer()
     session_id = context.user_data["rel_session_id"]
-    await _log_turn(session_id, update.effective_user, "E_summary_confirm", "человек", query.data)
+    await _log_turn(
+        session_id, update.effective_user, "E_summary_confirm", "человек", query.data, msg_type="кнопка"
+    )
 
     if query.data.endswith(":add"):
         await _send(update, context, session_id, "E_summary_correction", "Что добавить или поправить?")

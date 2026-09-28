@@ -53,6 +53,7 @@ def build_application():
     application.add_handler(CommandHandler("start", menu.start_command, filters=filters.ChatType.PRIVATE))
     application.add_handler(CommandHandler("limits", menu.limits_command))
     application.add_handler(CommandHandler("stats", menu.stats_command))
+    application.add_handler(CommandHandler("dialog", menu.dialog_command))
     application.add_handler(CommandHandler("chatid", menu.chatid_command))
     application.add_handler(CommandHandler("send", menu.send_command))
     application.add_handler(
