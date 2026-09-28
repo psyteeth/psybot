@@ -5,7 +5,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from bot.config import COUNT_SELF_REFUSED_TOWARD_LIMIT, DB_PATH
+from bot.config import COUNT_CRISIS_TOWARD_LIMIT, COUNT_SELF_REFUSED_TOWARD_LIMIT, DB_PATH
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS relationship_sessions (
     self_check_step TEXT,
     self_original_answer TEXT,
     self_reformulated INTEGER NOT NULL DEFAULT 0,
-    self_refused INTEGER NOT NULL DEFAULT 0
+    self_refused INTEGER NOT NULL DEFAULT 0,
+    note TEXT
 );
 
 CREATE TABLE IF NOT EXISTS teeth_sessions (
@@ -115,6 +116,7 @@ MIGRATIONS = [
     "ALTER TABLE relationship_sessions ADD COLUMN self_original_answer TEXT",
     "ALTER TABLE relationship_sessions ADD COLUMN self_reformulated INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE relationship_sessions ADD COLUMN self_refused INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE relationship_sessions ADD COLUMN note TEXT",
 ]
 
 
@@ -157,6 +159,9 @@ def count_relationship_sessions_this_month(user_id: int) -> int:
         # разбор, закрытый отказом («запрос на себя», ТЗ-доп. №3) по сути не начался —
         # не должен списываться из месячного лимита.
         query += " AND self_refused=0"
+    if not COUNT_CRISIS_TOWARD_LIMIT:
+        # разбор, закрытый по проверке суицид/самоповреждение (ТЗ-доп. №4) — та же логика.
+        query += " AND (exit_step IS NULL OR exit_step != 'crisis')"
     with get_conn() as conn:
         row = conn.execute(query, params).fetchone()
         return row["c"]

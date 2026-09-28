@@ -239,22 +239,6 @@ async def classify_confirmation(reply: str) -> str:
         return "confirm"
 
 
-CRISIS_SYSTEM = (
-    "Ты классификатор безопасности в психологическом боте. По описанию события пользователем "
-    "определи, есть ли признаки насилия, угроз жизни/здоровью или реальной опасности (не просто "
-    "бытовой конфликт, а именно насилие/угрозы/опасность). Ответь ровно одним словом: yes или no."
-)
-
-
-async def detect_crisis(event_text: str) -> bool:
-    try:
-        result = await _ask(CRISIS_SYSTEM, event_text, MODEL_SONNET, max_tokens=10)
-        return "yes" in result.lower()
-    except Exception:  # noqa: BLE001
-        logger.exception("detect_crisis упал")
-        return False
-
-
 ADVICE_SYSTEM = (
     "Ты — ассистент психостоматологического бота, ветка «Отношения». У пользователя есть "
     "событие (A), подтверждённое долженствование (B) и его эмоциональная реакция (C). "

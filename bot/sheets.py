@@ -42,6 +42,8 @@ RELATIONSHIP_HEADER = [
     "отражение_перед_E",
     # ТЗ-доп. №3 — запрос «проблема во мне»
     "запрос_на_себя", "шаг_проверки", "исходный_ответ", "переформулирован", "отказ_самообвинение",
+    # ТЗ-доп. №4
+    "примечание",
     "тест",
 ]
 TEETH_HEADER = [
@@ -62,6 +64,8 @@ HOSTILITY_HEADER = [
     "тест",
 ]
 
+ADMIN_MESSAGES_HEADER = ["timestamp", "user_id", "текст", "статус", "тест"]
+
 LIMIT_OVERRIDES_HEADER = ["user_id", "ветка", "лимит", "комментарий"]
 LIMIT_OVERRIDES_TAB = "Лимиты (ручные)"
 
@@ -74,6 +78,7 @@ SHEET_TABS = {
     "Концепция": CONCEPT_HEADER,
     "Лимиты": LIMITS_HEADER,
     "Выпады": HOSTILITY_HEADER,
+    "Админ-сообщения": ADMIN_MESSAGES_HEADER,
     LIMIT_OVERRIDES_TAB: LIMIT_OVERRIDES_HEADER,
     RELATIVES_TAB: RELATIVES_HEADER,
 }

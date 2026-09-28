@@ -1,11 +1,13 @@
 import logging
 
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
 from bot import db, limits, llm, stats
 from bot.config import ADMIN_CHAT_ID, NO_ACCESS_TEXT
 from bot.keyboards import main_menu_keyboard
+from bot.sheets import sheets_logger
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +109,36 @@ async def weekly_stats_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"📊 Еженедельная сводка\n\n{text}")
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось отправить еженедельную сводку админу")
+
+
+async def send_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/send <user_id> <текст> — только для ADMIN_CHAT_ID: отправляет сообщение указанному
+    пользователю от имени бота и логирует отправку. Текст берём из сырого текста сообщения
+    (не context.args), чтобы сохранить переносы строк на многоабзацных сообщениях."""
+    caller_id = update.effective_user.id
+    if not ADMIN_CHAT_ID or str(caller_id) != str(ADMIN_CHAT_ID):
+        return
+
+    raw = update.effective_message.text or ""
+    parts = raw.split(maxsplit=2)
+    if len(parts) < 3:
+        await update.effective_message.reply_text("Использование: /send <user_id> <текст>")
+        return
+
+    try:
+        target_id = int(parts[1])
+    except ValueError:
+        await update.effective_message.reply_text("user_id должен быть числом.")
+        return
+
+    text = parts[2]
+    try:
+        await context.bot.send_message(chat_id=target_id, text=text)
+        await sheets_logger.append("Админ-сообщения", [db.now(), target_id, text, "отправлено"])
+        await update.effective_message.reply_text("Отправлено.")
+    except TelegramError as e:
+        await sheets_logger.append("Админ-сообщения", [db.now(), target_id, text, f"ошибка: {e}"])
+        await update.effective_message.reply_text(f"Не удалось отправить (пользователь мог заблокировать бота): {e}")
 
 
 async def chatid_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

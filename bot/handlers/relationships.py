@@ -46,10 +46,6 @@ Q_C_TEMPLATE = (
     "Когда {narrative_short}не совпадает с тем, что происходит на самом деле — что ты чувствуешь "
     "и как реагируешь?"
 )
-CRISIS_TEXT = (
-    "Похоже, тут речь о насилии, угрозах или опасности. Такую ситуацию лучше разбирать со "
-    f"специалистом напрямую. Пиши {ADMIN_USERNAME}."
-)
 WRAP_TEXT = "Мы прошли уже много — давай подведём предварительный итог."
 E_NO_INSIGHT_TEXT = (
     "Похоже, сейчас ответ не находится — и это тоже нормально, не обязательно сразу. Если захочется "
@@ -129,6 +125,7 @@ def _row_for_sheets(row) -> list:
         row["self_original_answer"] or "",
         "да" if row["self_reformulated"] else "нет",
         "да" if row["self_refused"] else "нет",
+        row["note"] or "",
     ]
 
 
@@ -307,7 +304,7 @@ async def _process_a_event(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         update, context, branch="relationships", step="A", bot_question=Q_A, text_override=text
     )
     if status == "crisis":
-        await _close_after_hostility(session_id, "self_harm_crisis")
+        await _close_after_hostility(session_id, "crisis")
         return ConversationHandler.END
     if status == "hostile":
         return A_EVENT
@@ -317,12 +314,6 @@ async def _process_a_event(update: Update, context: ContextTypes.DEFAULT_TYPE, t
 
     await _bump_messages(session_id)
     db.update_relationship_session(session_id, a_event=text)
-
-    if await llm.detect_crisis(text):
-        db.finish_relationship_session(session_id, exit_step="crisis")
-        await _log_session(session_id)
-        await update.effective_message.reply_text(CRISIS_TEXT, reply_markup=back_to_menu_keyboard())
-        return ConversationHandler.END
 
     self_state = await _check_self_target(update, context, session_id, "A", text)
     if self_state is not None:
@@ -363,7 +354,7 @@ async def _process_a_prior_event(update: Update, context: ContextTypes.DEFAULT_T
         bot_question=PRIOR_EVENT_QUESTION, text_override=text,
     )
     if status == "crisis":
-        await _close_after_hostility(session_id, "self_harm_crisis")
+        await _close_after_hostility(session_id, "crisis")
         return ConversationHandler.END
     if status == "hostile":
         return A_PRIOR_EVENT
@@ -391,7 +382,7 @@ async def _process_a_other_person(update: Update, context: ContextTypes.DEFAULT_
         bot_question=OTHER_PERSON_QUESTION, text_override=text,
     )
     if status == "crisis":
-        await _close_after_hostility(session_id, "self_harm_crisis")
+        await _close_after_hostility(session_id, "crisis")
         return ConversationHandler.END
     if status == "hostile":
         return A_OTHER_PERSON
@@ -420,7 +411,7 @@ async def _process_b_narrative(update: Update, context: ContextTypes.DEFAULT_TYP
         update, context, branch="relationships", step="B", bot_question=Q_B, text_override=text
     )
     if status == "crisis":
-        await _close_after_hostility(session_id, "self_harm_crisis")
+        await _close_after_hostility(session_id, "crisis")
         return ConversationHandler.END
     if status == "hostile":
         return B_NARRATIVE
@@ -459,7 +450,7 @@ async def _process_b_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
         bot_question=pending_question, text_override=text,
     )
     if status == "crisis":
-        await _close_after_hostility(session_id, "self_harm_crisis")
+        await _close_after_hostility(session_id, "crisis")
         return ConversationHandler.END
     if status == "hostile":
         return B_CONFIRM
@@ -508,7 +499,7 @@ async def _process_c_consequence(update: Update, context: ContextTypes.DEFAULT_T
         text_override=text,
     )
     if status == "crisis":
-        await _close_after_hostility(session_id, "self_harm_crisis")
+        await _close_after_hostility(session_id, "crisis")
         return ConversationHandler.END
     if status == "hostile":
         return C_CONSEQUENCE
@@ -545,7 +536,7 @@ async def _process_c_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE,
         bot_question=feeling_question, text_override=text,
     )
     if status == "crisis":
-        await _close_after_hostility(session_id, "self_harm_crisis")
+        await _close_after_hostility(session_id, "crisis")
         return ConversationHandler.END
     if status == "hostile":
         return C_FEELING
@@ -581,7 +572,7 @@ async def _process_c_discomfort(update: Update, context: ContextTypes.DEFAULT_TY
         bot_question=DISCOMFORT_BEFORE_Q, text_override=text,
     )
     if status == "crisis":
-        await _close_after_hostility(session_id, "self_harm_crisis")
+        await _close_after_hostility(session_id, "crisis")
         return ConversationHandler.END
     if status == "hostile":
         return C_DISCOMFORT
@@ -620,7 +611,7 @@ async def _process_d_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
         bot_question=offer_text, text_override=text,
     )
     if status == "crisis":
-        await _close_after_hostility(session_id, "self_harm_crisis")
+        await _close_after_hostility(session_id, "crisis")
         return ConversationHandler.END
     if status == "hostile":
         return D_CONFIRM
@@ -662,7 +653,7 @@ async def _process_d_question(update: Update, context: ContextTypes.DEFAULT_TYPE
         update, context, branch="relationships", step="D", skip_hostility=True, text_override=text
     )
     if status == "crisis":
-        await _close_after_hostility(session_id, "self_harm_crisis")
+        await _close_after_hostility(session_id, "crisis")
         return ConversationHandler.END
 
     count = await _bump_messages(session_id)
@@ -699,7 +690,7 @@ async def _process_e_discomfort_after(update: Update, context: ContextTypes.DEFA
         bot_question=DISCOMFORT_AFTER_Q, text_override=text,
     )
     if status == "crisis":
-        await _close_after_hostility(session_id, "self_harm_crisis")
+        await _close_after_hostility(session_id, "crisis")
         return ConversationHandler.END
     if status == "hostile":
         return E_DISCOMFORT_AFTER
@@ -784,7 +775,7 @@ async def _process_e_summary_correction(update: Update, context: ContextTypes.DE
         bot_question="Что добавить или поправить?", text_override=text,
     )
     if status == "crisis":
-        await _close_after_hostility(session_id, "self_harm_crisis")
+        await _close_after_hostility(session_id, "crisis")
         return ConversationHandler.END
     if status == "hostile":
         return E_SUMMARY_CORRECTION
@@ -826,7 +817,7 @@ async def _process_e_summary(update: Update, context: ContextTypes.DEFAULT_TYPE,
         update, context, branch="relationships", step="E", bot_question=e_question, text_override=text
     )
     if status == "crisis":
-        await _close_after_hostility(session_id, "self_harm_crisis")
+        await _close_after_hostility(session_id, "crisis")
         return ConversationHandler.END
     if status == "hostile":
         return E_SUMMARY
@@ -862,7 +853,7 @@ async def _process_e_followup(update: Update, context: ContextTypes.DEFAULT_TYPE
         update, context, branch="relationships", step="E_followup", text_override=text
     )
     if status == "crisis":
-        await _close_after_hostility(session_id, "self_harm_crisis")
+        await _close_after_hostility(session_id, "crisis")
         return ConversationHandler.END
     if status == "hostile":
         return E_FOLLOWUP
