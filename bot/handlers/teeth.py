@@ -162,6 +162,7 @@ async def _process_ask_tooth(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if status in ("crisis", "acute", "closed"):
         if status != "acute":
             db.finish_teeth_session(session_id, completed=False)
+        await hostility.maybe_send_self_harm_note(update, context)
         return ConversationHandler.END
     if status == "hostile":
         return ASK_TOOTH
@@ -241,6 +242,7 @@ async def _process_ask_scary(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if status in ("crisis", "acute", "closed"):
         if status != "acute":
             db.finish_teeth_session(session_id, completed=False)
+        await hostility.maybe_send_self_harm_note(update, context)
         return ConversationHandler.END
     if status == "hostile":
         return ASK_SCARY
@@ -269,6 +271,7 @@ async def _process_ask_feeling(update: Update, context: ContextTypes.DEFAULT_TYP
     if status in ("crisis", "acute", "closed"):
         if status != "acute":
             db.finish_teeth_session(session_id, completed=False)
+        await hostility.maybe_send_self_harm_note(update, context)
         return ConversationHandler.END
     if status == "hostile":
         return ASK_FEELING
@@ -282,6 +285,7 @@ async def _process_ask_feeling(update: Update, context: ContextTypes.DEFAULT_TYP
         reply_markup=back_to_menu_keyboard(),
         parse_mode=ParseMode.HTML,
     )
+    await hostility.maybe_send_self_harm_note(update, context)
     return ConversationHandler.END
 
 
@@ -292,6 +296,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if session_id:
         db.finish_teeth_session(session_id, completed=False)
     await show_menu(update, context)
+    await hostility.maybe_send_self_harm_note(update, context)
     return ConversationHandler.END
 
 

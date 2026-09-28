@@ -30,6 +30,17 @@ SELF_HARM_TEXT = (
     f"{ADMIN_USERNAME}. Возвращайся сюда, когда будешь готов(а) — никуда не тороплю."
 )
 
+# «Мягкий» уровень (гипербола вроде «жить не хочется», без признаков реального текущего
+# намерения) не останавливает разбор — люди в «Отношения» часто говорят так о партнёре/ситуации,
+# и это материал разбора, а не кризис. Вместо жёсткого стопа — ненавязчивая пометка в конце сессии
+# (см. maybe_send_self_harm_note), плюс тихое уведомление админу на всякий случай.
+SELF_HARM_SOFT_NOTE = (
+    "Отдельно, коротко: в переписке мелькали фразы, похожие на «не хочу жить» — надеюсь, это просто "
+    "эмоции. Но если вдруг это не так и тебе правда тяжело — пожалуйста, не держи это в себе: "
+    "8-800-2000-122 (бесплатно, круглосуточно, по России) или пиши напрямую "
+    f"{ADMIN_USERNAME}. Забочусь."
+)
+
 FINAL_MESSAGE = (
     "Похоже, спорить тебе интереснее, чем разбираться. Хочешь поспорить с живым человеком — пиши "
     f"{ADMIN_USERNAME}."
@@ -71,6 +82,19 @@ def reset_session(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["hostility_last_category"] = None
     context.user_data["hostility_profanity_seen"] = False
     context.user_data.pop("hostility_pending_row", None)
+    context.user_data.pop("self_harm_mild_flagged", None)
+
+
+async def maybe_send_self_harm_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Вызывать в конце сессии/разговора (после финального сообщения) — если за сессию
+    хоть раз проскочил «мягкий» суицидальный маркер, шлёт отдельным сообщением ненавязчивую
+    пометку с контактами помощи, не мешая уже отправленному финалу разбора."""
+    if not context.user_data.pop("self_harm_mild_flagged", False):
+        return
+    try:
+        await update.effective_message.reply_text(SELF_HARM_SOFT_NOTE)
+    except Exception:  # noqa: BLE001
+        logger.exception("Не удалось отправить мягкую пометку про self-harm")
 
 
 async def precheck(
@@ -102,9 +126,26 @@ async def precheck(
     text = text_override if text_override is not None else (update.effective_message.text or "")
     _track_profanity(context, text)
 
-    if await llm.detect_self_harm(text):
+    self_harm_level = await llm.classify_self_harm(text)
+    if self_harm_level == "acute":
         await update.effective_message.reply_text(SELF_HARM_TEXT, reply_markup=back_to_menu_keyboard())
         return "crisis"
+    if self_harm_level == "mild":
+        context.user_data["self_harm_mild_flagged"] = True
+        if ADMIN_CHAT_ID:
+            try:
+                user = update.effective_user
+                await context.bot.send_message(
+                    chat_id=ADMIN_CHAT_ID,
+                    text=(
+                        f"ℹ️ Мягкий суицидальный маркер (возможна гипербола) у "
+                        f"@{user.username or user.id} в ветке «{branch}», шаг {step}. "
+                        f"Текст: {text[:300]}\nРазбор не остановлен, в конце пользователю уйдёт "
+                        "мягкая пометка с контактами помощи."
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Не удалось уведомить админа о mild self-harm маркере")
 
     if acute_check is not None and await acute_check():
         return "acute"

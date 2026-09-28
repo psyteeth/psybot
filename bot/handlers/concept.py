@@ -104,6 +104,7 @@ async def _process_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, quest
         return ConversationHandler.END
     if status == "closed":
         db.increment_concept_messages(user.id)
+        await hostility.maybe_send_self_harm_note(update, context)
         return ConversationHandler.END
     if status == "hostile":
         return ASKING
@@ -147,6 +148,7 @@ async def _process_clarify_reply(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
     if status == "closed":
         db.increment_concept_messages(user.id)
+        await hostility.maybe_send_self_harm_note(update, context)
         return ConversationHandler.END
     if status == "hostile":
         return CLARIFY
@@ -224,6 +226,7 @@ async def _process_clarify_reply(update: Update, context: ContextTypes.DEFAULT_T
         context.user_data["concept_dispute_streak"] = 0
 
     context.user_data.pop("concept_raw_question", None)
+    await hostility.maybe_send_self_harm_note(update, context)
     return ASKING
 
 
@@ -231,6 +234,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     from bot.handlers.menu import show_menu
 
     await show_menu(update, context)
+    await hostility.maybe_send_self_harm_note(update, context)
     return ConversationHandler.END
 
 
