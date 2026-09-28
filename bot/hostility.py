@@ -30,6 +30,14 @@ SELF_HARM_TEXT = (
     f"{ADMIN_USERNAME}. Возвращайся сюда, когда будешь готов(а) — никуда не тороплю."
 )
 
+# «Острый» уровень раньше сразу обрывал разбор. Теперь — сперва уточняющий вопрос (человек мог
+# сказать это как фигуру речи), и только если подтвердит, что всерьёз (или ответ не проясняет —
+# осторожный дефолт), уходит SELF_HARM_TEXT и разбор закрывается.
+SELF_HARM_CONFIRM_QUESTION = (
+    "Стоп на секунду — прежде чем продолжить, мне важно понять: то, что ты сейчас написал(а), это "
+    "на полном серьёзе, или это просто способ высказаться, метафора?"
+)
+
 # «Мягкий» уровень (гипербола вроде «жить не хочется», без признаков реального текущего
 # намерения) не останавливает разбор — люди в «Отношения» часто говорят так о партнёре/ситуации,
 # и это материал разбора, а не кризис. Вместо жёсткого стопа — ненавязчивая пометка в конце сессии
@@ -83,6 +91,8 @@ def reset_session(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data["hostility_profanity_seen"] = False
     context.user_data.pop("hostility_pending_row", None)
     context.user_data.pop("self_harm_mild_flagged", None)
+    context.user_data.pop("self_harm_awaiting_confirm", None)
+    context.user_data.pop("self_harm_pending_question", None)
 
 
 async def maybe_send_self_harm_note(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -95,6 +105,23 @@ async def maybe_send_self_harm_note(update: Update, context: ContextTypes.DEFAUL
         await update.effective_message.reply_text(SELF_HARM_SOFT_NOTE)
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось отправить мягкую пометку про self-harm")
+
+
+async def _resolve_self_harm_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> str:
+    """Обрабатывает ответ на SELF_HARM_CONFIRM_QUESTION. Возвращает статус для precheck —
+    "crisis" (подтвердил/неясно — уходит SELF_HARM_TEXT, разбор закрывается) или "hostile"
+    (это была метафора — переспрашиваем исходный вопрос шага, разбор продолжается)."""
+    context.user_data.pop("self_harm_awaiting_confirm", None)
+    pending_question = context.user_data.pop("self_harm_pending_question", "")
+
+    verdict = await llm.classify_self_harm_confirm(text)
+    if verdict != "not_serious":  # serious ИЛИ unclear — осторожный дефолт, не молчим
+        await update.effective_message.reply_text(SELF_HARM_TEXT, reply_markup=back_to_menu_keyboard())
+        return "crisis"
+
+    if pending_question:
+        await update.effective_message.reply_text(pending_question)
+    return "hostile"
 
 
 async def precheck(
@@ -110,8 +137,9 @@ async def precheck(
 ) -> str:
     """Возвращает:
     - "none"    — не перехвачено, обрабатывай сообщение как обычно;
-    - "crisis"  — суицидальный кризис, ответ уже отправлен, обработчик должен
-                  завершить сессию/разговор (ConversationHandler.END);
+    - "crisis"  — подтверждённый суицидальный кризис (после уточняющего вопроса — см.
+                  SELF_HARM_CONFIRM_QUESTION/_resolve_self_harm_confirm), ответ уже отправлен,
+                  обработчик должен завершить сессию/разговор (ConversationHandler.END);
     - "acute"   — сработал переданный acute_check (например острая боль в
                   «Зубах»), он уже сам отправил ответ, обработчик завершает разговор;
     - "hostile" — панчлайн отправлен, обработчик должен остаться на том же шаге,
@@ -126,10 +154,15 @@ async def precheck(
     text = text_override if text_override is not None else (update.effective_message.text or "")
     _track_profanity(context, text)
 
+    if context.user_data.get("self_harm_awaiting_confirm"):
+        return await _resolve_self_harm_confirm(update, context, text)
+
     self_harm_level = await llm.classify_self_harm(text)
     if self_harm_level == "acute":
-        await update.effective_message.reply_text(SELF_HARM_TEXT, reply_markup=back_to_menu_keyboard())
-        return "crisis"
+        context.user_data["self_harm_awaiting_confirm"] = True
+        context.user_data["self_harm_pending_question"] = bot_question or ""
+        await update.effective_message.reply_text(SELF_HARM_CONFIRM_QUESTION)
+        return "hostile"
     if self_harm_level == "mild":
         context.user_data["self_harm_mild_flagged"] = True
         if ADMIN_CHAT_ID:

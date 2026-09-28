@@ -625,6 +625,34 @@ async def classify_self_harm(text: str) -> str:
         return "none"
 
 
+SELF_HARM_CONFIRM_SYSTEM = (
+    "Пользователь психологического бота только что написал нечто похожее на острую суицидальную "
+    "угрозу/намерение навредить себе. Бот спросил его прямо: «то, что ты написал(а) — на полном "
+    "серьёзе, или это просто способ высказаться, метафора?». Определи по ответу пользователя:\n"
+    '- "serious" — подтверждает, что всерьёз (прямо говорит «да, серьёзно», либо повторяет/'
+    "усиливает угрозу, либо содержательно не отрицает).\n"
+    '- "not_serious" — ясно отрицает: это была метафора/фигура речи/эмоции/шутка/способ выразить '
+    "злость, не буквально.\n"
+    '- "unclear" — ответ не даёт понять однозначно ни то, ни другое (ушёл от ответа, сменил тему, '
+    "непонятное сообщение).\n\n"
+    "Ответь СТРОГО одним словом: serious, not_serious или unclear."
+)
+
+
+async def classify_self_harm_confirm(text: str) -> str:
+    try:
+        result = await _ask(SELF_HARM_CONFIRM_SYSTEM, text, MODEL_HAIKU, max_tokens=10)
+        result = result.lower().strip()
+        for verdict in ("not_serious", "serious", "unclear"):
+            if verdict in result:
+                return verdict
+        return "unclear"
+    except Exception:  # noqa: BLE001
+        logger.exception("classify_self_harm_confirm упал")
+        # безопасный дефолт при сбое — как unclear, эскалируем к специалисту, а не молчим
+        return "unclear"
+
+
 def _strip_code_fence(raw: str) -> str:
     raw = raw.strip()
     if raw.startswith("```"):
