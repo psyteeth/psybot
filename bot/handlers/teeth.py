@@ -61,6 +61,17 @@ OTHER_PERSON_ANXIOUS_TEXT = (
 )
 
 
+# Живой кейс: люди отвечают на «Каким ты тогда себя чувствуешь?» ярлыком/фактом («не целый», «не
+# справившийся»), а не прожитой эмоцией — бот должен докопаться до настоящего чувства, а не
+# принимать первый попавшийся ярлык.
+FEELING_DIG_MAX_ATTEMPTS = 2
+FEELING_DIG_TEXT = (
+    "Диагностика — штука не самая комфортная, и всё же это самый важный шаг на пути к тому, чтобы "
+    'понять, откуда идёт проблема с зубами. Так что скажи честно: ты сказал(а) «{label}» — а что в '
+    "этом самое страшное?"
+)
+
+
 def _other_person_note_text(subject_age: str, motivation: str) -> str:
     if subject_age == "minor":
         return OTHER_PERSON_MINOR_TEXT
@@ -206,6 +217,7 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     session_id = db.create_teeth_session(user.id, user.username)
     context.user_data["teeth_session_id"] = session_id
+    context.user_data.pop("teeth_feeling_attempts", None)
     hostility.reset_session(context)
 
     with open(TEETH_CHART_PATH, "rb") as photo:
@@ -367,6 +379,17 @@ async def _process_ask_feeling(update: Update, context: ContextTypes.DEFAULT_TYP
         return ASK_FEELING
 
     await _log_turn(session_id, update.effective_user, "ask_feeling", "человек", text)
+
+    attempts = context.user_data.get("teeth_feeling_attempts", 0)
+    if attempts < FEELING_DIG_MAX_ATTEMPTS:
+        depth = await llm.classify_feeling_depth(text)
+        if not depth["is_deep"]:
+            context.user_data["teeth_feeling_attempts"] = attempts + 1
+            dig_text = FEELING_DIG_TEXT.format(label=depth["label"])
+            await _send(update, context, session_id, "ask_feeling", dig_text, msg_type="уточнение")
+            return ASK_FEELING
+
+    context.user_data.pop("teeth_feeling_attempts", None)
     db.update_teeth_session(session_id, feeling_word=text)
     db.finish_teeth_session(session_id, completed=True)
     await sheets_logger.append("Зубы", _fetch_teeth_row(session_id))
