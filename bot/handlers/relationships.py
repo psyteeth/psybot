@@ -443,10 +443,18 @@ async def a_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _process_a_event(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     session_id = context.user_data["rel_session_id"]
-    await _log_turn(session_id, update.effective_user, "A", "человек", text)
+    # Баг из живой сессии: пока идёт лестница дожима (ТЗ-доп. №6), ответ пользователя на
+    # реплику дожима возвращает то же состояние A_EVENT — и без этой проверки ответ логировался
+    # бы под шагом "A" вместо "проверка_A", а bot_question для hostility.precheck оставался бы
+    # исходным Q_A вместо реального последнего вопроса бота.
+    attempts_a = context.user_data.get("rel_dozhim_a_attempts", 0)
+    in_dozhim_retry = attempts_a > 0
+    log_step = "проверка_A" if in_dozhim_retry else "A"
+    bot_question = (DOZHIM_ATTEMPT1_TEXT["A"] if attempts_a == 1 else DOZHIM_ATTEMPT2_TEXT["A"]) if in_dozhim_retry else Q_A
+    await _log_turn(session_id, update.effective_user, log_step, "человек", text)
 
     status = await hostility.precheck(
-        update, context, branch="relationships", step="A", bot_question=Q_A, text_override=text
+        update, context, branch="relationships", step=log_step, bot_question=bot_question, text_override=text
     )
     if status == "crisis":
         await _close_after_hostility(update, context, session_id, "crisis")
@@ -553,10 +561,16 @@ async def b_narrative(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _process_b_narrative(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     session_id = context.user_data["rel_session_id"]
-    await _log_turn(session_id, update.effective_user, "B", "человек", text)
+    # см. тот же фикс в _process_a_event — во время лестницы дожима это состояние (B_NARRATIVE)
+    # тоже переиспользуется, ответ на дожим иначе логировался бы под "B", а не "проверка_B".
+    attempts_b = context.user_data.get("rel_dozhim_b_attempts", 0)
+    in_dozhim_retry = attempts_b > 0
+    log_step = "проверка_B" if in_dozhim_retry else "B"
+    bot_question = (DOZHIM_ATTEMPT1_TEXT["B"] if attempts_b == 1 else DOZHIM_ATTEMPT2_TEXT["B"]) if in_dozhim_retry else Q_B
+    await _log_turn(session_id, update.effective_user, log_step, "человек", text)
 
     status = await hostility.precheck(
-        update, context, branch="relationships", step="B", bot_question=Q_B, text_override=text
+        update, context, branch="relationships", step=log_step, bot_question=bot_question, text_override=text
     )
     if status == "crisis":
         await _close_after_hostility(update, context, session_id, "crisis")
