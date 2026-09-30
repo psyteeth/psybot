@@ -8,4 +8,5 @@ data/*.db
 data/*.db-journal
 data/*.pickle
 data/backups/
+data/events_export.csv
 .DS_Store

@@ -4,7 +4,7 @@ from telegram import Update
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
-from bot import db, limits, llm, stats
+from bot import analytics, db, limits, llm, stats
 from bot.config import ADMIN_CHAT_ID, NO_ACCESS_TEXT
 from bot.keyboards import main_menu_keyboard
 from bot.secrets_index import secrets_index
@@ -46,6 +46,11 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.clear()
+    user = update.effective_user
+    db.upsert_user(user.id, user.username)
+    source = analytics.parse_source(context.args)
+    db.set_source(user.id, source)
+    await analytics.log(context, user.id, "start")
     await show_menu(update, context)
 
 
@@ -121,6 +126,46 @@ async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     n = await secrets_index.reload()
     await update.effective_message.reply_text(f"Индекс секретов обновлён: {n} фрагментов.")
+
+
+async def stats_funnel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stats_funnel [дней=7] — аналитика воронки рекламы (ТЗ 30.09): по source и A/B-варианту,
+    start → flow_started → A → B → C → D → E → cta_click. Только для ADMIN_CHAT_ID."""
+    caller_id = update.effective_user.id
+    if not ADMIN_CHAT_ID or str(caller_id) != str(ADMIN_CHAT_ID):
+        return
+    days = 7
+    if context.args:
+        try:
+            days = int(context.args[0])
+        except ValueError:
+            await update.effective_message.reply_text("Использование: /stats_funnel [дней]")
+            return
+    text = await analytics.compute_funnel_stats(days)
+    await update.effective_message.reply_text(text)
+
+
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/export — CSV всей таблицы events файлом в чат. Только для ADMIN_CHAT_ID."""
+    caller_id = update.effective_user.id
+    if not ADMIN_CHAT_ID or str(caller_id) != str(ADMIN_CHAT_ID):
+        return
+    path = analytics.export_csv()
+    with open(path, "rb") as f:
+        await update.effective_message.reply_document(f, filename="events.csv")
+
+
+async def links_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/links — готовые рекламные ссылки t.me/<бот>?start=<метка> по меткам из конфига
+    (AD_CAMPAIGN_LABELS). Только для ADMIN_CHAT_ID."""
+    caller_id = update.effective_user.id
+    if not ADMIN_CHAT_ID or str(caller_id) != str(ADMIN_CHAT_ID):
+        return
+    from bot.config import AD_CAMPAIGN_LABELS
+
+    bot_username = (await context.bot.get_me()).username
+    lines = [f"https://t.me/{bot_username}?start={label}" for label in AD_CAMPAIGN_LABELS]
+    await update.effective_message.reply_text("\n".join(lines) if lines else "Список меток пуст (AD_CAMPAIGN_LABELS).")
 
 
 async def dialog_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

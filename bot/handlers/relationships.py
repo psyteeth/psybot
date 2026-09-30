@@ -14,9 +14,11 @@ from telegram.ext import (
     filters,
 )
 
-from bot import db, debounce, dialogue_matrix, hostility, limits, llm
+from bot import analytics, db, debounce, dialogue_matrix, hostility, limits, llm
 from bot.config import (
     ADMIN_USERNAME,
+    AB_TESTING_ENABLED,
+    CTA_TARGETS,
     ENABLE_PRIOR_EVENT_QUESTION,
     EXIT_INTENT_CONFIDENCE_THRESHOLD,
     LIMIT_RELATIONSHIP_MESSAGES,
@@ -39,7 +41,8 @@ logger = logging.getLogger(__name__)
     D_CONFIRM, D_QUESTION,
     E_DISCOMFORT_AFTER, E_SUMMARY_CONFIRM, E_SUMMARY_CORRECTION, E_SUMMARY, E_FOLLOWUP,
     D5_QUESTION, D5_HUNDRED_FOLLOWUP, EXIT_INTENT_CLARIFY,
-) = range(18)
+    INTRO_WAIT, POST_FLOW,  # аналитика воронки рекламы, ТЗ 30.09 — дописаны в конец, см. выше
+) = range(20)
 
 Q_A = (
     "Опиши событие или поведение другого человека, от которого тебе дискомфортно: "
@@ -257,7 +260,16 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return await _start_session(update, context, via_query=True)
 
 
-async def _start_session(update: Update, context: ContextTypes.DEFAULT_TYPE, via_query: bool) -> int:
+INTRO_SCREEN_TEXT = (
+    "Разберём одну ситуацию, где тебя что-то бесит или задевает в поведении другого человека — "
+    "по методу психостоматологии, шаг за шагом.\n\n"
+    "Обычно это 5-10 минут и помогает увидеть, что стоит за раздражением на самом деле."
+)
+
+
+async def _start_session(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, via_query: bool, skip_ab: bool = False
+) -> int:
     user = update.effective_user
     send = update.callback_query.edit_message_text if via_query else update.effective_message.reply_text
 
@@ -271,12 +283,41 @@ async def _start_session(update: Update, context: ContextTypes.DEFAULT_TYPE, via
         await send(RELATIONSHIP_LIMIT_TEXT, reply_markup=back_to_menu_keyboard())
         return ConversationHandler.END
 
+    # Аналитика воронки рекламы (ТЗ 30.09): до создания сессии — считались бы «начатые» разборы
+    # людьми, которые просто повторно тапнули кнопку.
+    if not skip_ab and db.count_relationship_sessions(user.id) > 0:
+        await analytics.log(context, user.id, "return_session")
+
+    if AB_TESTING_ENABLED and not skip_ab:
+        variant = db.get_or_assign_ab_variant(user.id)
+        if variant == "intro":
+            keyboard = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Разобрать", callback_data="rel_intro_start")]]
+            )
+            await send(INTRO_SCREEN_TEXT, reply_markup=keyboard)
+            return INTRO_WAIT
+
     session_id = db.create_relationship_session(user.id, user.username)
     context.user_data["rel_session_id"] = session_id
     hostility.reset_session(context)
     await send(Q_A)
     await _log_turn(session_id, user, "A", "бот", Q_A)
+    variant = db.get_or_assign_ab_variant(user.id) if AB_TESTING_ENABLED else "direct"
+    await analytics.log(context, user.id, "flow_started", {"ab_variant": variant})
     return A_EVENT
+
+
+async def rel_intro_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Тап по кнопке «Разобрать» на интро-экране A/B-варианта (ТЗ 30.09)."""
+    query = update.callback_query
+    await query.answer()
+    return await _start_session(update, context, via_query=True, skip_ab=True)
+
+
+async def rel_intro_text_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Если на интро-экране человек написал текст вместо тапа по кнопке — не бросаем в тупик,
+    просто стартуем разбор так же, как по кнопке."""
+    return await _start_session(update, context, via_query=False, skip_ab=True)
 
 
 async def _close_after_hostility(
@@ -417,6 +458,7 @@ async def _start_e_finale(update: Update, context: ContextTypes.DEFAULT_TYPE, se
     Цитирует содержательные ответы (2.3), затем переспрашивает дискомфорт (2.1), и только
     потом идёт Voss-резюме/подтверждение."""
     row = db.get_relationship_session(session_id)
+    await analytics.log(context, update.effective_user.id, "step_D_done")
     quote_text, stored_quotes = _pick_reflection_quotes(row)
     if quote_text:
         await _send(update, context, session_id, "E_reflection", quote_text)
@@ -471,6 +513,8 @@ async def _process_a_event(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     dozhim_state = await _check_dozhim(update, context, session_id, "A", text)
     if dozhim_state is not None:
         return dozhim_state
+
+    await analytics.log(context, update.effective_user.id, "step_A_done", {"len": len(text)})
 
     if ENABLE_PRIOR_EVENT_QUESTION:
         await _send(update, context, session_id, "A_prior", PRIOR_EVENT_QUESTION)
@@ -635,6 +679,7 @@ async def _process_b_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     confirmed = context.user_data.pop("rel_pending_narrative")
     db.update_relationship_session(session_id, b_narrative_confirmed=confirmed)
+    await analytics.log(context, update.effective_user.id, "step_B_done", {"len": len(confirmed)})
 
     wrap_state = await _maybe_wrap_to_summary(update, context, session_id, count)
     if wrap_state is not None:
@@ -756,6 +801,7 @@ async def _process_c_discomfort(update: Update, context: ContextTypes.DEFAULT_TY
 
     await _bump_messages(session_id)
     db.update_relationship_session(session_id, discomfort_before=value)
+    await analytics.log(context, update.effective_user.id, "step_C_done")
 
     row = db.get_relationship_session(session_id)
     advice = await llm.generate_i_would_advice(row["a_event"], row["b_narrative_confirmed"], row["c_consequence"])
@@ -958,6 +1004,76 @@ async def _process_e_discomfort_after(update: Update, context: ContextTypes.DEFA
     return await _send_summary_confirm(update, context, session_id)
 
 
+FEEDBACK_QUESTION_TEXT = "Стало легче?"
+CTA_OFFER_TEXT = "Если хочется разобраться глубже — вот варианты:"
+
+
+async def _complete_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> int:
+    """Общая точка истинного завершения разбора (аналитика воронки, ТЗ 30.09) — вызывается и из
+    немедленного конца _finish_e, и из конца _process_exit_intent_clarify (когда «избегание или
+    интеграция» продлевает разбор на один обмен). Логирует E/flow_completed и вместо END уводит в
+    POST_FLOW — «Стало легче?», затем CTA."""
+    user = update.effective_user
+    await analytics.log(context, user.id, "step_E_done")
+    await analytics.log(context, user.id, "flow_completed")
+    await _log_session(update, context, session_id)
+    await hostility.maybe_send_self_harm_note(update, context)
+
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Да", callback_data=f"fb:{session_id}:Да"),
+        InlineKeyboardButton("Немного", callback_data=f"fb:{session_id}:Немного"),
+        InlineKeyboardButton("Нет", callback_data=f"fb:{session_id}:Нет"),
+    ]])
+    await _send(update, context, session_id, "feedback_q", FEEDBACK_QUESTION_TEXT, reply_markup=keyboard)
+
+    context.user_data.pop("rel_session_id", None)
+    context.user_data.pop("rel_e_first_answer", None)
+    context.user_data.pop("rel_summary", None)
+    return POST_FLOW
+
+
+async def rel_feedback_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, session_id_str, value = query.data.split(":", 2)
+        session_id = int(session_id_str)
+    except ValueError:
+        return POST_FLOW
+
+    user = update.effective_user
+    await analytics.log(context, user.id, "feedback", {"value": value})
+
+    buttons = [
+        InlineKeyboardButton(label, callback_data=f"cta:{session_id}:{key}")
+        for key, (label, _url) in CTA_TARGETS.items()
+    ]
+    await _send(
+        update, context, session_id, "cta_offer", CTA_OFFER_TEXT,
+        reply_markup=InlineKeyboardMarkup([[b] for b in buttons]),
+    )
+    for key in CTA_TARGETS:
+        await analytics.log(context, user.id, "cta_shown", {"target": key})
+    return POST_FLOW
+
+
+async def rel_cta_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, session_id_str, key = query.data.split(":", 2)
+        session_id = int(session_id_str)
+    except ValueError:
+        return ConversationHandler.END
+
+    user = update.effective_user
+    # Сначала лог клика, потом ссылка — прямая URL-кнопка не отслеживается (ТЗ 30.09).
+    await analytics.log(context, user.id, "cta_click", {"target": key})
+    label, url = CTA_TARGETS.get(key, (key, ROADMAP_URL))
+    await _send(update, context, session_id, "cta_link", f"{label}: {url}")
+    return ConversationHandler.END
+
+
 async def _finish_e(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, insertion: str | None) -> int:
     db.finish_relationship_session(session_id, exit_step="E")
 
@@ -983,12 +1099,7 @@ async def _finish_e(update: Update, context: ContextTypes.DEFAULT_TYPE, session_
         await _send(update, context, session_id, "exit_intent_check", question)
         return EXIT_INTENT_CLARIFY
 
-    await _log_session(update, context, session_id)
-    await hostility.maybe_send_self_harm_note(update, context)
-    context.user_data.pop("rel_session_id", None)
-    context.user_data.pop("rel_e_first_answer", None)
-    context.user_data.pop("rel_summary", None)
-    return ConversationHandler.END
+    return await _complete_flow(update, context, session_id)
 
 
 async def exit_intent_clarify(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1030,14 +1141,9 @@ async def _process_exit_intent_clarify(update: Update, context: ContextTypes.DEF
         reply_markup=back_to_menu_keyboard(),
     )
 
-    await _log_session(update, context, session_id)
-    await hostility.maybe_send_self_harm_note(update, context)
-    context.user_data.pop("rel_session_id", None)
     context.user_data.pop("exit_intent_flagged", None)
     context.user_data.pop("exit_intent_behavior", None)
-    context.user_data.pop("rel_e_first_answer", None)
-    context.user_data.pop("rel_summary", None)
-    return ConversationHandler.END
+    return await _complete_flow(update, context, session_id)
 
 
 async def _send_summary_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> int:
@@ -1243,6 +1349,14 @@ conv_handler = ConversationHandler(
         E_SUMMARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_summary)],
         E_FOLLOWUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_followup)],
         EXIT_INTENT_CLARIFY: [MessageHandler(filters.TEXT & ~filters.COMMAND, exit_intent_clarify)],
+        INTRO_WAIT: [
+            CallbackQueryHandler(rel_intro_start, pattern="^rel_intro_start$"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, rel_intro_text_fallback),
+        ],
+        POST_FLOW: [
+            CallbackQueryHandler(rel_feedback_choice, pattern="^fb:"),
+            CallbackQueryHandler(rel_cta_choice, pattern="^cta:"),
+        ],
     },
     fallbacks=[
         CommandHandler("cancel", cancel),

@@ -95,6 +95,18 @@ CREATE TABLE IF NOT EXISTS shown_secrets (
     shown_at TEXT NOT NULL,
     PRIMARY KEY (user_id, chunk_id)
 );
+
+-- Аналитика воронки рекламы (ТЗ 30.09) — лог событий по всей ветке «Отношения», от /start с
+-- меткой источника до клика по CTA. Текст пользователя сюда никогда не пишется, только факт
+-- события + длина ответа в meta.
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    source TEXT NOT NULL,
+    event TEXT NOT NULL,
+    meta TEXT
+);
 """
 
 
@@ -145,6 +157,9 @@ MIGRATIONS = [
     "ALTER TABLE relationship_sessions ADD COLUMN attempts_a INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE relationship_sessions ADD COLUMN attempts_b INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE relationship_sessions ADD COLUMN dozhim_outcome TEXT",
+    "ALTER TABLE users ADD COLUMN first_source TEXT",
+    "ALTER TABLE users ADD COLUMN last_source TEXT",
+    "ALTER TABLE users ADD COLUMN ab_variant TEXT",
 ]
 
 
@@ -167,6 +182,44 @@ def upsert_user(user_id: int, username: Optional[str]) -> None:
             "ON CONFLICT(user_id) DO UPDATE SET username=excluded.username",
             (user_id, username),
         )
+
+
+# --- Аналитика воронки рекламы (ТЗ 30.09) ---
+
+def log_event(user_id: int, source: str, event: str, meta: Optional[str]) -> None:
+    """meta — уже сериализованная JSON-строка (или None); сериализацию делает bot/analytics.py,
+    здесь только запись."""
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO events (ts, user_id, source, event, meta) VALUES (?, ?, ?, ?, ?)",
+            (now(), user_id, source, event, meta),
+        )
+
+
+def set_source(user_id: int, source: str) -> None:
+    """last_source всегда обновляется; first_source пишется только один раз (COALESCE)."""
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE users SET first_source = COALESCE(first_source, ?), last_source = ? "
+            "WHERE user_id = ?",
+            (source, source, user_id),
+        )
+
+
+def get_last_source(user_id: int) -> str:
+    with get_conn() as conn:
+        row = conn.execute("SELECT last_source FROM users WHERE user_id=?", (user_id,)).fetchone()
+    return (row["last_source"] if row and row["last_source"] else "organic")
+
+
+def get_or_assign_ab_variant(user_id: int) -> str:
+    with get_conn() as conn:
+        row = conn.execute("SELECT ab_variant FROM users WHERE user_id=?", (user_id,)).fetchone()
+        if row and row["ab_variant"]:
+            return row["ab_variant"]
+        variant = "direct" if hash(user_id) % 2 == 0 else "intro"
+        conn.execute("UPDATE users SET ab_variant=? WHERE user_id=?", (variant, user_id))
+    return variant
 
 
 # --- Ветка «Отношения» ---

@@ -55,6 +55,9 @@ def build_application():
     application.add_handler(CommandHandler("stats", menu.stats_command))
     application.add_handler(CommandHandler("dialog", menu.dialog_command))
     application.add_handler(CommandHandler("reload", menu.reload_command))
+    application.add_handler(CommandHandler("stats_funnel", menu.stats_funnel_command))
+    application.add_handler(CommandHandler("export", menu.export_command))
+    application.add_handler(CommandHandler("links", menu.links_command))
     application.add_handler(CommandHandler("chatid", menu.chatid_command))
     application.add_handler(CommandHandler("send", menu.send_command))
     application.add_handler(
