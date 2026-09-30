@@ -1,6 +1,7 @@
 """Обёртка над Claude API. Системные промпты кэшируются (prompt caching)."""
 import json
 import logging
+import re
 
 from anthropic import AsyncAnthropic
 
@@ -604,8 +605,41 @@ CONCEPT_SYSTEM = (
 )
 
 
+# Доп. ТЗ 30.09: режим «простой ответ» — жёсткий формат из трёх частей, 1-3 предложения, без
+# уточняющего вопроса. Добавка к CONCEPT_SYSTEM, а не отдельный промпт — весь grounding
+# (нарратив/примеры автора/базовый факт) остаётся общим для simple/deepen, меняется только формат.
+# Живой баг при тестировании: модель игнорировала лимит и писала 2 абзаца/4-5 предложений — при
+# max_tokens=200 это обрезалось ПОСЕРЕДИНЕ СЛОВА и выглядело как поломка. Усилена формулировка +
+# добавлен програмный предохранитель _cap_sentences() (обрезка по границе предложения, не букв).
+SIMPLE_MODE_ADDENDUM = (
+    "\n\nРЕЖИМ «ПРОСТОЙ ОТВЕТ» — ЖЁСТКО, это не пожелание, а требование к длине: ОТВЕТ ЦЕЛИКОМ — "
+    "РОВНО ТРИ КОРОТКИХ ПРЕДЛОЖЕНИЯ, одним абзацем, без переноса строк, БЕЗ ИСКЛЮЧЕНИЙ, даже если "
+    "тема кажется сложной или интересной — сложность сюда не помещается, сократи. Структура строго: "
+    "(1) суть одной фразой («Похоже, что так», «Не совсем», «Да, именно так» — прямой ответ по "
+    "существу, без разворачивания механизма); (2) рамка применимости ОДНОЙ фразой (у кого это "
+    "работает/при каких условиях, например «у тех, кто проходит диагностику»); (3) один мягкий "
+    "вопрос-крючок («Хочешь, покажу на примере?») — приглашение продолжить, а НЕ уточнение того, "
+    "что человек имел в виду. НИКАКИХ уточняющих вопросов — отвечай на наиболее вероятное прочтение "
+    "вопроса напрямую. Статус — 2-4 слова ВНУТРИ первого предложения («по нашей практике», «это "
+    "пока гипотеза»), не отдельное предложение и не лекция о методологии. Если чувствуешь, что "
+    "хочется объяснить механизм подробнее — не делай этого здесь, это для другого режима; здесь "
+    "только прямой ответ и рамка."
+)
+
+
+def _cap_sentences(text: str, max_sentences: int = 3) -> str:
+    """Предохранитель от того, что модель проигнорирует лимит длины в SIMPLE_MODE_ADDENDUM —
+    режет по границе предложения (не по количеству символов), чтобы никогда не обрывать посреди
+    слова, даже если модель написала больше, чем просили."""
+    text = text.strip()
+    parts = re.split(r"(?<=[.!?…])\s+(?=[А-ЯA-ZЁ«\"])", text)
+    if len(parts) <= max_sentences:
+        return text
+    return " ".join(parts[:max_sentences]).strip()
+
+
 async def answer_concept_question(
-    question: str, context_text: str, author_examples: list[dict] | None = None
+    question: str, context_text: str, author_examples: list[dict] | None = None, simple: bool = False,
 ) -> str:
     examples_block = ""
     if author_examples:
@@ -623,8 +657,119 @@ async def answer_concept_question(
         f"{FOUNDATION_FACT}\n\n{BRIDGE_THEORY_FACT}\n\nФрагменты таблицы концепции:\n{context_text[:12000]}"
         f"{examples_block}\n\nВопрос пользователя: {question}"
     )
-    answer = await _ask(CONCEPT_SYSTEM, user_text, MODEL_SONNET, max_tokens=1536)
-    return answer.replace("**", "").replace("##", "").replace("# ", "")
+    system = CONCEPT_SYSTEM + (SIMPLE_MODE_ADDENDUM if simple else "")
+    # max_tokens с запасом (не 200) — предохранитель по предложениям режет ЛИШНЕЕ чисто, а вот
+    # обрубленный на полуслове ответ от нехватки токенов уже не почистить.
+    answer = await _ask(system, user_text, MODEL_SONNET, max_tokens=400 if simple else 1536)
+    answer = answer.replace("**", "").replace("##", "").replace("# ", "")
+    return _cap_sentences(answer, 3) if simple else answer
+
+
+# ---------------------------------------------------------------------------
+# Ветка «Концепция»: режим ответа — простой/уточнение/углубление (доп. ТЗ 30.09)
+# ---------------------------------------------------------------------------
+
+CONCEPT_ROUTER_SYSTEM = (
+    "Ты — роутер режима ответа психостоматологического бота, ветка «Концепция». Перед тем как "
+    "отвечать, реши: дать простой прямой ответ, уточнить, или раскрыть подробно (человек явно "
+    "просит подробностей или спрашивает «почему»/«как» про то, что уже обсуждалось).\n\n"
+    "Тебе дан вопрос клиента, последние реплики разговора, до 5 чанков базы со скорами "
+    "релевантности, и число уточнений, уже заданных по этой теме.\n\n"
+    "Режимы:\n"
+    '- "simple" — вопрос понятен, есть подходящий чанк, ответ уложится в 1-3 предложения. Выбирай '
+    "ПО УМОЛЧАНИЮ, если нет явной причины уточнять.\n"
+    '- "clarify" — ТОЛЬКО если хотя бы одно: подходящего чанка нет вообще (все скоры низкие или '
+    "кандидатов нет); вопрос читается минимум двумя способами, и ответы по ним существенно "
+    'разошлись бы; нет референта («а это как?» без контекста, о чём — неясно); текст '
+    "бессвязный/шум.\n"
+    '- "deepen" — клиент явно просит подробнее, или спрашивает «почему»/«как» про то, что уже было '
+    "в разговоре.\n\n"
+    "Определи также:\n"
+    '- "readings": если mode=clarify и вопрос читается несколькими способами — до 3 коротких '
+    "вариантов прочтения (2-4 слова каждый, годятся как подписи на кнопках). Иначе пустой список.\n"
+    '- "missing": чего не хватает для ответа, одной короткой фразой (или пустая строка).\n'
+    '- "noise": true, если текст клиента бессвязный/шум, не поддаётся разбору.\n'
+    '- "irritation": true, ТОЛЬКО если клиент раздражён ИМЕННО процессом уточнения — «я же '
+    "сказал», «не тупи», «ты не понял», повторяет тот же вопрос без изменений. Обычная грубость "
+    "или мат клиента НЕ считаются раздражением сами по себе.\n"
+    '- "confusion": true, если клиент сам путается — переформулирует по нескольку раз, говорит «не '
+    "понимаю», противоречит себе.\n\n"
+    "Короткий закрытый вопрос («правда ли…», «это так?», да/нет) — почти всегда simple. Мат и "
+    "грубость клиента не влияют на режим.\n\n"
+    "Ответь СТРОГО валидным JSON без markdown и без пояснений после JSON: "
+    '{"mode": "simple" или "clarify" или "deepen", "confidence": число от 0.0 до 1.0, "readings": '
+    '[...], "missing": "...", "noise": true или false, "irritation": true или false, "confusion": '
+    'true или false}'
+)
+
+
+async def route_concept_question(
+    question: str, recent_context: str, candidates: list[dict], clarify_count: int
+) -> dict:
+    candidates_block = (
+        "\n".join(f"score={c['score']:.2f}: {c['text'][:150]}" for c in candidates)
+        if candidates else "(кандидатов нет)"
+    )
+    user_text = (
+        f"Вопрос клиента: {question}\n\nПоследние реплики разговора:\n{recent_context}\n\n"
+        f"Уточнений по этой теме уже было: {clarify_count}\n\nТоп чанков:\n{candidates_block}"
+    )
+    try:
+        raw = await _ask(CONCEPT_ROUTER_SYSTEM, user_text, MODEL_HAIKU, max_tokens=250)
+        data = json.loads(_strip_code_fence(raw))
+        mode = data.get("mode")
+        if mode not in ("simple", "clarify", "deepen"):
+            mode = "simple"
+        return {
+            "mode": mode,
+            "confidence": float(data.get("confidence", 0.5)),
+            "readings": [str(r) for r in data.get("readings", []) if isinstance(r, str)][:3],
+            "missing": str(data.get("missing", "")),
+            "noise": bool(data.get("noise", False)),
+            "irritation": bool(data.get("irritation", False)),
+            "confusion": bool(data.get("confusion", False)),
+        }
+    except Exception:  # noqa: BLE001
+        logger.exception("route_concept_question упал/не распарсился")
+        # безопасный дефолт при сбое — простой ответ (по умолчанию из ТЗ), не зависаем на уточнении
+        return {
+            "mode": "simple", "confidence": 0.5, "readings": [], "missing": "",
+            "noise": False, "irritation": False, "confusion": False,
+        }
+
+
+CONCEPT_CLARIFY_QUESTION_SYSTEM = (
+    "Ты — ассистент психостоматологического бота, ветка «Концепция». Вопрос клиента непонятен "
+    "настолько, что отвечать наугад нельзя. Сформулируй ОДИН короткий конкретный уточняющий "
+    "вопрос. Не оценивай клиента, не иронизируй над невнятностью формулировки. Пиши по-дружески, "
+    "без канцелярита.\n\n"
+    "Если тебе даны варианты прочтения — сформулируй вопрос так, чтобы он естественно вёл к выбору "
+    "одного из них (например «Уточню, чтобы не промахнуться: ты про [вариант1] или [вариант2]?»). "
+    "Если вариантов нет, но известно, чего не хватает — спроси конкретно про это.\n\n"
+    "Ответь только текстом вопроса, без пояснений."
+)
+
+CONCEPT_CLARIFY_QUESTION_SHORT_SYSTEM = (
+    CONCEPT_CLARIFY_QUESTION_SYSTEM
+    + " ВАЖНО: клиент сам путается в формулировках — сделай вопрос МАКСИМАЛЬНО простым и коротким, "
+    'одна фраза, в духе «Одним предложением: что тебя зацепило?».'
+)
+
+
+async def generate_concept_clarify_question(
+    question: str, readings: list[str], missing: str, short: bool = False
+) -> str:
+    user_text = f"Вопрос клиента: {question}"
+    if readings:
+        user_text += f"\nВарианты прочтения: {', '.join(readings)}"
+    if missing:
+        user_text += f"\nЧего не хватает: {missing}"
+    system = CONCEPT_CLARIFY_QUESTION_SHORT_SYSTEM if short else CONCEPT_CLARIFY_QUESTION_SYSTEM
+    try:
+        return await _ask(system, user_text, MODEL_SONNET, max_tokens=100)
+    except Exception:  # noqa: BLE001
+        logger.exception("generate_concept_clarify_question упал")
+        return "Уточни, пожалуйста, одним предложением, что именно ты имеешь в виду?"
 
 
 # ---------------------------------------------------------------------------
@@ -692,14 +837,27 @@ SECRET_REVEAL_SYSTEM = (
 )
 
 
-async def generate_secret_reveal(chunk_text: str, status: str | None, question: str) -> str:
+# Доп. ТЗ 30.09, режим «углубление»: тот же тон/статус-правила, но без ограничения в 2-4
+# предложения и с несколькими соседними чанками — клиент сам попросил подробностей.
+FULL_REVEAL_ADDENDUM = (
+    "\n\nЗдесь клиент сам явно попросил подробностей — формат 2-4 предложения НЕ действует, можно "
+    "раскрыть тему на несколько абзацев, используя весь предоставленный материал (основной "
+    "фрагмент и соседние из того же листа). Остальные правила (статус разговорно, без цитат, без "
+    "названий листов/ячеек, без выдуманных авторов) действуют как обычно."
+)
+
+
+async def generate_secret_reveal(
+    chunk_text: str, status: str | None, question: str, full: bool = False
+) -> str:
     status_label = status or "без статуса"
     user_text = (
         f"Вопрос клиента (для контекста, не пересказывай его дословно): {question}\n\n"
-        f"Фрагмент базы (статус: {status_label}):\n{chunk_text}"
+        f"Фрагмент(ы) базы (статус: {status_label}):\n{chunk_text}"
     )
+    system = SECRET_REVEAL_SYSTEM + (FULL_REVEAL_ADDENDUM if full else "")
     try:
-        return await _ask(SECRET_REVEAL_SYSTEM, user_text, MODEL_SONNET, max_tokens=300)
+        return await _ask(system, user_text, MODEL_SONNET, max_tokens=800 if full else 300)
     except Exception:  # noqa: BLE001
         logger.exception("generate_secret_reveal упал")
         return ""
@@ -794,28 +952,6 @@ async def is_offtopic_concept(question: str, prior_topic: str | None = None) -> 
     except Exception:  # noqa: BLE001
         logger.exception("is_offtopic_concept упал")
         return False
-
-
-CLARIFY_SYSTEM = (
-    "Ты — ассистент психостоматологического бота, ветка «Концепция». Пользователь задал вопрос. "
-    "Прежде чем отвечать, нужно убедиться, что ты понял, что он на самом деле хочет узнать — не только "
-    "буквальный вопрос, но и подспудный, более глубокий вопрос за ним (например, за «чем докажешь, что "
-    "это не шарлатанство» может стоять желание понять, есть ли вообще доказательства связи зубов и "
-    "отношений, сомнение в честности концепции или страх потратить время зря — выбери наиболее "
-    "вероятный подспудный смысл по контексту). Сформулируй ОДНИМ коротким дружелюбным "
-    "вопросом-уточнением и буквальный смысл, и предположение о подспудном, в духе: «Правильно понимаю: "
-    "тебе интересно [буквальный смысл]? Или тебя больше волнует [подспудный смысл]?» Если тебе дана "
-    "предыдущая формулировка и поправка пользователя к ней — учти поправку и переформулируй заново, не "
-    "повторяясь дословно. Пиши просто и по-дружески, без канцелярита. Ответь только текстом "
-    "уточняющего вопроса, без пояснений." + GENDER_NEUTRAL_RULE
-)
-
-
-async def clarify_question(raw_question: str, correction: str | None = None) -> str:
-    user_text = f"Вопрос пользователя: {raw_question}"
-    if correction:
-        user_text += f"\nПоправка пользователя к предыдущему уточнению: {correction}"
-    return await _ask(CLARIFY_SYSTEM, user_text, MODEL_SONNET, max_tokens=200)
 
 
 RANT_DETECT_SYSTEM = (

@@ -38,6 +38,7 @@ _TOKEN_RE = re.compile(r"[а-яёa-z0-9]+", re.IGNORECASE)
 FOR_BOT_ACCESS_HEADER = ["лист", "доступ"]
 FOR_BOT_STOPWORDS_HEADER = "стоп-слова (имена/ники — заменяются на «один человек»)"
 FOR_BOT_FAVORITES_HEADER = "любимые секреты автора (необязательно, свободная подсказка)"
+FOR_BOT_PARAMS_HEADER = "параметры роутера (key=value, по одному на строку)"
 
 
 def _tokenize(text: str) -> list[str]:
@@ -83,6 +84,7 @@ class ForBotConfig:
     access: dict[str, str] = field(default_factory=dict)
     stop_words: list[str] = field(default_factory=list)
     favorites_hint: str = ""
+    params: dict[str, float] = field(default_factory=dict)
 
 
 def _scrub_pii(text: str, stop_words: list[str]) -> str:
@@ -146,7 +148,8 @@ class SecretsIndex:
             ws.update(rows, "A1")
             ws.update_cell(1, 4, FOR_BOT_STOPWORDS_HEADER)
             ws.update_cell(1, 6, FOR_BOT_FAVORITES_HEADER)
-            return ForBotConfig(access=dict(SECRETS_ACCESS_DEFAULTS), stop_words=[], favorites_hint="")
+            ws.update_cell(1, 8, FOR_BOT_PARAMS_HEADER)
+            return ForBotConfig(access=dict(SECRETS_ACCESS_DEFAULTS), stop_words=[], favorites_hint="", params={})
 
         values = ws.get_all_values()
         access: dict[str, str] = {}
@@ -171,7 +174,22 @@ class SecretsIndex:
             if len(row) > 5 and row[5].strip():
                 favorites.append(row[5].strip())
 
-        return ForBotConfig(access=access, stop_words=stop_words, favorites_hint="; ".join(favorites))
+        params: dict[str, float] = {}
+        for row in values[1:]:
+            if len(row) <= 7 or not row[7].strip():
+                continue
+            raw_param = row[7].strip()
+            if "=" not in raw_param:
+                continue
+            key, _, value = raw_param.partition("=")
+            try:
+                params[key.strip()] = float(value.strip())
+            except ValueError:
+                continue
+
+        return ForBotConfig(
+            access=access, stop_words=stop_words, favorites_hint="; ".join(favorites), params=params
+        )
 
     # --- Чанкинг ---
 
@@ -301,7 +319,9 @@ class SecretsIndex:
             score += idf * (f * (k1 + 1)) / (denom or 1)
         return score
 
-    def search(self, query: str, top_k: int = 5, exclude_ids: set[str] | None = None) -> list[Chunk]:
+    def search_scored(
+        self, query: str, top_k: int = 5, exclude_ids: set[str] | None = None
+    ) -> list[tuple[Chunk, float]]:
         exclude_ids = exclude_ids or set()
         query_tokens = _tokenize(query)
         if not query_tokens or not self._chunks:
@@ -312,10 +332,16 @@ class SecretsIndex:
             if cid not in exclude_ids
         ]
         scored.sort(key=lambda x: -x[1])
-        return [self._chunks[cid] for cid, score in scored[:top_k] if score > 0]
+        return [(self._chunks[cid], score) for cid, score in scored[:top_k] if score > 0]
+
+    def search(self, query: str, top_k: int = 5, exclude_ids: set[str] | None = None) -> list[Chunk]:
+        return [c for c, _score in self.search_scored(query, top_k, exclude_ids)]
 
     def get(self, chunk_id: str) -> Chunk | None:
         return self._chunks.get(chunk_id)
+
+    def param(self, key: str, default: float) -> float:
+        return self._for_bot.params.get(key, default)
 
     def neighbors(self, chunk_id: str, limit: int = 3) -> list[Chunk]:
         chunk = self._chunks.get(chunk_id)

@@ -61,6 +61,8 @@ TEETH_HEADER = [
 CONCEPT_HEADER = [
     "timestamp", "user_id", "username", "вопрос", "ответ", "спор", "передано_админу",
     "вопрос_уточнённый",
+    # доп. ТЗ 30.09 — режим ответа простой/уточнение/углубление
+    "режим", "confidence", "число_уточнений", "раздражение", "запутанность", "реакция_клиента",
     "тест",
 ]
 LIMITS_HEADER = ["timestamp", "user_id", "username", "ветка", "событие", "тест"]
@@ -197,6 +199,37 @@ class SheetsLogger:
             await asyncio.to_thread(self._update_secret_reaction_sync, chunk_id, user_id, reaction)
         except Exception:  # noqa: BLE001
             logger.exception("update_secret_reaction() упал")
+
+    def _update_concept_reaction_sync(self, timestamp: str, user_id: int, reaction: str) -> None:
+        if not self._client or not LOG_SPREADSHEET_ID:
+            return
+        try:
+            sh = self._client.open_by_key(LOG_SPREADSHEET_ID)
+            ws = sh.worksheet("Концепция")
+            values = ws.get_all_values()
+            if not values:
+                return
+            header = values[0]
+            ts_idx = header.index("timestamp")
+            user_idx = header.index("user_id")
+            reaction_idx = header.index("реакция_клиента")
+            for i in range(len(values) - 1, 0, -1):
+                row = values[i]
+                if (
+                    len(row) > max(ts_idx, user_idx, reaction_idx)
+                    and row[ts_idx] == timestamp
+                    and row[user_idx] == str(user_id)
+                ):
+                    ws.update_cell(i + 1, reaction_idx + 1, reaction)
+                    return
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось обновить реакцию на ответ «Концепция» (ts=%s)", timestamp)
+
+    async def update_concept_reaction(self, timestamp: str, user_id: int, reaction: str) -> None:
+        try:
+            await asyncio.to_thread(self._update_concept_reaction_sync, timestamp, user_id, reaction)
+        except Exception:  # noqa: BLE001
+            logger.exception("update_concept_reaction() упал")
 
 
 class ConceptStore:

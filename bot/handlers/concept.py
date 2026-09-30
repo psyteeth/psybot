@@ -1,7 +1,7 @@
 import logging
 import random
 
-from telegram import Update
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
@@ -17,6 +17,9 @@ from bot.config import (
     ADMIN_CHAT_ID,
     ADMIN_USERNAME,
     CONCEPT_CHAT_USERNAME,
+    CONCEPT_ROUTER_CONFIDENCE_THRESHOLD,
+    CONCEPT_ROUTER_MAX_CLARIFICATIONS,
+    CONCEPT_ROUTER_RELEVANCE_THRESHOLD,
     SECRETS_MAX_PER_SESSION,
     SECRETS_MIN_GAP_ANSWERS,
     SECRETS_PAUSE_AFTER_IGNORED,
@@ -59,13 +62,6 @@ async def _send(update: Update, context: ContextTypes.DEFAULT_TYPE, step: str, t
     await _log_turn(context, update.effective_user, step, "бот", text, msg_type)
     return result
 
-MAX_CLARIFY_ROUNDS = 3
-CLARIFY_OPENERS = [
-    "Так, давай разберёмся: ",
-    "Так-так-так, давай ещё раз, попытаюсь тебя понять: ",
-    "Давай я тебя ещё раз помучаю, потому что я не просто бот — я тупой бот, поэтому прости меня "
-    "за это, ещё раз спрошу: ",
-]
 
 RANT_OPENERS = [
     "Ого, походу, разметелило тебя там 😄 Слышу, без драмы.",
@@ -136,7 +132,7 @@ async def _handle_pending_secret_reaction(update: Update, context: ContextTypes.
         if chunk:
             neighbors = secrets_index.neighbors(chunk_id, limit=2)
             detail_source = "\n\n".join([chunk.text] + [n.text for n in neighbors])
-            detail_text = await llm.generate_secret_reveal(detail_source, chunk.status, secret_text)
+            detail_text = await llm.generate_secret_reveal(detail_source, chunk.status, secret_text, full=True)
         else:
             detail_text = ""
         if not detail_text:
@@ -208,95 +204,67 @@ async def _maybe_share_secret(
         logger.exception("_maybe_share_secret упал, отвечаем без секрета")
 
 
-async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    user = update.effective_user
-    db.upsert_user(user.id, user.username)
+# --- Режим ответа: простой / уточнение / углубление (доп. ТЗ 30.09) ---
 
-    if await _check_limit(update, context, user, via_query=True):
-        return ConversationHandler.END
-
-    context.user_data["concept_dispute_streak"] = 0
-    context.user_data.pop("concept_last_topic", None)
+def _reset_concept_topic_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     context.user_data.pop("concept_session_id", None)
-    _reset_secrets_session_state(context)
-    hostility.reset_session(context)
-    await query.edit_message_text(INTRO_TEXT, reply_markup=back_to_menu_keyboard())
-    await _log_turn(context, user, "intro", "бот", INTRO_TEXT)
-    return ASKING
+    context.user_data.pop("concept_raw_question", None)
+    context.user_data.pop("concept_combined_question", None)
+    context.user_data.pop("concept_clarify_count", None)
+    context.user_data.pop("concept_irritated", None)
+    context.user_data.pop("concept_last_readings", None)
+    context.user_data.pop("concept_last_bot_question", None)
+    context.user_data.pop("concept_reading_options", None)
 
 
 async def ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Первое сообщение раунда: сырой вопрос пользователя. Не отвечаем сразу —
-    сперва уточняем, что человек на самом деле хочет узнать (буквально и подспудно)."""
     return await debounce.collect(
         update, context, step_id="concept_ask", conv_handler=conv_handler, state=ASKING,
-        process=lambda text: _process_ask(update, context, text),
+        process=lambda text: _process_message(update, context, text),
     )
-
-
-async def _process_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str) -> int:
-    user = update.effective_user
-
-    if await _check_limit(update, context, user, via_query=False):
-        return ConversationHandler.END
-
-    secret_reaction_state = await _handle_pending_secret_reaction(update, context, question)
-    if secret_reaction_state is not None:
-        return secret_reaction_state
-
-    status = await hostility.precheck(
-        update, context, branch="concept", step="ask", text_override=question
-    )
-    if status == "crisis":
-        return ConversationHandler.END
-    if status == "closed":
-        db.increment_concept_messages(user.id)
-        await hostility.maybe_send_self_harm_note(update, context)
-        return ConversationHandler.END
-    if status == "hostile":
-        return ASKING
-
-    db.increment_concept_messages(user.id)
-
-    # session_id разбора — на весь цикл вопрос→(уточнения)→ответ (ТЗ-доп. №6, ч.1)
-    context.user_data["concept_session_id"] = f"{user.id}_{db.now()}"
-    await _log_turn(context, user, "ask", "человек", question)
-
-    prior_topic = context.user_data.get("concept_last_topic")
-    if await llm.is_offtopic_concept(question, prior_topic=prior_topic):
-        await _send(update, context, "offtopic", OFFTOPIC_TEXT, msg_type="отказ", reply_markup=back_to_menu_keyboard())
-        context.user_data.pop("concept_session_id", None)
-        return ASKING
-
-    await _maybe_rant_opener(update, question)
-
-    context.user_data["concept_raw_question"] = question
-    context.user_data["concept_clarify_round"] = 1
-    clarified = await llm.clarify_question(question)
-    context.user_data["concept_pending_clarified"] = clarified
-    await _send(update, context, "clarify", CLARIFY_OPENERS[0] + clarified, msg_type="уточнение")
-    return CLARIFY
 
 
 async def clarify_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await debounce.collect(
         update, context, step_id="concept_clarify", conv_handler=conv_handler, state=CLARIFY,
-        process=lambda text: _process_clarify_reply(update, context, text),
+        process=lambda text: _process_message(update, context, text),
     )
 
 
-async def _process_clarify_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+async def reading_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Тап по кнопке-варианту прочтения в режиме УТОЧНЕНИЕ — эквивалент того, что человек
+    напечатал бы этот вариант текстом."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        idx = int(query.data.split(":", 1)[1])
+        options = context.user_data.get("concept_reading_options", [])
+        chosen_text = options[idx]
+    except (ValueError, IndexError):
+        return CLARIFY
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:  # noqa: BLE001
+        pass
+    return await _process_message(update, context, chosen_text)
+
+
+async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     user = update.effective_user
 
     if await _check_limit(update, context, user, via_query=False):
         return ConversationHandler.END
 
-    pending_question = context.user_data.get("concept_pending_clarified", "")
+    secret_reaction_state = await _handle_pending_secret_reaction(update, context, text)
+    if secret_reaction_state is not None:
+        return secret_reaction_state
+
+    is_first = not context.user_data.get("concept_raw_question")
+    bot_question = None if is_first else context.user_data.get("concept_last_bot_question", "")
+
     status = await hostility.precheck(
-        update, context, branch="concept", step="clarify",
-        bot_question=pending_question, text_override=text,
+        update, context, branch="concept", step="ask" if is_first else "clarify",
+        bot_question=bot_question, text_override=text,
     )
     if status == "crisis":
         return ConversationHandler.END
@@ -305,68 +273,207 @@ async def _process_clarify_reply(update: Update, context: ContextTypes.DEFAULT_T
         await hostility.maybe_send_self_harm_note(update, context)
         return ConversationHandler.END
     if status == "hostile":
-        return CLARIFY
+        return ASKING if is_first else CLARIFY
 
     db.increment_concept_messages(user.id)
 
-    await _log_turn(context, user, "clarify", "человек", text)
-    await _maybe_rant_opener(update, text)
+    if is_first:
+        pending_marker = context.user_data.pop("concept_pending_reaction_marker", None)
+        context.user_data["concept_session_id"] = f"{user.id}_{db.now()}"
+        await _log_turn(context, user, "ask", "человек", text)
 
-    raw_question = context.user_data.get("concept_raw_question", "")
-    round_ = context.user_data.get("concept_clarify_round", 1)
+        prior_topic = context.user_data.get("concept_last_topic")
+        if await llm.is_offtopic_concept(text, prior_topic=prior_topic):
+            if pending_marker:
+                await sheets_logger.update_concept_reaction(pending_marker, user.id, "ушёл")
+            await _send(update, context, "offtopic", OFFTOPIC_TEXT, msg_type="отказ", reply_markup=back_to_menu_keyboard())
+            context.user_data.pop("concept_session_id", None)
+            return ASKING
 
-    verdict = await llm.classify_confirmation(text) if round_ < MAX_CLARIFY_ROUNDS else "confirm"
+        await _maybe_rant_opener(update, text)
+        context.user_data["concept_raw_question"] = text
+        context.user_data["concept_combined_question"] = text
+        context.user_data["concept_clarify_count"] = 0
+        context.user_data["concept_irritated"] = False
+        context.user_data["_concept_pending_marker_to_resolve"] = pending_marker
+    else:
+        await _log_turn(context, user, "clarify_reply", "человек", text)
+        await _maybe_rant_opener(update, text)
+        combined = context.user_data.get("concept_combined_question", "")
+        context.user_data["concept_combined_question"] = f"{combined}\n(уточнение клиента: {text})"
 
-    if verdict == "correct":
-        round_ += 1
-        context.user_data["concept_clarify_round"] = round_
-        clarified = await llm.clarify_question(raw_question, correction=text)
-        context.user_data["concept_pending_clarified"] = clarified
-        await _send(update, context, "clarify", CLARIFY_OPENERS[round_ - 1] + clarified, msg_type="уточнение")
-        return CLARIFY
+    return await _route_and_respond(update, context)
 
-    resolved_question = context.user_data.pop("concept_pending_clarified", raw_question)
-    context.user_data.pop("concept_clarify_round", None)
+
+async def _route_and_respond(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    question = context.user_data.get("concept_combined_question", "")
+    raw_question = context.user_data.get("concept_raw_question", question)
+    clarify_count = context.user_data.get("concept_clarify_count", 0)
+    irritated = context.user_data.get("concept_irritated", False)
+
+    await secrets_index.ensure_fresh()
+    scored = secrets_index.search_scored(question, top_k=5) if secrets_index.is_loaded() else []
+    candidates_for_router = [{"score": s, "text": c.text} for c, s in scored]
+
+    route = await llm.route_concept_question(question, question, candidates_for_router, clarify_count)
+    context.user_data["concept_last_readings"] = route.get("readings", [])
+    if route.get("irritation"):
+        context.user_data["concept_irritated"] = True
+        irritated = True
+
+    relevance_threshold = secrets_index.param("relevance_threshold", CONCEPT_ROUTER_RELEVANCE_THRESHOLD)
+    confidence_threshold = secrets_index.param("confidence_threshold", CONCEPT_ROUTER_CONFIDENCE_THRESHOLD)
+    max_clarifications = int(secrets_index.param("max_clarifications", CONCEPT_ROUTER_MAX_CLARIFICATIONS))
+    best_score = scored[0][1] if scored else 0.0
+
+    mode = route["mode"]
+    capped = False
+    if mode == "clarify":
+        if best_score >= relevance_threshold and route["confidence"] >= confidence_threshold:
+            mode = "simple"
+        elif irritated:
+            mode = "simple"
+            capped = True
+        elif clarify_count >= max_clarifications:
+            mode = "simple"
+            capped = True
+
+    pending_marker = context.user_data.pop("_concept_pending_marker_to_resolve", None)
+    if pending_marker:
+        reaction = "углубился" if mode == "deepen" else "ушёл"
+        await sheets_logger.update_concept_reaction(pending_marker, update.effective_user.id, reaction)
+
+    if mode == "clarify":
+        return await _respond_clarify(update, context, question, route)
+    if mode == "deepen":
+        return await _respond_deepen(update, context, question, scored, route)
+    return await _respond_simple(update, context, raw_question, question, route, capped)
+
+
+async def _respond_clarify(update: Update, context: ContextTypes.DEFAULT_TYPE, question: str, route: dict) -> int:
+    user = update.effective_user
+    clarify_count = context.user_data.get("concept_clarify_count", 0) + 1
+    context.user_data["concept_clarify_count"] = clarify_count
+    readings = route.get("readings", [])
+
+    clarify_text = await llm.generate_concept_clarify_question(
+        question, readings, route.get("missing", ""), short=route.get("confusion", False)
+    )
+
+    keyboard = None
+    if readings and 2 <= len(readings) <= 3:
+        context.user_data["concept_reading_options"] = readings
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(r, callback_data=f"concept_reading:{i}")] for i, r in enumerate(readings)]
+        )
+
+    context.user_data["concept_last_bot_question"] = clarify_text
+    await _send(update, context, "clarify", clarify_text, msg_type="уточнение", reply_markup=keyboard)
+
+    await sheets_logger.append(
+        "Концепция",
+        [
+            db.now(), user.id, user.username or "", context.user_data.get("concept_raw_question", question),
+            clarify_text, "нет", "нет", question,
+            "clarify", route.get("confidence", 0.0), clarify_count,
+            "да" if route.get("irritation") else "нет", "да" if route.get("confusion") else "нет", "",
+        ],
+    )
+    return CLARIFY
+
+
+async def _respond_deepen(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, question: str, scored: list, route: dict
+) -> int:
+    user = update.effective_user
+    raw_question = context.user_data.get("concept_raw_question", question)
+
+    if not scored:
+        return await _respond_simple(update, context, raw_question, question, route, capped=False)
+
+    top_chunk, _score = scored[0]
+    neighbors = secrets_index.neighbors(top_chunk.chunk_id, limit=2)
+    full_source = "\n\n".join([top_chunk.text] + [n.text for n in neighbors])
+    answer = await llm.generate_secret_reveal(full_source, top_chunk.status, question, full=True)
+    if not answer:
+        return await _respond_simple(update, context, raw_question, question, route, capped=False)
+
+    await _send(update, context, "deepen", answer, reply_markup=back_to_menu_keyboard())
+    context.user_data["concept_last_topic"] = question
+
+    dispute = await llm.is_dispute(raw_question)
+    await sheets_logger.append(
+        "Концепция",
+        [
+            db.now(), user.id, user.username or "", raw_question, answer,
+            "да" if dispute else "нет", "нет", question,
+            "deepen", route.get("confidence", 0.0), context.user_data.get("concept_clarify_count", 0),
+            "да" if route.get("irritation") else "нет", "да" if route.get("confusion") else "нет", "",
+        ],
+    )
+
+    if ADMIN_CHAT_ID:
+        try:
+            relay = f"❓ {user.username or user.id}: {raw_question}\n(углубление)\n\n💬 {answer}"
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=relay[:4000])
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось отправить релей углубления админу")
+
+    _reset_concept_topic_state(context)
+    await hostility.maybe_send_self_harm_note(update, context)
+    return ASKING
+
+
+async def _respond_simple(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, raw_question: str, question: str, route: dict, capped: bool
+) -> int:
+    user = update.effective_user
 
     await concept_store.ensure_fresh()
     context_text = concept_store.main_narrative()
-    relevant_title = await llm.pick_relevant_sheet(resolved_question, concept_store.titles())
+    relevant_title = await llm.pick_relevant_sheet(question, concept_store.titles())
     if relevant_title:
         context_text += "\n\n" + concept_store.get(relevant_title)
 
     dispute = await llm.is_dispute(raw_question)
-    similar_nums = await llm.pick_similar_author_answers(resolved_question, AUTHOR_ANSWERS)
+    similar_nums = await llm.pick_similar_author_answers(question, AUTHOR_ANSWERS)
     author_examples = [e for e in AUTHOR_ANSWERS if e["num"] in similar_nums]
-    answer = await llm.answer_concept_question(resolved_question, context_text, author_examples)
+    answer = await llm.answer_concept_question(question, context_text, author_examples, simple=True)
+
+    if capped:
+        readings = context.user_data.get("concept_last_readings", [])
+        assumption = readings[0] if readings else route.get("missing") or question
+        answer = f"Я понял так: {assumption}.\n\n{answer}\n\nЕсли про другое, напиши одним предложением."
 
     streak = context.user_data.get("concept_dispute_streak", 0)
     streak = streak + 1 if dispute else 0
     context.user_data["concept_dispute_streak"] = streak
-
     escalated = streak >= DISPUTE_STREAK_THRESHOLD
     if escalated:
         answer = f"{answer}\n\n{NOT_CONVERGED_TEXT}"
 
     await _send(update, context, "answer", answer, reply_markup=back_to_menu_keyboard())
-    context.user_data["concept_last_topic"] = resolved_question
+    context.user_data["concept_last_topic"] = question
 
     if not escalated:
-        await _maybe_share_secret(update, context, raw_question, resolved_question)
-    context.user_data.pop("concept_session_id", None)
+        await _maybe_share_secret(update, context, raw_question, question)
 
+    row_timestamp = db.now()
     await sheets_logger.append(
         "Концепция",
-        [db.now(), user.id, user.username or "", raw_question, answer,
-         "да" if dispute else "нет", "да" if (escalated and ADMIN_CHAT_ID) else "нет",
-         resolved_question],
+        [
+            row_timestamp, user.id, user.username or "", raw_question, answer,
+            "да" if dispute else "нет", "да" if (escalated and ADMIN_CHAT_ID) else "нет", question,
+            "simple", route.get("confidence", 0.0), context.user_data.get("concept_clarify_count", 0),
+            "да" if route.get("irritation") else "нет", "да" if route.get("confusion") else "нет", "",
+        ],
     )
+    if not escalated:
+        context.user_data["concept_pending_reaction_marker"] = row_timestamp
 
     if ADMIN_CHAT_ID:
         try:
-            relay = (
-                f"❓ {user.username or user.id}: {raw_question}\n"
-                f"(уточнено: {resolved_question})\n\n💬 {answer}"
-            )
+            relay = f"❓ {user.username or user.id}: {raw_question}\n(режим: simple)\n\n💬 {answer}"
             await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=relay[:4000])
         except Exception:  # noqa: BLE001
             logger.exception("Не удалось отправить релей вопроса/ответа админу")
@@ -384,8 +491,28 @@ async def _process_clarify_reply(update: Update, context: ContextTypes.DEFAULT_T
             logger.exception("Не удалось отправить уведомление об эскалации админу")
         context.user_data["concept_dispute_streak"] = 0
 
-    context.user_data.pop("concept_raw_question", None)
+    _reset_concept_topic_state(context)
     await hostility.maybe_send_self_harm_note(update, context)
+    return ASKING
+
+
+async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user = update.effective_user
+    db.upsert_user(user.id, user.username)
+
+    if await _check_limit(update, context, user, via_query=True):
+        return ConversationHandler.END
+
+    context.user_data["concept_dispute_streak"] = 0
+    context.user_data.pop("concept_last_topic", None)
+    context.user_data.pop("concept_pending_reaction_marker", None)
+    _reset_concept_topic_state(context)
+    _reset_secrets_session_state(context)
+    hostility.reset_session(context)
+    await query.edit_message_text(INTRO_TEXT, reply_markup=back_to_menu_keyboard())
+    await _log_turn(context, user, "intro", "бот", INTRO_TEXT)
     return ASKING
 
 
@@ -393,6 +520,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     from bot.handlers.menu import show_menu
 
     await _sweep_pending_secret_as_no_reply(update, context)
+    pending_marker = context.user_data.pop("concept_pending_reaction_marker", None)
+    if pending_marker:
+        await sheets_logger.update_concept_reaction(pending_marker, update.effective_user.id, "ушёл")
     await show_menu(update, context)
     await hostility.maybe_send_self_harm_note(update, context)
     return ConversationHandler.END
@@ -402,7 +532,10 @@ conv_handler = ConversationHandler(
     entry_points=[CallbackQueryHandler(entry, pattern="^menu:concept$")],
     states={
         ASKING: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask)],
-        CLARIFY: [MessageHandler(filters.TEXT & ~filters.COMMAND, clarify_reply)],
+        CLARIFY: [
+            CallbackQueryHandler(reading_choice, pattern="^concept_reading:"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, clarify_reply),
+        ],
     },
     fallbacks=[
         CommandHandler("cancel", cancel),
