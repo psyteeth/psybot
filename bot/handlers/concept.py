@@ -13,8 +13,17 @@ from telegram.ext import (
 
 from bot import db, debounce, hostility, limits, llm
 from bot.author_answers import ENTRIES as AUTHOR_ANSWERS
-from bot.config import ADMIN_CHAT_ID, ADMIN_USERNAME, CONCEPT_CHAT_USERNAME, limit_exhausted_text
+from bot.config import (
+    ADMIN_CHAT_ID,
+    ADMIN_USERNAME,
+    CONCEPT_CHAT_USERNAME,
+    SECRETS_MAX_PER_SESSION,
+    SECRETS_MIN_GAP_ANSWERS,
+    SECRETS_PAUSE_AFTER_IGNORED,
+    limit_exhausted_text,
+)
 from bot.keyboards import back_to_menu_keyboard
+from bot.secrets_index import secrets_index
 from bot.sheets import concept_store, sheets_logger
 
 logger = logging.getLogger(__name__)
@@ -83,6 +92,122 @@ async def _maybe_rant_opener(update: Update, text: str) -> None:
         await update.effective_message.reply_text(random.choice(RANT_OPENERS))
 
 
+# --- «Секреты из таблицы» (мини-ТЗ 29.09) ---
+
+def _reset_secrets_session_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["concept_secrets_shown_count"] = 0
+    context.user_data["concept_secrets_answer_count"] = 0
+    context.user_data["concept_secrets_last_shown_at_answer"] = -999
+    context.user_data["concept_secrets_ignore_streak"] = 0
+    context.user_data["concept_secrets_paused"] = False
+    context.user_data.pop("concept_pending_secret_chunk_id", None)
+    context.user_data.pop("concept_pending_secret_text", None)
+
+
+async def _sweep_pending_secret_as_no_reply(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chunk_id = context.user_data.pop("concept_pending_secret_chunk_id", None)
+    context.user_data.pop("concept_pending_secret_text", None)
+    if not chunk_id:
+        return
+    await sheets_logger.update_secret_reaction(chunk_id, update.effective_user.id, "нет ответа")
+
+
+async def _handle_pending_secret_reaction(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int | None:
+    """Если недавно был показан секрет — разбирает реакцию на НЕГО в первую очередь.
+    Возвращает состояние, если сообщение целиком про секрет («расскажи подробнее» — раскрыли и
+    вернулись в ASKING), иначе None — вызывающий обрабатывает text как обычно (в т.ч. возражение
+    или новую тему, которые тоже считаются реакцией, но не «съедают» сообщение)."""
+    chunk_id = context.user_data.get("concept_pending_secret_chunk_id")
+    if not chunk_id:
+        return None
+    user = update.effective_user
+    secret_text = context.user_data.get("concept_pending_secret_text", "")
+
+    verdict = await llm.classify_secret_reaction(secret_text, text)
+    reaction_label = {"more": "уточнил", "dispute": "возразил", "other": "проигнорировал"}[verdict]
+    await sheets_logger.update_secret_reaction(chunk_id, user.id, reaction_label)
+    context.user_data.pop("concept_pending_secret_chunk_id", None)
+    context.user_data.pop("concept_pending_secret_text", None)
+
+    if verdict == "more":
+        context.user_data["concept_secrets_ignore_streak"] = 0
+        await _log_turn(context, user, "secret_more", "человек", text)
+        chunk = secrets_index.get(chunk_id)
+        if chunk:
+            neighbors = secrets_index.neighbors(chunk_id, limit=2)
+            detail_source = "\n\n".join([chunk.text] + [n.text for n in neighbors])
+            detail_text = await llm.generate_secret_reveal(detail_source, chunk.status, secret_text)
+        else:
+            detail_text = ""
+        if not detail_text:
+            detail_text = "Хм, под рукой сейчас нет деталей по этому — но идея всё ещё интересная, можем вернуться к ней позже."
+        await _send(update, context, "secret_detail", detail_text, msg_type="секрет")
+        return ASKING
+
+    if verdict == "dispute":
+        context.user_data["concept_secrets_ignore_streak"] = 0
+        return None  # пусть обычный поток обработает это как содержательный ответ/спор
+
+    streak = context.user_data.get("concept_secrets_ignore_streak", 0) + 1
+    context.user_data["concept_secrets_ignore_streak"] = streak
+    if streak >= SECRETS_PAUSE_AFTER_IGNORED:
+        context.user_data["concept_secrets_paused"] = True
+    return None
+
+
+async def _maybe_share_secret(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, question: str, resolved_question: str
+) -> None:
+    user = update.effective_user
+    answer_count = context.user_data.get("concept_secrets_answer_count", 0) + 1
+    context.user_data["concept_secrets_answer_count"] = answer_count
+
+    if context.user_data.get("concept_secrets_paused"):
+        return
+    if context.user_data.get("concept_secrets_shown_count", 0) >= SECRETS_MAX_PER_SESSION:
+        return
+    last_shown_at = context.user_data.get("concept_secrets_last_shown_at_answer", -999)
+    if (answer_count - last_shown_at) < SECRETS_MIN_GAP_ANSWERS:
+        return
+
+    try:
+        await secrets_index.ensure_fresh()
+        if not secrets_index.is_loaded():
+            return
+        seen_ids = db.get_seen_secret_ids(user.id)
+        candidates = secrets_index.search(f"{question} {resolved_question}", top_k=5, exclude_ids=seen_ids)
+        if not candidates:
+            return
+
+        gate = await llm.classify_secret_gate(
+            resolved_question,
+            f"Исходный вопрос: {question}\nУточнённый: {resolved_question}",
+            [{"chunk_id": c.chunk_id, "status": c.status, "text": c.text} for c in candidates],
+        )
+        if not gate["share"] or not gate["chunk_id"]:
+            return
+        chunk = secrets_index.get(gate["chunk_id"])
+        if not chunk:
+            return
+
+        reveal_text = await llm.generate_secret_reveal(chunk.text, chunk.status, resolved_question)
+        if not reveal_text:
+            return
+
+        await _send(update, context, "secret", reveal_text, msg_type="секрет")
+        await sheets_logger.append(
+            "Секреты",
+            [db.now(), user.id, user.username or "", "concept", chunk.chunk_id, chunk.sheet, reveal_text, ""],
+        )
+        db.record_secret_shown(user.id, chunk.chunk_id)
+        context.user_data["concept_secrets_shown_count"] = context.user_data.get("concept_secrets_shown_count", 0) + 1
+        context.user_data["concept_secrets_last_shown_at_answer"] = answer_count
+        context.user_data["concept_pending_secret_chunk_id"] = chunk.chunk_id
+        context.user_data["concept_pending_secret_text"] = reveal_text
+    except Exception:  # noqa: BLE001
+        logger.exception("_maybe_share_secret упал, отвечаем без секрета")
+
+
 async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     await query.answer()
@@ -95,6 +220,7 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["concept_dispute_streak"] = 0
     context.user_data.pop("concept_last_topic", None)
     context.user_data.pop("concept_session_id", None)
+    _reset_secrets_session_state(context)
     hostility.reset_session(context)
     await query.edit_message_text(INTRO_TEXT, reply_markup=back_to_menu_keyboard())
     await _log_turn(context, user, "intro", "бот", INTRO_TEXT)
@@ -115,6 +241,10 @@ async def _process_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, quest
 
     if await _check_limit(update, context, user, via_query=False):
         return ConversationHandler.END
+
+    secret_reaction_state = await _handle_pending_secret_reaction(update, context, question)
+    if secret_reaction_state is not None:
+        return secret_reaction_state
 
     status = await hostility.precheck(
         update, context, branch="concept", step="ask", text_override=question
@@ -219,6 +349,9 @@ async def _process_clarify_reply(update: Update, context: ContextTypes.DEFAULT_T
 
     await _send(update, context, "answer", answer, reply_markup=back_to_menu_keyboard())
     context.user_data["concept_last_topic"] = resolved_question
+
+    if not escalated:
+        await _maybe_share_secret(update, context, raw_question, resolved_question)
     context.user_data.pop("concept_session_id", None)
 
     await sheets_logger.append(
@@ -259,6 +392,7 @@ async def _process_clarify_reply(update: Update, context: ContextTypes.DEFAULT_T
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     from bot.handlers.menu import show_menu
 
+    await _sweep_pending_secret_as_no_reply(update, context)
     await show_menu(update, context)
     await hostility.maybe_send_self_harm_note(update, context)
     return ConversationHandler.END

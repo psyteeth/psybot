@@ -85,6 +85,16 @@ CREATE TABLE IF NOT EXISTS limit_hits (
     branch TEXT NOT NULL,
     ts TEXT NOT NULL
 );
+
+-- «Секреты из таблицы» (мини-ТЗ 29.09) — какие chunk_id уже показаны какому пользователю,
+-- чтобы никогда не повторять один и тот же секрет одному человеку (пожизненно, не только
+-- в рамках сессии).
+CREATE TABLE IF NOT EXISTS shown_secrets (
+    user_id INTEGER NOT NULL,
+    chunk_id TEXT NOT NULL,
+    shown_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, chunk_id)
+);
 """
 
 
@@ -339,4 +349,22 @@ def log_limit_hit(user_id: int, branch: str) -> None:
         conn.execute(
             "INSERT INTO limit_hits (user_id, branch, ts) VALUES (?, ?, ?)",
             (user_id, branch, now()),
+        )
+
+
+# --- «Секреты из таблицы» (мини-ТЗ 29.09) ---
+
+def get_seen_secret_ids(user_id: int) -> set[str]:
+    with get_conn() as conn:
+        rows = conn.execute(
+            "SELECT chunk_id FROM shown_secrets WHERE user_id=?", (user_id,)
+        ).fetchall()
+    return {r["chunk_id"] for r in rows}
+
+
+def record_secret_shown(user_id: int, chunk_id: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO shown_secrets (user_id, chunk_id, shown_at) VALUES (?, ?, ?)",
+            (user_id, chunk_id, now()),
         )

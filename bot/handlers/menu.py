@@ -7,6 +7,7 @@ from telegram.ext import ContextTypes
 from bot import db, limits, llm, stats
 from bot.config import ADMIN_CHAT_ID, NO_ACCESS_TEXT
 from bot.keyboards import main_menu_keyboard
+from bot.secrets_index import secrets_index
 from bot.sheets import sheets_logger
 
 logger = logging.getLogger(__name__)
@@ -109,6 +110,17 @@ async def weekly_stats_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"📊 Еженедельная сводка\n\n{text}")
     except Exception:  # noqa: BLE001
         logger.exception("Не удалось отправить еженедельную сводку админу")
+
+
+async def reload_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/reload — мини-ТЗ 29.09: принудительно обновляет индекс «секретов из таблицы» (обычно
+    раз в 30 минут по расписанию), чтобы правки листа «Для бота» подхватывались без деплоя.
+    Только для ADMIN_CHAT_ID."""
+    caller_id = update.effective_user.id
+    if not ADMIN_CHAT_ID or str(caller_id) != str(ADMIN_CHAT_ID):
+        return
+    n = await secrets_index.reload()
+    await update.effective_message.reply_text(f"Индекс секретов обновлён: {n} фрагментов.")
 
 
 async def dialog_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

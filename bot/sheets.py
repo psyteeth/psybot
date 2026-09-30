@@ -79,6 +79,13 @@ DIALOGUES_HEADER = [
     "текст", "тип", "тест",
 ]
 
+SECRETS_HEADER = [
+    # «Секреты из таблицы», мини-ТЗ 29.09 — user_id индекс 1, см. _test_flag.
+    "timestamp", "user_id", "username", "ветка", "chunk_id", "лист", "показанный_текст",
+    "реакция", "тест",
+]
+SECRETS_TAB = "Секреты"
+
 LIMIT_OVERRIDES_HEADER = ["user_id", "ветка", "лимит", "комментарий"]
 LIMIT_OVERRIDES_TAB = "Лимиты (ручные)"
 
@@ -93,6 +100,7 @@ SHEET_TABS = {
     "Выпады": HOSTILITY_HEADER,
     "Админ-сообщения": ADMIN_MESSAGES_HEADER,
     "Диалоги": DIALOGUES_HEADER,
+    SECRETS_TAB: SECRETS_HEADER,
     LIMIT_OVERRIDES_TAB: LIMIT_OVERRIDES_HEADER,
     RELATIVES_TAB: RELATIVES_HEADER,
 }
@@ -157,6 +165,38 @@ class SheetsLogger:
             await asyncio.to_thread(self._append_sync, tab, [*row, _test_flag(row)])
         except Exception:  # noqa: BLE001
             logger.exception("append() к Sheets упал, разговор продолжается без лога")
+
+    def _update_secret_reaction_sync(self, chunk_id: str, user_id: int, reaction: str) -> None:
+        if not self._client or not LOG_SPREADSHEET_ID:
+            return
+        try:
+            sh = self._client.open_by_key(LOG_SPREADSHEET_ID)
+            ws = sh.worksheet(SECRETS_TAB)
+            values = ws.get_all_values()
+            if not values:
+                return
+            header = values[0]
+            chunk_idx = header.index("chunk_id")
+            user_idx = header.index("user_id")
+            reaction_idx = header.index("реакция")
+            for i in range(len(values) - 1, 0, -1):  # с конца — обычно это самая свежая строка
+                row = values[i]
+                if (
+                    len(row) > max(chunk_idx, user_idx, reaction_idx)
+                    and row[chunk_idx] == chunk_id
+                    and row[user_idx] == str(user_id)
+                    and not row[reaction_idx].strip()
+                ):
+                    ws.update_cell(i + 1, reaction_idx + 1, reaction)
+                    return
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось обновить реакцию на секрет (chunk_id=%s)", chunk_id)
+
+    async def update_secret_reaction(self, chunk_id: str, user_id: int, reaction: str) -> None:
+        try:
+            await asyncio.to_thread(self._update_secret_reaction_sync, chunk_id, user_id, reaction)
+        except Exception:  # noqa: BLE001
+            logger.exception("update_secret_reaction() упал")
 
 
 class ConceptStore:
