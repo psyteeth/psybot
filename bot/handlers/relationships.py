@@ -333,7 +333,10 @@ async def _start_session(
     session_id = db.create_relationship_session(user.id, user.username)
     context.user_data["rel_session_id"] = session_id
     hostility.reset_session(context)
-    await send(Q_A)
+    # Живой кейс: на вопросе A нет способа выйти кроме /start — несколько раз подряд человек
+    # открывал разбор, не отвечал и уходил (см. SeliverstovaMarina, 3 пустых cancelled-сессии
+    # подряд). Кнопка «В меню» даёт лёгкий путь назад без команды.
+    await send(Q_A, reply_markup=back_to_menu_keyboard())
     await _log_turn(session_id, user, "A", "бот", Q_A)
     variant = db.get_or_assign_ab_variant(user.id) if AB_TESTING_ENABLED else "direct"
     await analytics.log(context, user.id, "flow_started", {"ab_variant": variant})
