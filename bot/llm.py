@@ -266,6 +266,14 @@ CONCRETE_ANSWER_SYSTEM = (
     'мне» (target=self), «я сама всё разрушаю» (target=self).\n\n'
     "ПРИНИМАЕТСЯ (concrete_behavior=true), даже если звучит обобщённо: «должен был бы защищать, "
     'оберегать, учить и т.п.» (названы конкретные глаголы-действия, пусть и списком обязанностей).\n\n'
+    "ВАЖНО про местоимения «себя»/«сам(а)»: вопрос ВСЕГДА про ДРУГОГО человека — возвратное "
+    "местоимение в ответе почти всегда относится тоже к НЕМУ, не к говорящему. Живой баг: ответ "
+    '«больше быть с семьёй или заменить себя нянями» (про партнёра, который мало бывает дома) был '
+    "неверно размечен как target=self из-за слова «себя» — хотя речь шла о ТОМ, что должен делать "
+    "другой человек. «Себя»/«сам» в контексте чужого поведения («он должен бы заменить себя "
+    "нянями», «пусть сам разбирается») — это target=other. Ставь target=self ТОЛЬКО если из текста "
+    "ясно, что говорящий описывает СВОИ СОБСТВЕННЫЕ действия от первого лица («я…», «мне…», «я "
+    "сама…») — а не чужие.\n\n"
     'Ответь СТРОГО валидным JSON без markdown и БЕЗ пояснений после JSON: {"target": "other" или '
     '"self" или "unclear", "concrete_behavior": true или false, "confidence": число от 0.0 до 1.0}.'
 )
@@ -336,7 +344,15 @@ DISPUTE_BASE_QUESTIONS = {
     # 5 (шкала катастроф) — больше НЕ через adapt_dispute_question, фиксированный текст с опорой
     # 100 (см. relationships.py::D5_QUESTION_TEMPLATE, ТЗ-доп. №5) — LLM не смягчает формулировку.
     6: "Историческое. Всегда ли в твоей жизни люди делали так, как «должны»? Откуда у тебя это правило?",
-    7: "Двойной стандарт. Ты сам всегда поступаешь так, как требуешь от [него/неё]? Посоветовал бы ты близкому другу требовать этого?",
+    # ТЗ 01.10.2026, п.A3: раньше это был один вопрос из двух частей (себе + про друга) в одном
+    # сообщении — ответы смешивались, статистика по D7 была нечитаема. Разбито на два отдельных
+    # шага D7a/D7b (см. relationships.py). Будущее время вместо «посоветовал бы» — гендерно
+    # нейтрально (тот же приём, что в GENDER_NEUTRAL_RULE), без «сам(а)».
+    "7a": "Двойной стандарт (себе). Ты всегда поступаешь так же, как требуешь от [него/неё]?",
+    "7b": (
+        "Двойной стандарт (другу). Если бы близкий друг рассказал тебе похожую ситуацию — ты "
+        "посоветуешь ему требовать того же от [него/неё]?"
+    ),
     8: "Семантическая переформулировка. Если заменить «[он/она] должен» на «я бы предпочёл, чтобы…», что меняется в ощущении?",
 }
 
@@ -350,7 +366,7 @@ DISPUTE_SYSTEM = (
 )
 
 
-async def adapt_dispute_question(index: int, narrative: str) -> str:
+async def adapt_dispute_question(index: int | str, narrative: str) -> str:
     base = DISPUTE_BASE_QUESTIONS[index]
     user_text = f"Долженствование (B): {narrative}\nБазовый вопрос: {base}"
     try:
@@ -475,13 +491,24 @@ E_ANALYZE_SYSTEM = (
     "к чему оно относится (не требуй развёрнутого предложения). Не считается наблюдением только "
     "описание чувства/состояния без конкретного поведения на будущее (простое «злюсь», «устал», «не "
     "получается»). Ответь СТРОГО валидным JSON без markdown: "
-    '{"has_insight": true или false, "reflection": "..."}. Если has_insight=true — reflection: КОРОТКАЯ '
-    "вставка (одно продолжение фразы, без точки в начале и с маленькой буквы), составленная ТОЛЬКО из "
-    "слов и смысла самого пользователя, которая грамматически продолжает фразу «в следующий раз в "
-    "подобной ситуации ты можешь ...» — например, если пользователь написал «я б сказал: давай сначала "
-    "за водой, а позже на почту», reflection = «предложить сначала съездить за водой, а на почту "
-    "заехать позже, или сходить самой, раз это рядом». Если has_insight=false — reflection = пустая "
-    "строка."
+    '{"has_insight": true или false, "reflection": "...", "wants_change": true или false}. Если '
+    "has_insight=true — reflection: КОРОТКАЯ вставка (одно продолжение фразы, без точки в начале и "
+    "с маленькой буквы), составленная ТОЛЬКО из слов и смысла самого пользователя, которая "
+    "грамматически продолжает фразу «в следующий раз в подобной ситуации ты можешь ...» — например, "
+    "если пользователь написал «я б сказал: давай сначала за водой, а позже на почту», reflection = "
+    "«предложить сначала съездить за водой, а на почту заехать позже, или сходить самой, раз это "
+    "рядом». Если has_insight=false — reflection = пустая строка.\n\n"
+    "ВАЖНО про лицо в reflection: это ВСЕГДА то, что делает/говорит САМ пользователь — никогда не "
+    "пересказ чужого желания. Живой баг (сессия 13:25:49): модель написала «ты можешь сказать, что "
+    "ей хочется, чтобы её ставили в известность заранее» — субъект перепутан, непонятно, кто говорит "
+    "и о ком. Если пользователь хочет донести ДО ДРУГОГО свои чувства/просьбу — формулируй как "
+    "прямую речь от первого лица: «сказать ему: мне хочется, чтобы меня предупреждали заранее», а не "
+    "как описание желаний другого человека.\n\n"
+    'Поле "wants_change" значимо ТОЛЬКО когда has_insight=false: true — если пользователь прямо '
+    "говорит, что хочет в будущем реагировать иначе, но пока не может это сформулировать («хочется "
+    "по-другому, но я не умею», «не знаю как, но так больше не хочу»); false — если никакого "
+    "движения в сторону новой реакции не видно вообще (просто непонимание/тупик/отказ думать "
+    "дальше)."
 )
 
 
@@ -497,10 +524,11 @@ async def analyze_e_insight(event: str, narrative: str, prior_context: str, late
         return {
             "has_insight": bool(data.get("has_insight", False)),
             "reflection": str(data.get("reflection", "")).strip(),
+            "wants_change": bool(data.get("wants_change", False)),
         }
     except Exception:  # noqa: BLE001
         logger.exception("analyze_e_insight упал/не распарсился")
-        return {"has_insight": False, "reflection": ""}
+        return {"has_insight": False, "reflection": "", "wants_change": False}
 
 
 E_FOLLOWUP_SYSTEM = (
@@ -636,6 +664,20 @@ def _cap_sentences(text: str, max_sentences: int = 3) -> str:
     if len(parts) <= max_sentences:
         return text
     return " ".join(parts[:max_sentences]).strip()
+
+
+def _trim_incomplete_tail(text: str) -> str:
+    """Предохранитель от обрыва ответа посередине предложения/слова, когда модель упёрлась в
+    max_tokens (живой баг: ответ перед «Похоже ли это на правду?» обрывался на полуслове). Если
+    текст не заканчивается знаком конца предложения — отбрасывает незаконченный хвост по границе
+    последнего целого предложения."""
+    text = text.strip()
+    if not text or text[-1] in ".!?…»\"":
+        return text
+    parts = re.split(r"(?<=[.!?…])\s+(?=[А-ЯA-ZЁ«\"])", text)
+    if len(parts) <= 1:
+        return text
+    return " ".join(parts[:-1]).strip()
 
 
 async def answer_concept_question(
@@ -1291,6 +1333,30 @@ YES_NO_SYSTEM = (
 )
 
 
+DISCOMFORT_CONTRADICTION_SYSTEM = (
+    "Ты классификатор для ветки «Отношения» психостоматологического бота. Пользователь дважды "
+    "оценивал дискомфорт от ситуации по шкале 0-10: было {before}, сейчас ответил {after}. Он же "
+    "написал текстом: «{raw_text}». Определи: ПРОТИВОРЕЧИТ ли смысл текста направлению изменения "
+    "цифры? Например, цифра показывает снижение (после меньше, чем было), а текст говорит, что "
+    "стало ХУЖЕ/тяжелее/дискомфортнее — это противоречие. Или наоборот: цифра выросла, а текст "
+    "говорит, что полегчало. Если текст нейтральный, просто поясняет число, или направление текста "
+    "совпадает с направлением цифры — противоречия нет. Ответь ровно одним словом: yes (есть "
+    "противоречие) или no (нет)."
+)
+
+
+async def classify_discomfort_contradiction(before: int | None, after: int, raw_text: str) -> bool:
+    if before is None:
+        return False
+    system = DISCOMFORT_CONTRADICTION_SYSTEM.format(before=before, after=after, raw_text=raw_text)
+    try:
+        result = await _ask(system, raw_text, MODEL_HAIKU, max_tokens=10)
+        return "yes" in result.lower()
+    except Exception:  # noqa: BLE001
+        logger.exception("classify_discomfort_contradiction упал")
+        return False
+
+
 async def classify_yes_no(text: str) -> bool:
     try:
         result = await _ask(YES_NO_SYSTEM, text, MODEL_SONNET, max_tokens=10)
@@ -1322,15 +1388,20 @@ NO_FALSE_IMPROVEMENT_RULE = (
 )
 
 
+D_SUMMARY_LABELS = ["D1", "D2", "D3", "D4", "D5", "D6", "D7_себе", "D7_другу", "D8"]
+
+
 async def generate_session_summary(
     event: str,
     narrative: str,
     consequence: str,
-    d_answers: dict[int, str],
+    d_answers: dict[str, str],
     discomfort_before: int | None = None,
     discomfort_after: int | None = None,
 ) -> str:
-    d_text = "\n".join(f"D{i}: {d_answers.get(i, '')}" for i in range(1, 9) if d_answers.get(i))
+    d_text = "\n".join(
+        f"{label}: {d_answers.get(label, '')}" for label in D_SUMMARY_LABELS if d_answers.get(label)
+    )
     user_text = (
         f"Событие (A): {event}\nДолженствование (B): {narrative}\nСледствие/чувство (C): {consequence}\n"
         f"Ответы на восемь оспариваний:\n{d_text}"
@@ -1339,7 +1410,8 @@ async def generate_session_summary(
     if discomfort_before is not None and discomfort_after is not None and discomfort_after >= discomfort_before:
         system += NO_FALSE_IMPROVEMENT_RULE.format(before=discomfort_before, after=discomfort_after)
     try:
-        return await _ask(system, user_text, MODEL_SONNET, max_tokens=400)
+        answer = await _ask(system, user_text, MODEL_SONNET, max_tokens=700)
+        return _trim_incomplete_tail(answer)
     except Exception:  # noqa: BLE001
         logger.exception("generate_session_summary упал")
         return "Похоже, мы разобрали и событие, и то, чего ты ждал(а) от другого человека, и что при этом чувствуешь(ла)."

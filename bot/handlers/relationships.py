@@ -18,7 +18,6 @@ from bot import analytics, db, debounce, dialogue_matrix, hostility, limits, llm
 from bot.config import (
     ADMIN_USERNAME,
     AB_TESTING_ENABLED,
-    CTA_TARGETS,
     ENABLE_PRIOR_EVENT_QUESTION,
     EXIT_INTENT_CONFIDENCE_THRESHOLD,
     LIMIT_RELATIONSHIP_MESSAGES,
@@ -31,24 +30,27 @@ from bot.sheets import sheets_logger
 
 logger = logging.getLogger(__name__)
 
-# Новые состояния (D5_QUESTION, D5_HUNDRED_FOLLOWUP, EXIT_INTENT_CLARIFY) дописаны В КОНЕЦ,
-# а не вставлены по смыслу между старыми — persistent=True хранит состояние как целое число
-# на диске (PicklePersistence), и перенумерация уже существующих состояний сломала бы разборы,
-# начатые до деплоя этого изменения.
+# Новые состояния (D5_QUESTION, D5_HUNDRED_FOLLOWUP, EXIT_INTENT_CLARIFY, D7_SELF, D7_FRIEND)
+# дописаны В КОНЕЦ, а не вставлены по смыслу между старыми — persistent=True хранит состояние как
+# целое число на диске (PicklePersistence), и перенумерация уже существующих состояний сломала бы
+# разборы, начатые до деплоя этого изменения. POST_FLOW (ТЗ 30.09, «Стало легче?»/CTA-меню) убран
+# из conv_handler.states по ТЗ 01.10.2026 (п.A1/A2), но имя оставлено занятым по той же причине —
+# не сдвигать номера состояний после него.
 (
     A_EVENT, A_PRIOR_EVENT, A_OTHER_PERSON,
     B_NARRATIVE, B_CONFIRM, C_CONSEQUENCE, C_FEELING, C_DISCOMFORT,
     D_CONFIRM, D_QUESTION,
     E_DISCOMFORT_AFTER, E_SUMMARY_CONFIRM, E_SUMMARY_CORRECTION, E_SUMMARY, E_FOLLOWUP,
     D5_QUESTION, D5_HUNDRED_FOLLOWUP, EXIT_INTENT_CLARIFY,
-    INTRO_WAIT, POST_FLOW,  # аналитика воронки рекламы, ТЗ 30.09 — дописаны в конец, см. выше
-) = range(20)
+    INTRO_WAIT, POST_FLOW,
+    D7_SELF, D7_FRIEND,
+) = range(22)
 
 Q_A = (
     "Опиши событие или поведение другого человека, от которого тебе дискомфортно: "
     "триггерит, бесит, раздражает, обламывает, достаёт."
 )
-Q_B = "Как бы ты хотел, чтобы было иначе? Что другой человек должен был сделать по-другому?"
+Q_B = "Как бы тебе хотелось, чтобы было иначе? Что другой человек должен был сделать по-другому?"
 Q_C_TEMPLATE = (
     "Когда {narrative_short}не совпадает с тем, что происходит на самом деле — что ты чувствуешь "
     "и как реагируешь?"
@@ -58,6 +60,14 @@ E_NO_INSIGHT_TEXT = (
     "Похоже, сейчас ответ не находится — и это тоже нормально, не обязательно сразу. Если захочется "
     f"разобрать это глубже — приходи на диагностику, пиши {ADMIN_USERNAME}."
 )
+# B7 (ТЗ 01.10.2026): отдельный текст для исхода «хочу иначе, но не умею» — раньше это закрывалось
+# тем же E_NO_INSIGHT_TEXT, что и полное отсутствие движения, хотя человек уже сам заметил желание
+# реагировать по-другому (живой пример: «хочется по-другому, но я не умею», сессия 05:16:46).
+E_WANTS_CHANGE_TEXT = (
+    "Похоже, ты уже чувствуешь, что хочется реагировать иначе — а готовой формулировки для этого "
+    "пока нет, и это тоже нормально, так и бывает. Если захочется найти её — приходи на диагностику, "
+    f"пиши {ADMIN_USERNAME}."
+)
 DECLINE_D_TEXT = "Ок, как скажешь. Если захочешь вернуться — я здесь."
 
 PRIOR_EVENT_QUESTION = "А что было до этого? Может, чуть раньше что-то уже задело?"
@@ -65,10 +75,18 @@ OTHER_PERSON_QUESTION = "А кто это для тебя?"
 DISCOMFORT_BEFORE_Q = "Насколько тебе сейчас дискомфортно от этой ситуации, от 0 до 10?"
 DISCOMFORT_AFTER_Q = "И ещё раз, от 0 до 10: насколько тебе дискомфортно от этой ситуации сейчас?"
 DISCOMFORT_RETRY_TEXT = "Напиши, пожалуйста, просто число от 0 до 10."
+# B1 (ТЗ 01.10.2026): живой баг — discomfort_before=0 при явно непустом, беспокоящем событии почти
+# всегда оказывался опечаткой/недопониманием вопроса, а не реальным «ноль». Один раз переспрашиваем.
+DISCOMFORT_ZERO_CONFIRM_TEXT = "0 — совсем не беспокоит, так?"
 
 
 def _parse_discomfort(text: str) -> int | None:
-    m = re.fullmatch(r"\s*(\d{1,2})\s*[.!]?\s*", text)
+    # B1 (ТЗ 01.10.2026): раньше было re.fullmatch — принимало ТОЛЬКО голое число, а сообщение с
+    # пояснением («стало дискомфортнее, 4») отклонялось целиком («напиши просто число»), и ровно
+    # эти поясняющие слова (нужные для проверки противоречия в E_discomfort_after) терялись в
+    # отклонённом сообщении. Теперь число ищем внутри текста — с пояснением оно тоже принимается, а
+    # сырой текст с пояснением сохраняется (см. вызовы discomfort_*_raw).
+    m = re.search(r"(?<!\d)(10|[0-9])(?!\d)", text)
     if not m:
         return None
     n = int(m.group(1))
@@ -155,12 +173,19 @@ FINAL_INSIGHT_OPENERS = ["Похоже, у тебя получилось", "Ка
 
 D_FIELDS = {
     1: "d1_logical", 2: "d2_empirical", 3: "d3_pragmatic", 4: "d4_hedonistic",
-    5: "d5_catastrophe_scale", 6: "d6_historical", 7: "d7_double_standard", 8: "d8_semantic",
+    5: "d5_catastrophe_scale", 6: "d6_historical", 8: "d8_semantic",
+    # 7 (двойной стандарт) разбит на D7_SELF/D7_FRIEND — свои обработчики, свои поля
+    # (d7_self/d7_friend), не через этот generic-словарь (ТЗ 01.10.2026, п.A3).
 }
 
 
-def _shift_value(before, after):
+def _shift_value(row):
+    before, after = row["discomfort_before"], row["discomfort_after"]
     if before is None or after is None:
+        return ""
+    if row["discomfort_doubt"]:
+        # B1 (ТЗ 01.10.2026): слова в ответе противоречат направлению изменения числа — не
+        # считаем сдвиг как достоверный, чтобы не портить статистику ошибкой ввода.
         return ""
     return before - after
 
@@ -176,7 +201,7 @@ def _row_for_sheets(row) -> list:
         row["event_before"] or "", row["other_person"] or "",
         row["discomfort_before"] if row["discomfort_before"] is not None else "",
         row["discomfort_after"] if row["discomfort_after"] is not None else "",
-        _shift_value(row["discomfort_before"], row["discomfort_after"]),
+        _shift_value(row),
         row["reflection_before_e"] or "",
         "да" if row["self_request"] else "нет",
         row["self_check_step"] or "",
@@ -194,6 +219,14 @@ def _row_for_sheets(row) -> list:
         row["attempts_a"] if row["attempts_a"] is not None else "",
         row["attempts_b"] if row["attempts_b"] is not None else "",
         row["dozhim_outcome"] or "",
+        # ТЗ 01.10.2026: новые поля дописаны в конец, старые позиции (d7_double_standard,
+        # reflection_before_e выше) не трогаем — не сдвигаем уже выгруженные колонки в Sheets.
+        row["d7_self"] or "",
+        row["d7_friend"] or "",
+        "да" if row["discomfort_doubt"] else "нет",
+        row["discomfort_before_raw"] or "",
+        row["discomfort_after_raw"] or "",
+        row["e_outcome"] or "",
     ]
 
 
@@ -431,38 +464,13 @@ async def _ask_feeling_question(session_id: int) -> str:
     return "Как ты себя чувствуешь в этот момент?"
 
 
-def _pick_reflection_quotes(row) -> tuple[str | None, str]:
-    """Самые содержательные ответы D1-D4/D6-D8 по длине (словам) — цитируем дословно,
-    ничего не пересказываем и не интерпретируем (см. ТЗ-доп. №2, п.2.3). D5 — число, не
-    описательный текст, в цитаты не годится (ТЗ-доп. №5)."""
-    candidates = [
-        row[f] for f in (
-            "d1_logical", "d2_empirical", "d3_pragmatic", "d4_hedonistic",
-            "d6_historical", "d7_double_standard", "d8_semantic",
-        )
-    ]
-    candidates = [c for c in candidates if c]
-    if not candidates:
-        return None, ""
-    top = sorted(candidates, key=lambda t: len(t.split()), reverse=True)[:2]
-    if len(top) == 1:
-        text = f'На одном из вопросов ты сказал(а): "{top[0]}".'
-    else:
-        text = f'На одном из вопросов ты сказал(а): "{top[0]}". А на другом: "{top[1]}".'
-    return text, " | ".join(top)
-
-
 async def _start_e_finale(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> int:
     """Общая точка входа в финал разбора — что при нормальном прохождении всех D1-D8,
     что при форсированном сворачивании по лимиту 40 сообщений (см. _maybe_wrap_to_summary).
-    Цитирует содержательные ответы (2.3), затем переспрашивает дискомфорт (2.1), и только
-    потом идёт Voss-резюме/подтверждение."""
-    row = db.get_relationship_session(session_id)
+    Шаг E_reflection (цитаты «на одном вопросе ты сказал...») убран по ТЗ 01.10.2026, п.A4 —
+    пара цитат выбиралась нестабильно и без рамки, иногда ухудшала состояние человека. Сразу
+    переспрашивает дискомфорт (2.1), и только потом идёт Voss-резюме/подтверждение."""
     await analytics.log(context, update.effective_user.id, "step_D_done")
-    quote_text, stored_quotes = _pick_reflection_quotes(row)
-    if quote_text:
-        await _send(update, context, session_id, "E_reflection", quote_text)
-    db.update_relationship_session(session_id, reflection_before_e=stored_quotes)
     await _send(update, context, session_id, "E_discomfort_after", DISCOMFORT_AFTER_Q)
     return E_DISCOMFORT_AFTER
 
@@ -779,11 +787,13 @@ async def c_discomfort(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _process_c_discomfort(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
     session_id = context.user_data["rel_session_id"]
+    zero_pending = context.user_data.get("rel_c_discomfort_zero_pending", False)
+    bot_question = DISCOMFORT_ZERO_CONFIRM_TEXT if zero_pending else DISCOMFORT_BEFORE_Q
     await _log_turn(session_id, update.effective_user, "C_discomfort", "человек", text)
 
     status = await hostility.precheck(
         update, context, branch="relationships", step="C_discomfort",
-        bot_question=DISCOMFORT_BEFORE_Q, text_override=text,
+        bot_question=bot_question, text_override=text,
     )
     if status == "crisis":
         await _close_after_hostility(update, context, session_id, "crisis")
@@ -794,13 +804,30 @@ async def _process_c_discomfort(update: Update, context: ContextTypes.DEFAULT_TY
         await _close_after_hostility(update, context, session_id, "hostility_closed")
         return ConversationHandler.END
 
-    value = _parse_discomfort(text)
-    if value is None:
-        await _send(update, context, session_id, "C_discomfort", DISCOMFORT_RETRY_TEXT)
-        return C_DISCOMFORT
+    if zero_pending:
+        # B1: это ответ на «0 — совсем не беспокоит, так?», не новое число — исходный «0» уже
+        # сохранён в raw_text ниже.
+        context.user_data.pop("rel_c_discomfort_zero_pending", None)
+        raw_text = context.user_data.pop("rel_c_discomfort_zero_raw", text)
+        confirmed_zero = await llm.classify_yes_no(text)
+        if not confirmed_zero:
+            await _send(update, context, session_id, "C_discomfort", DISCOMFORT_BEFORE_Q)
+            return C_DISCOMFORT
+        value = 0
+    else:
+        value = _parse_discomfort(text)
+        if value is None:
+            await _send(update, context, session_id, "C_discomfort", DISCOMFORT_RETRY_TEXT)
+            return C_DISCOMFORT
+        if value == 0:
+            context.user_data["rel_c_discomfort_zero_pending"] = True
+            context.user_data["rel_c_discomfort_zero_raw"] = text
+            await _send(update, context, session_id, "C_discomfort", DISCOMFORT_ZERO_CONFIRM_TEXT)
+            return C_DISCOMFORT
+        raw_text = text
 
     await _bump_messages(session_id)
-    db.update_relationship_session(session_id, discomfort_before=value)
+    db.update_relationship_session(session_id, discomfort_before=value, discomfort_before_raw=raw_text)
     await analytics.log(context, update.effective_user.id, "step_C_done")
 
     row = db.get_relationship_session(session_id)
@@ -853,6 +880,13 @@ async def _process_d_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
     return D_QUESTION
 
 
+# B5 (ТЗ 01.10.2026): D8 — семантическая переформулировка «я бы предпочёл, чтобы...» — должна быть
+# про самого клиента. Живой баг (сессия 18:49:17): ответ «я бы сказала ей поговорить с партнёром»
+# был про третье лицо (подругу из D7), а не про себя. Переспрашиваем один раз, не больше.
+D8_THIRD_PERSON_RETRY_TEXT = "Это про тебя? Что меняется, когда ты говоришь это про себя?"
+FIRST_PERSON_RE = re.compile(r"\b(я|мне|меня|мной|мною)\b", re.IGNORECASE)
+
+
 async def d_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await debounce.collect(
         update, context, step_id="rel_d", conv_handler=conv_handler, state=D_QUESTION,
@@ -892,12 +926,92 @@ async def _process_d_question(update: Update, context: ContextTypes.DEFAULT_TYPE
             question = D5_QUESTION_TEMPLATE.format(situation=row["a_event"])
             await _send(update, context, session_id, "D5", question)
             return D5_QUESTION
+        if idx == 7:
+            # A3 (ТЗ 01.10.2026): D7 разбит на два отдельных сообщения — себе (D7_SELF), затем
+            # другу (D7_FRIEND, см. ниже), вместо одного вопроса из двух смешанных частей.
+            row = db.get_relationship_session(session_id)
+            question = await llm.adapt_dispute_question("7a", row["b_narrative_confirmed"])
+            await _send(update, context, session_id, "D7_self", question)
+            return D7_SELF
         row = db.get_relationship_session(session_id)
         question = await llm.adapt_dispute_question(idx, row["b_narrative_confirmed"])
         await _send(update, context, session_id, f"D{idx}", question)
         return D_QUESTION
 
+    # idx == 8: только что получен ответ на D8.
+    if not FIRST_PERSON_RE.search(text) and not context.user_data.get("rel_d8_reasked"):
+        context.user_data["rel_d8_reasked"] = True
+        await _send(update, context, session_id, "D8_проверка", D8_THIRD_PERSON_RETRY_TEXT)
+        return D_QUESTION
+    context.user_data.pop("rel_d8_reasked", None)
     return await _start_e_finale(update, context, session_id)
+
+
+async def d7_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_d7_self", conv_handler=conv_handler, state=D7_SELF,
+        process=lambda text: _process_d7_self(update, context, text),
+    )
+
+
+async def _process_d7_self(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    session_id = context.user_data["rel_session_id"]
+    await _log_turn(session_id, update.effective_user, "D7_self", "человек", text)
+
+    status = await hostility.precheck(
+        update, context, branch="relationships", step="D", skip_hostility=True, text_override=text
+    )
+    if status == "crisis":
+        await _close_after_hostility(update, context, session_id, "crisis")
+        return ConversationHandler.END
+
+    count = await _bump_messages(session_id)
+    db.update_relationship_session(session_id, d7_self=text)
+
+    await _check_exit_intent(context, session_id, "D7_self", text)
+
+    wrap_state = await _maybe_wrap_to_summary(update, context, session_id, count)
+    if wrap_state is not None:
+        return wrap_state
+
+    row = db.get_relationship_session(session_id)
+    question = await llm.adapt_dispute_question("7b", row["b_narrative_confirmed"])
+    await _send(update, context, session_id, "D7_friend", question)
+    return D7_FRIEND
+
+
+async def d7_friend(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_d7_friend", conv_handler=conv_handler, state=D7_FRIEND,
+        process=lambda text: _process_d7_friend(update, context, text),
+    )
+
+
+async def _process_d7_friend(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    session_id = context.user_data["rel_session_id"]
+    await _log_turn(session_id, update.effective_user, "D7_friend", "человек", text)
+
+    status = await hostility.precheck(
+        update, context, branch="relationships", step="D", skip_hostility=True, text_override=text
+    )
+    if status == "crisis":
+        await _close_after_hostility(update, context, session_id, "crisis")
+        return ConversationHandler.END
+
+    count = await _bump_messages(session_id)
+    db.update_relationship_session(session_id, d7_friend=text)
+
+    await _check_exit_intent(context, session_id, "D7_friend", text)
+
+    wrap_state = await _maybe_wrap_to_summary(update, context, session_id, count)
+    if wrap_state is not None:
+        return wrap_state
+
+    context.user_data["rel_d_index"] = 8
+    row = db.get_relationship_session(session_id)
+    question = await llm.adapt_dispute_question(8, row["b_narrative_confirmed"])
+    await _send(update, context, session_id, "D8", question)
+    return D_QUESTION
 
 
 async def d5_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -924,6 +1038,19 @@ async def _process_d5_question(update: Update, context: ContextTypes.DEFAULT_TYP
         return D5_QUESTION
 
     await _bump_messages(session_id)
+
+    # B2 (ТЗ 01.10.2026): живой баг — повторное/гоночное сообщение в этот же шаг (клиент успел
+    # отправить D5 дважды до того, как бот обработал первый ответ) приводило к повторной отправке
+    # D6. Если D5 уже отвечен — это не новый ответ, а правка прежнего: обновляем значение (храня
+    # исходное в d5_original) и НЕ переспрашиваем/не продвигаем разбор второй раз.
+    existing = db.get_relationship_session(session_id)
+    if existing["d5_catastrophe_scale"] is not None:
+        update_fields = {"d5_catastrophe_scale": value, "d5_comment": text}
+        if existing["d5_original"] is None and int(existing["d5_catastrophe_scale"]) != value:
+            update_fields["d5_original"] = int(existing["d5_catastrophe_scale"])
+        db.update_relationship_session(session_id, **update_fields)
+        return D_QUESTION
+
     db.update_relationship_session(session_id, d5_catastrophe_scale=value, d5_comment=text)
 
     if value == 100:
@@ -1000,84 +1127,55 @@ async def _process_e_discomfort_after(update: Update, context: ContextTypes.DEFA
         return E_DISCOMFORT_AFTER
 
     await _bump_messages(session_id)
-    db.update_relationship_session(session_id, discomfort_after=value)
+    row = db.get_relationship_session(session_id)
+    # B1 (ТЗ 01.10.2026): слова ответа могут противоречить направлению изменения числа
+    # («стало дискомфортнее, 4» при падении с 8) — живой случай, ошибка ввода. Флаг «сомнение»
+    # исключает такой сдвиг из статистики (см. _shift_value), сам ответ всё равно сохраняется.
+    contradicts = await llm.classify_discomfort_contradiction(row["discomfort_before"], value, text)
+    db.update_relationship_session(
+        session_id, discomfort_after=value, discomfort_after_raw=text,
+        discomfort_doubt=1 if contradicts else 0,
+    )
     return await _send_summary_confirm(update, context, session_id)
 
 
-FEEDBACK_QUESTION_TEXT = "Стало легче?"
-CTA_OFFER_TEXT = "Если хочется разобраться глубже — вот варианты:"
+CTA_OFFER_TEXT = (
+    "Если хочется разобраться глубже — приходи на эфир, поговорим, или на консультацию. В любом "
+    f"случае пиши {ADMIN_USERNAME} — он сориентирует."
+)
 
 
 async def _complete_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> int:
-    """Общая точка истинного завершения разбора (аналитика воронки, ТЗ 30.09) — вызывается и из
-    немедленного конца _finish_e, и из конца _process_exit_intent_clarify (когда «избегание или
-    интеграция» продлевает разбор на один обмен). Логирует E/flow_completed и вместо END уводит в
-    POST_FLOW — «Стало легче?», затем CTA."""
+    """Общая точка истинного завершения разбора — вызывается и из немедленного конца _finish_e, и
+    из конца _process_exit_intent_clarify (когда «избегание или интеграция» продлевает разбор на
+    один обмен). Логирует E/flow_completed, затем текстовое приглашение написать админу (ТЗ
+    01.10.2026, п.A1/A2 — «Стало легче?» и кнопки «Консультация»/«Интенсив»/«Канал» убраны, они не
+    работали или путали; кнопки здесь больше нет вообще — «В меню» уже есть на самом сообщении
+    E_finish прямо перед этим, дублировать её тут не нужно)."""
     user = update.effective_user
     await analytics.log(context, user.id, "step_E_done")
     await analytics.log(context, user.id, "flow_completed")
     await _log_session(update, context, session_id)
     await hostility.maybe_send_self_harm_note(update, context)
 
-    keyboard = InlineKeyboardMarkup([[
-        InlineKeyboardButton("Да", callback_data=f"fb:{session_id}:Да"),
-        InlineKeyboardButton("Немного", callback_data=f"fb:{session_id}:Немного"),
-        InlineKeyboardButton("Нет", callback_data=f"fb:{session_id}:Нет"),
-    ]])
-    await _send(update, context, session_id, "feedback_q", FEEDBACK_QUESTION_TEXT, reply_markup=keyboard)
+    await _send(update, context, session_id, "cta_offer", CTA_OFFER_TEXT)
 
     context.user_data.pop("rel_session_id", None)
     context.user_data.pop("rel_e_first_answer", None)
     context.user_data.pop("rel_summary", None)
-    return POST_FLOW
-
-
-async def rel_feedback_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    try:
-        _, session_id_str, value = query.data.split(":", 2)
-        session_id = int(session_id_str)
-    except ValueError:
-        return POST_FLOW
-
-    user = update.effective_user
-    await analytics.log(context, user.id, "feedback", {"value": value})
-
-    buttons = [
-        InlineKeyboardButton(label, callback_data=f"cta:{session_id}:{key}")
-        for key, (label, _url) in CTA_TARGETS.items()
-    ]
-    await _send(
-        update, context, session_id, "cta_offer", CTA_OFFER_TEXT,
-        reply_markup=InlineKeyboardMarkup([[b] for b in buttons]),
-    )
-    for key in CTA_TARGETS:
-        await analytics.log(context, user.id, "cta_shown", {"target": key})
-    return POST_FLOW
-
-
-async def rel_cta_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    try:
-        _, session_id_str, key = query.data.split(":", 2)
-        session_id = int(session_id_str)
-    except ValueError:
-        return ConversationHandler.END
-
-    user = update.effective_user
-    # Сначала лог клика, потом ссылка — прямая URL-кнопка не отслеживается (ТЗ 30.09).
-    await analytics.log(context, user.id, "cta_click", {"target": key})
-    label, url = CTA_TARGETS.get(key, (key, ROADMAP_URL))
-    await _send(update, context, session_id, "cta_link", f"{label}: {url}")
     return ConversationHandler.END
 
 
-async def _finish_e(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, insertion: str | None) -> int:
+async def _finish_e(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, insertion: str | None,
+    wants_change: bool = False,
+) -> int:
+    """Три разных текста закрытия по исходу (B7, ТЗ 01.10.2026): (1) найдена новая реакция —
+    insertion есть; (2) хочется иначе, но пока не сформулировано — wants_change; (3) без движения."""
     db.finish_relationship_session(session_id, exit_step="E")
 
     if insertion:
+        outcome = "insight"
         closing_text = FINAL_INSIGHT_TEMPLATE.format(
             opener=random.choice(FINAL_INSIGHT_OPENERS), insertion=html.escape(insertion)
         )
@@ -1085,8 +1183,16 @@ async def _finish_e(update: Update, context: ContextTypes.DEFAULT_TYPE, session_
             update, context, session_id, "E_finish", closing_text,
             reply_markup=back_to_menu_keyboard(), parse_mode=ParseMode.HTML,
         )
+    elif wants_change:
+        outcome = "wants_change"
+        await _send(
+            update, context, session_id, "E_finish", E_WANTS_CHANGE_TEXT,
+            reply_markup=back_to_menu_keyboard(),
+        )
     else:
+        outcome = "no_change"
         await _send(update, context, session_id, "E_finish", E_NO_INSIGHT_TEXT, reply_markup=back_to_menu_keyboard())
+    db.update_relationship_session(session_id, e_outcome=outcome)
 
     # «Избегание или интеграция» (ТЗ-доп. №5, раздел 2) — если хоть раз сработало на C-D8/E,
     # разбор не заканчивается тут же, а продолжается ещё одним обменом. Лог в Sheets поэтому
@@ -1148,7 +1254,9 @@ async def _process_exit_intent_clarify(update: Update, context: ContextTypes.DEF
 
 async def _send_summary_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> int:
     row = db.get_relationship_session(session_id)
-    d_answers = {i: row[D_FIELDS[i]] for i in range(1, 9)}
+    d_answers = {f"D{i}": row[D_FIELDS[i]] for i in D_FIELDS}
+    d_answers["D7_себе"] = row["d7_self"]
+    d_answers["D7_другу"] = row["d7_friend"]
     summary = await llm.generate_session_summary(
         row["a_event"], row["b_narrative_confirmed"], row["c_consequence"], d_answers,
         discomfort_before=row["discomfort_before"], discomfort_after=row["discomfort_after"],
@@ -1313,7 +1421,7 @@ async def _process_e_followup(update: Update, context: ContextTypes.DEFAULT_TYPE
     if analysis["has_insight"]:
         return await _finish_e(update, context, session_id, analysis["reflection"])
 
-    return await _finish_e(update, context, session_id, None)
+    return await _finish_e(update, context, session_id, None, wants_change=analysis.get("wants_change", False))
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1343,6 +1451,8 @@ conv_handler = ConversationHandler(
         D_QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, d_question)],
         D5_QUESTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, d5_question)],
         D5_HUNDRED_FOLLOWUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, d5_hundred_followup)],
+        D7_SELF: [MessageHandler(filters.TEXT & ~filters.COMMAND, d7_self)],
+        D7_FRIEND: [MessageHandler(filters.TEXT & ~filters.COMMAND, d7_friend)],
         E_DISCOMFORT_AFTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_discomfort_after)],
         E_SUMMARY_CONFIRM: [CallbackQueryHandler(e_summary_confirm, pattern="^e_confirm:")],
         E_SUMMARY_CORRECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_summary_correction)],
@@ -1353,10 +1463,8 @@ conv_handler = ConversationHandler(
             CallbackQueryHandler(rel_intro_start, pattern="^rel_intro_start$"),
             MessageHandler(filters.TEXT & ~filters.COMMAND, rel_intro_text_fallback),
         ],
-        POST_FLOW: [
-            CallbackQueryHandler(rel_feedback_choice, pattern="^fb:"),
-            CallbackQueryHandler(rel_cta_choice, pattern="^cta:"),
-        ],
+        # POST_FLOW («Стало легче?»/CTA-меню, ТЗ 30.09) больше не используется — убран по
+        # ТЗ 01.10.2026, п.A1/A2 (_complete_flow теперь сразу шлёт «Интенсив» и завершает разговор).
     },
     fallbacks=[
         CommandHandler("cancel", cancel),

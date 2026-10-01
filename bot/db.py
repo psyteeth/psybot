@@ -56,7 +56,13 @@ CREATE TABLE IF NOT EXISTS relationship_sessions (
     exit_intent_answer TEXT,
     attempts_a INTEGER NOT NULL DEFAULT 0,
     attempts_b INTEGER NOT NULL DEFAULT 0,
-    dozhim_outcome TEXT
+    dozhim_outcome TEXT,
+    d7_self TEXT,
+    d7_friend TEXT,
+    discomfort_before_raw TEXT,
+    discomfort_after_raw TEXT,
+    discomfort_doubt INTEGER NOT NULL DEFAULT 0,
+    e_outcome TEXT
 );
 
 CREATE TABLE IF NOT EXISTS teeth_sessions (
@@ -160,6 +166,13 @@ MIGRATIONS = [
     "ALTER TABLE users ADD COLUMN first_source TEXT",
     "ALTER TABLE users ADD COLUMN last_source TEXT",
     "ALTER TABLE users ADD COLUMN ab_variant TEXT",
+    # ТЗ 01.10.2026: D7 разбит на два шага (себе/другу), ревалидация дискомфорта, 3 исхода E_finish.
+    "ALTER TABLE relationship_sessions ADD COLUMN d7_self TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN d7_friend TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN discomfort_before_raw TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN discomfort_after_raw TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN discomfort_doubt INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE relationship_sessions ADD COLUMN e_outcome TEXT",
 ]
 
 
@@ -294,7 +307,7 @@ def get_relationship_session(session_id: int) -> Optional[sqlite3.Row]:
 RELATIONSHIP_REQUIRED_FIELDS = [
     "a_event", "b_narrative_confirmed", "c_consequence",
     "d1_logical", "d2_empirical", "d3_pragmatic", "d4_hedonistic",
-    "d5_catastrophe_scale", "d6_historical", "d7_double_standard", "d8_semantic",
+    "d5_catastrophe_scale", "d6_historical", "d7_self", "d7_friend", "d8_semantic",
     "e_summary",
 ]
 

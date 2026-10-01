@@ -18,14 +18,17 @@ logger = logging.getLogger(__name__)
 
 SOURCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
-# Порядок шагов воронки для /stats_funnel — от старта до клика по CTA.
+# Порядок шагов воронки для /stats_funnel — от старта до конца разбора. ТЗ 01.10.2026: CTA-кнопка
+# убрана совсем (путала людей, см. живой кейс с двумя "cancelled"-сессиями подряд) — финальное
+# сообщение теперь просто текст, без кнопки и без отдельного события показа, так что последняя
+# ступень воронки — flow_completed (а не cta_shown/cta_click, которых больше не существует).
 FUNNEL_STEPS = [
     "start", "flow_started", "step_A_done", "step_B_done", "step_C_done",
-    "step_D_done", "step_E_done", "cta_click",
+    "step_D_done", "step_E_done", "flow_completed",
 ]
 FUNNEL_STEP_LABELS = {
     "start": "start", "flow_started": "flow_started", "step_A_done": "A", "step_B_done": "B",
-    "step_C_done": "C", "step_D_done": "D", "step_E_done": "E", "cta_click": "cta_click",
+    "step_C_done": "C", "step_D_done": "D", "step_E_done": "E", "flow_completed": "completed",
 }
 
 
@@ -119,16 +122,6 @@ def _median_time_to_d(rows: list[dict]) -> str:
     return f"{round(statistics.median(deltas) / 60, 1)} мин (n={len(deltas)})"
 
 
-def _feedback_distribution(rows: list[dict]) -> str:
-    dist: dict[str, int] = defaultdict(int)
-    for r in rows:
-        if r["event"] == "feedback":
-            dist[str(r["meta"].get("value", "?"))] += 1
-    if not dist:
-        return "нет ответов"
-    return ", ".join(f"{k}: {v}" for k, v in sorted(dist.items(), key=lambda x: -x[1]))
-
-
 async def compute_funnel_stats(days: int) -> str:
     try:
         rows = _fetch_events(days)
@@ -142,7 +135,6 @@ async def compute_funnel_stats(days: int) -> str:
     lines.append("\nПо A/B-варианту:")
     lines.append(_funnel_table(rows, lambda r: r["meta"].get("ab_variant")))
     lines.append(f"\nМедианное время start → D: {_median_time_to_d(rows)}")
-    lines.append(f"Отклики «стало легче»: {_feedback_distribution(rows)}")
     return "\n".join(lines)
 
 
