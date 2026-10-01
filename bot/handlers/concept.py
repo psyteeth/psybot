@@ -22,6 +22,7 @@ from bot.config import (
     CONCEPT_ROUTER_RELEVANCE_THRESHOLD,
     SECRETS_MAX_PER_SESSION,
     SECRETS_MIN_GAP_ANSWERS,
+    ROADMAP_URL,
     SECRETS_PAUSE_AFTER_IGNORED,
     limit_exhausted_text,
 )
@@ -44,6 +45,16 @@ OFFTOPIC_TEXT = (
     f"{CONCEPT_CHAT_USERNAME}. Чтобы получить туда доступ, напиши {ADMIN_USERNAME} — добавят."
 )
 DISPUTE_STREAK_THRESHOLD = 2
+# Личный запрос («хочу разобрать свою ситуацию», «откуда у меня…») — не здесь: «Концепция» объясняет
+# метод, а разбор жизни уводит в бесконечную псевдотерапию (живой кейс 502643542, 02.10).
+PERSONAL_REQUEST_TEXT = (
+    "Похоже, тебе хочется разобраться в своей ситуации, а не в теории 🙌 Здесь, в «Концепции», я "
+    "только объясняю сам метод.\n\n"
+    "Свою ситуацию с конкретным человеком можно разобрать по шагам в ветке «Отношения» — кнопка ниже.\n\n"
+    "А полный разбор, с чем связаны именно твои зубы, — на диагностике в Психостоматологии №1. "
+    f"Подробности по ссылке: {ROADMAP_URL}\n\n"
+    f"По всем вопросам — пиши администратору Марии {ADMIN_USERNAME}."
+)
 
 
 async def _log_turn(context: ContextTypes.DEFAULT_TYPE, user, step: str, who: str, text: str, msg_type: str = "обычный") -> None:
@@ -277,6 +288,9 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, t
 
     db.increment_concept_messages(user.id)
 
+    if await llm.is_personal_request(text, context.user_data.get("concept_last_answer")):
+        return await _redirect_personal_request(update, context, text, is_first)
+
     if is_first:
         pending_marker = context.user_data.pop("concept_pending_reaction_marker", None)
         context.user_data["concept_session_id"] = f"{user.id}_{db.now()}"
@@ -318,6 +332,35 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         context.user_data["concept_combined_question"] = f"{combined}\n(уточнение клиента: {text})"
 
     return await _route_and_respond(update, context)
+
+
+async def _redirect_personal_request(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, is_first: bool
+) -> int:
+    user = update.effective_user
+    if is_first:
+        context.user_data["concept_session_id"] = f"{user.id}_{db.now()}"
+    await _log_turn(context, user, "ask" if is_first else "clarify_reply", "человек", text)
+    pending_marker = context.user_data.pop("concept_pending_reaction_marker", None)
+    if pending_marker:
+        await sheets_logger.update_concept_reaction(pending_marker, user.id, "личный запрос")
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Отношения", callback_data="menu:relationships")],
+            [InlineKeyboardButton("В меню", callback_data="menu:back")],
+        ]
+    )
+    await _send(update, context, "personal_redirect", PERSONAL_REQUEST_TEXT, reply_markup=keyboard)
+    if ADMIN_CHAT_ID:
+        try:
+            relay = f"❓ {user.username or user.id}: {text}\n(личный запрос → Отношения/диагностика)"
+            await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=relay[:4000])
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось отправить релей личного запроса админу")
+    _reset_concept_topic_state(context)
+    context.user_data.pop("concept_last_topic", None)
+    context.user_data.pop("concept_last_answer", None)
+    return ConversationHandler.END
 
 
 async def _route_and_respond(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
