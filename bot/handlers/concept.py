@@ -310,6 +310,7 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, t
             context.user_data["concept_combined_question"] = followup
             context.user_data["concept_clarify_count"] = 0
             context.user_data["concept_irritated"] = False
+            context.user_data["concept_hook_followup"] = True
             return await _route_and_respond(update, context)
 
         if await llm.is_offtopic_concept(text, prior_topic=prior_topic):
@@ -386,6 +387,10 @@ async def _route_and_respond(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     mode = route["mode"]
     capped = False
+    # согласие на крючок — выполняем обещанное простым ответом: «углубление» достаёт случайный кусок
+    # базы и уводит тему в сторону (живой кейс 02.10), а уточнять после «да» нечего
+    if context.user_data.pop("concept_hook_followup", False):
+        mode = "simple"
     if mode == "clarify":
         if best_score >= relevance_threshold and route["confidence"] >= confidence_threshold:
             mode = "simple"

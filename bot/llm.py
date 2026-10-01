@@ -32,7 +32,19 @@ async def _ask(system: str, user_text: str, model: str, max_tokens: int = 500) -
         messages=[{"role": "user", "content": user_text}],
         thinking={"type": "disabled"},
     )
-    return "".join(block.text for block in resp.content if block.type == "text").strip()
+    return _strip_cjk("".join(block.text for block in resp.content if block.type == "text")).strip()
+
+
+# Живой баг 02.10: в русский ответ просочился иероглиф («внутри случается微 паника»). Боту не нужны
+# CJK-символы ни в одном сценарии — вырезаем их на выходе любого вызова модели.
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\uff66-\uff9f]+")
+
+
+def _strip_cjk(text: str) -> str:
+    if not _CJK_RE.search(text):
+        return text
+    logger.warning("LLM вернул CJK-символы, вырезаем: %r", text[:200])
+    return re.sub(r"[ \t]{2,}", " ", _CJK_RE.sub(" ", text))
 
 
 # ---------------------------------------------------------------------------
