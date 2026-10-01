@@ -71,6 +71,8 @@ FEELING_DIG_TEXT = (
     'понять, откуда идёт проблема с зубами. Так что скажи честно: ты сказал(а) «{label}» — а какой '
     'ты сам(а), если назвать это одним словом? Закончи: «Я...»'
 )
+# второй переспрос короче: длинное вступление про диагностику дважды подряд читается как зацикливание
+FEELING_DIG_TEXT_AGAIN = "Давай ещё раз: а если всё это одним словом? Закончи: «Я...»"
 
 
 def _other_person_note_text(subject_age: str, motivation: str) -> str:
@@ -385,7 +387,10 @@ async def _process_ask_feeling(update: Update, context: ContextTypes.DEFAULT_TYP
         depth = await llm.classify_feeling_depth(text)
         if not depth["is_deep"]:
             context.user_data["teeth_feeling_attempts"] = attempts + 1
-            dig_text = FEELING_DIG_TEXT.format(label=depth["label"])
+            dig_text = (
+                FEELING_DIG_TEXT.format(label=depth["label"]) if attempts == 0
+                else FEELING_DIG_TEXT_AGAIN
+            )
             await _send(update, context, session_id, "ask_feeling", dig_text, msg_type="уточнение")
             return ASK_FEELING
 
