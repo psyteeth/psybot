@@ -864,7 +864,10 @@ async def _process_d_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     await _bump_messages(session_id)
 
-    agreed = await llm.classify_yes_no(text)
+    # Живой баг: раньше тут был общий classify_yes_no — любой неявный ответ (вопрос, рассуждение)
+    # читался как отказ и рвал весь разбор. Теперь разбор прерывается только на явном «не хочу
+    # продолжать»/«останови»/«начни заново» (см. llm.CONTINUE_CONSENT_SYSTEM).
+    agreed = await llm.classify_continue_consent(text)
     if not agreed:
         db.finish_relationship_session(session_id, exit_step="declined_D")
         await _log_session(update, context, session_id)
