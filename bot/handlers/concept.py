@@ -1,5 +1,6 @@
 import logging
 import random
+import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -12,6 +13,7 @@ from telegram.ext import (
 )
 
 from bot import db, debounce, hostility, limits, llm
+from bot.handlers import teeth
 from bot.author_answers import ENTRIES as AUTHOR_ANSWERS
 from bot.config import (
     ADMIN_CHAT_ID,
@@ -45,6 +47,10 @@ OFFTOPIC_TEXT = (
     f"{CONCEPT_CHAT_USERNAME}. Чтобы получить туда доступ, напиши {ADMIN_USERNAME} — добавят."
 )
 DISPUTE_STREAK_THRESHOLD = 2
+TEETH_RESUME_TEXT = (
+    "Похоже, «{text}» — это ответ на вопрос из разбора зуба, который мы не закончили 🙂 "
+    "Закончить тот разбор с этим ответом?"
+)
 # Личный запрос («хочу разобрать свою ситуацию», «откуда у меня…») — не здесь: «Концепция» объясняет
 # метод, а разбор жизни уводит в бесконечную псевдотерапию (живой кейс 502643542, 02.10).
 PERSONAL_REQUEST_TEXT = (
@@ -288,13 +294,67 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, t
 
     db.increment_concept_messages(user.id)
 
+    if is_first and await _offer_teeth_resume(update, context, text):
+        return ASKING
+
+    return await _process_concept_text(update, context, text, is_first)
+
+
+async def _offer_teeth_resume(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    """Первое сообщение в «Концепции» после брошенного на «Каким ты себя чувствуешь?» разбора зуба —
+    если это похоже на ответ на тот вопрос, предлагаем закончить разбор (см. teeth.UNFINISHED_KEY)."""
+    unfinished = context.user_data.get(teeth.UNFINISHED_KEY)
+    if not unfinished:
+        return False
+    if time.time() - unfinished.get("ts", 0) > teeth.UNFINISHED_TTL_SECONDS:
+        context.user_data.pop(teeth.UNFINISHED_KEY, None)
+        return False
+    # предлагаем только на первое сообщение после ухода из «Зубов» — дальше не переспрашиваем
+    context.user_data.pop(teeth.UNFINISHED_KEY, None)
+    if len(text.split()) > 5 or not await llm.is_feeling_answer(text):
+        return False
+    context.user_data[teeth.UNFINISHED_KEY] = unfinished
+    context.user_data["concept_teeth_candidate"] = text
+    await _log_turn(context, update.effective_user, "ask", "человек", text)
+    keyboard = InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("Да, закончить разбор зуба", callback_data="concept_teeth:yes")],
+            [InlineKeyboardButton("Нет, это вопрос про концепцию", callback_data="concept_teeth:no")],
+        ]
+    )
+    await _send(update, context, "teeth_resume_offer", TEETH_RESUME_TEXT.format(text=text), reply_markup=keyboard)
+    return True
+
+
+async def teeth_resume_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_reply_markup(reply_markup=None)
+    text = context.user_data.pop("concept_teeth_candidate", None)
+    unfinished = context.user_data.pop(teeth.UNFINISHED_KEY, None)
+    if not text:
+        return ASKING
+    await _log_turn(context, update.effective_user, "teeth_resume_offer", "человек", query.data, msg_type="кнопка")
+    if query.data == "concept_teeth:yes" and unfinished:
+        _reset_concept_topic_state(context)
+        await teeth.finish_with_feeling(update, context, unfinished["session_id"], text)
+        return ConversationHandler.END
+    return await _process_concept_text(update, context, text, is_first=True, logged=True)
+
+
+async def _process_concept_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, is_first: bool, logged: bool = False
+) -> int:
+    user = update.effective_user
+
     if await llm.is_personal_request(text, context.user_data.get("concept_last_answer")):
         return await _redirect_personal_request(update, context, text, is_first)
 
     if is_first:
         pending_marker = context.user_data.pop("concept_pending_reaction_marker", None)
         context.user_data["concept_session_id"] = f"{user.id}_{db.now()}"
-        await _log_turn(context, user, "ask", "человек", text)
+        if not logged:
+            await _log_turn(context, user, "ask", "человек", text)
 
         prior_topic = context.user_data.get("concept_last_topic")
         last_answer = context.user_data.pop("concept_last_answer", None)
@@ -597,7 +657,10 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 conv_handler = ConversationHandler(
     entry_points=[CallbackQueryHandler(entry, pattern="^menu:concept$")],
     states={
-        ASKING: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask)],
+        ASKING: [
+            CallbackQueryHandler(teeth_resume_choice, pattern="^concept_teeth:"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, ask),
+        ],
         CLARIFY: [
             CallbackQueryHandler(reading_choice, pattern="^concept_reading:"),
             MessageHandler(filters.TEXT & ~filters.COMMAND, clarify_reply),

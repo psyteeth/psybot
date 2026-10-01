@@ -1,6 +1,7 @@
 import html
 import logging
 import re
+import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -28,6 +29,12 @@ from bot.sheets import sheets_logger
 logger = logging.getLogger(__name__)
 
 ASK_TOOTH, CONFIRM_TOOTH, ASK_SCARY, ASK_FEELING = range(4)
+
+# Живой кейс 02.10 (502643542): ушёл из «Зубов» на вопросе «Каким ты тогда себя чувствуешь?»
+# (/start → меню → «Концепция») и первым сообщением там написал «Неловкая» — ответ на брошенный
+# вопрос, а «Концепция» приняла его за вопрос о методе. Помним брошенный на этом шаге разбор.
+UNFINISHED_KEY = "teeth_unfinished_feeling"
+UNFINISHED_TTL_SECONDS = 2 * 60 * 60
 
 ACUTE_PATTERNS = [
     r"сильн\w*\s+бол", r"остр\w*\s+бол", r"отёк", r"отек", r"температур",
@@ -220,6 +227,7 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     session_id = db.create_teeth_session(user.id, user.username)
     context.user_data["teeth_session_id"] = session_id
     context.user_data.pop("teeth_feeling_attempts", None)
+    context.user_data.pop(UNFINISHED_KEY, None)
     hostility.reset_session(context)
 
     with open(TEETH_CHART_PATH, "rb") as photo:
@@ -394,7 +402,14 @@ async def _process_ask_feeling(update: Update, context: ContextTypes.DEFAULT_TYP
             await _send(update, context, session_id, "ask_feeling", dig_text, msg_type="уточнение")
             return ASK_FEELING
 
+    return await finish_with_feeling(update, context, session_id, text)
+
+
+async def finish_with_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, text: str) -> int:
+    """Финал разбора по ответу на «Каким ты тогда себя чувствуешь?». Вызывается и из «Концепции»,
+    когда человек ушёл из «Зубов» на этом вопросе и ответил на него уже там (см. UNFINISHED_KEY)."""
     context.user_data.pop("teeth_feeling_attempts", None)
+    context.user_data.pop(UNFINISHED_KEY, None)
     db.update_teeth_session(session_id, feeling_word=text)
     db.finish_teeth_session(session_id, completed=True)
     await sheets_logger.append("Зубы", _fetch_teeth_row(session_id))
@@ -417,6 +432,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     session_id = context.user_data.pop("teeth_session_id", None)
     if session_id:
         db.finish_teeth_session(session_id, completed=False)
+        row = db.get_teeth_session(session_id)
+        if row is not None and row["scary_thing"] and not row["feeling_word"]:
+            context.user_data[UNFINISHED_KEY] = {"session_id": session_id, "ts": time.time()}
     await show_menu(update, context)
     await hostility.maybe_send_self_harm_note(update, context)
     return ConversationHandler.END
