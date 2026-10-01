@@ -283,6 +283,21 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         await _log_turn(context, user, "ask", "человек", text)
 
         prior_topic = context.user_data.get("concept_last_topic")
+        last_answer = context.user_data.pop("concept_last_answer", None)
+        if last_answer and len(text) <= 60 and await llm.is_hook_acceptance(last_answer, text):
+            # согласие на крючок прошлого ответа — продолжаем ту же тему, а не новый вопрос
+            if pending_marker:
+                await sheets_logger.update_concept_reaction(pending_marker, user.id, "углубился")
+            followup = (
+                f"{prior_topic}\n(бот ответил: {last_answer})\n(клиент ответил «{text}» — согласен на "
+                "предложение в конце ответа бота; выполни именно это предложение, не повторяя уже сказанное)"
+            )
+            context.user_data["concept_raw_question"] = text
+            context.user_data["concept_combined_question"] = followup
+            context.user_data["concept_clarify_count"] = 0
+            context.user_data["concept_irritated"] = False
+            return await _route_and_respond(update, context)
+
         if await llm.is_offtopic_concept(text, prior_topic=prior_topic):
             if pending_marker:
                 await sheets_logger.update_concept_reaction(pending_marker, user.id, "ушёл")
@@ -400,6 +415,7 @@ async def _respond_deepen(
 
     await _send(update, context, "deepen", answer, reply_markup=back_to_menu_keyboard())
     context.user_data["concept_last_topic"] = question
+    context.user_data["concept_last_answer"] = answer
 
     dispute = await llm.is_dispute(raw_question)
     await sheets_logger.append(
@@ -454,6 +470,7 @@ async def _respond_simple(
 
     await _send(update, context, "answer", answer, reply_markup=back_to_menu_keyboard())
     context.user_data["concept_last_topic"] = question
+    context.user_data["concept_last_answer"] = answer
 
     if not escalated:
         await _maybe_share_secret(update, context, raw_question, question)
@@ -507,6 +524,7 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     context.user_data["concept_dispute_streak"] = 0
     context.user_data.pop("concept_last_topic", None)
+    context.user_data.pop("concept_last_answer", None)
     context.user_data.pop("concept_pending_reaction_marker", None)
     _reset_concept_topic_state(context)
     _reset_secrets_session_state(context)
