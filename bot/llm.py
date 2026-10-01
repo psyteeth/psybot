@@ -163,21 +163,29 @@ async def classify_feeling_depth(text: str) -> dict:
 
 
 NORMALIZE_FEELING_SYSTEM = (
-    "Пользователь ответил на вопрос «Каким ты тогда себя чувствуешь?». Сделай из его ответа короткую "
-    "вставку (2-6 слов), которая грамматически встанет в фразу «ты себя чувствуешь как ___»: именительный "
-    "падеж, без местоимений «я/мне/меня» и без глаголов, только характеристика. Обязательно сохрани тот "
-    "грамматический род, который пользователь использовал в своём ответе про себя — не меняй его. Верни "
-    "только саму вставку, без кавычек и пояснений."
+    "Пользователь ответил на вопрос «Каким ты тогда себя чувствуешь?». Возьми из ответа саму "
+    "характеристику (без местоимений «я/мне/меня» и без глаголов) ДОСЛОВНО — те же слова, тот же "
+    "порядок, без синонимов и смягчений, сохрани грамматический род пользователя — и поставь её в два "
+    "падежа:\n"
+    '- "instr" — творительный, для фразы «ты чувствуешь себя ___» (пример: «чмом позорным»);\n'
+    '- "nom" — именительный, для фразы «то, что ты: ___» (пример: «чмо позорное»).\n'
+    'Ответь СТРОГО валидным JSON без markdown: {"instr": "...", "nom": "..."}'
 )
 
 
-async def normalize_feeling_insert(raw_answer: str) -> str:
+async def normalize_feeling_insert(raw_answer: str) -> dict:
+    """Дословная вставка ответа в двух падежах: {"instr": творительный, "nom": именительный}."""
     try:
-        result = await _ask(NORMALIZE_FEELING_SYSTEM, raw_answer, MODEL_HAIKU, max_tokens=40)
-        return result.strip().strip('"').strip("«»")
+        raw = await _ask(NORMALIZE_FEELING_SYSTEM, raw_answer, MODEL_HAIKU, max_tokens=80)
+        data = json.loads(_strip_code_fence(raw))
+        instr = str(data.get("instr", "")).strip().strip('"').strip("«»")
+        nom = str(data.get("nom", "")).strip().strip('"').strip("«»")
+        if not instr or not nom:
+            raise ValueError(f"пустая вставка: {data!r}")
+        return {"instr": instr, "nom": nom}
     except Exception:  # noqa: BLE001
         logger.exception("normalize_feeling_insert упал, используем исходный текст")
-        return raw_answer
+        return {"instr": raw_answer.strip(), "nom": raw_answer.strip()}
 
 
 # ---------------------------------------------------------------------------

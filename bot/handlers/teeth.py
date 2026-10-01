@@ -110,17 +110,16 @@ def describe_tooth(number: int) -> str:
     return f"{QUADRANT_NAMES[quadrant]} {POSITION_NAMES[position]}"
 
 FINAL_TEMPLATE = (
-    "🦷 <b>Зуб даю,</b> что у тебя это ощущение возникает с кем-то в коммуникации.\n\n"
-    "🔍 <b>Ищи с кем и где ты чувствуешь себя</b> как {insert}, и начинай работать над этой "
-    "коммуникацией и отношениями. <b>Оно само не пройдёт.</b>\n\n"
+    "🦷 <b>6 лет исследований Психостоматологии №1</b> говорят, что это ощущение возникает у вас с "
+    "кем-то в отношениях.\n\n"
+    "🔍 <b>Ищи с кем и где ты чувствуешь себя</b> {insert_instr}, и начинай работать над этой "
+    "коммуникацией и отношениями. Нужна будет помощь — приходи на полную диагностику в "
+    f"Психостоматологию №1. Подробности по ссылке: {ROADMAP_URL}\n\n"
     "Ну или как и большинство людей с проблемами по зубам, избегай всех ситуаций и коммуникаций, "
-    "где кто-то может подсветить тебе то, что ты: {insert}.\n\n"
+    "где кто-то может подсветить тебе то, что ты: {insert_nom}.\n\n"
     "💩 Так обычно все и делают. И чем меньше своих ровных здоровых зубов, тем больше избегания и "
     "границ в коммуникации с жизнью и классными людьми.\n\n"
-    "🔥 Если же <b>ты не хочешь быть «как все»</b> и тебе нужна помощь в том, чтобы разобраться, о "
-    f"чём говорят твои зубы — можешь начать с просмотра записей диагностик по зубам других людей: {DIAGNOSTICS_POST_URL}\n\n"
-    "Или <b>приходи в диагностику самостоятельно</b>, а оттуда решишь, как дальше вести себя с "
-    f"другими людьми, чтобы не разрушать свои зубы. Подробности по ссылке: {ROADMAP_URL}\n\n"
+    f"🔥 Записи диагностик по зубам других людей: {DIAGNOSTICS_POST_URL}\n\n"
     f"По всем вопросам — пиши администратору Марии {ADMIN_USERNAME}."
 )
 
@@ -394,8 +393,10 @@ async def _process_ask_feeling(update: Update, context: ContextTypes.DEFAULT_TYP
     db.update_teeth_session(session_id, feeling_word=text)
     db.finish_teeth_session(session_id, completed=True)
     await sheets_logger.append("Зубы", _fetch_teeth_row(session_id))
-    insert = html.escape(await llm.normalize_feeling_insert(text))
-    final_text = FINAL_TEMPLATE.format(insert=insert)
+    insert = await llm.normalize_feeling_insert(text)
+    final_text = FINAL_TEMPLATE.format(
+        insert_instr=html.escape(insert["instr"]), insert_nom=html.escape(insert["nom"]),
+    )
     await _send(
         update, context, session_id, "final", final_text,
         reply_markup=back_to_menu_keyboard(), parse_mode=ParseMode.HTML,
