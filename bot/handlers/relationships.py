@@ -179,6 +179,11 @@ D_FIELDS = {
 }
 
 
+def _other(row) -> str:
+    """Кто другой и в каком роде о нём говорить — для всех генераций (вопросы D, резюме, E)."""
+    return llm.other_person_note(row["other_person_label"], row["other_person_gender"])
+
+
 def _shift_value(row):
     before, after = row["discomfort_before"], row["discomfort_after"]
     if before is None or after is None:
@@ -227,6 +232,8 @@ def _row_for_sheets(row) -> list:
         row["discomfort_before_raw"] or "",
         row["discomfort_after_raw"] or "",
         row["e_outcome"] or "",
+        row["other_person_label"] or "",
+        row["other_person_gender"] or "",
     ]
 
 
@@ -451,7 +458,7 @@ async def _check_dozhim(
 
 async def _ask_e_question(context: ContextTypes.DEFAULT_TYPE, session_id: int) -> str:
     row = db.get_relationship_session(session_id)
-    question = await llm.generate_e_question(row["a_event"], row["b_narrative_confirmed"])
+    question = await llm.generate_e_question(row["a_event"], row["b_narrative_confirmed"], other=_other(row))
     context.user_data["rel_e_question"] = question
     return question
 
@@ -538,9 +545,12 @@ async def _classify_or_ask_other_person(
     update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int
 ) -> int:
     row = db.get_relationship_session(session_id)
-    other = await llm.classify_other_person(row["a_event"])
-    if other:
-        db.update_relationship_session(session_id, other_person=other)
+    other = await llm.classify_other_person_full(row["a_event"])
+    if other["category"]:
+        db.update_relationship_session(
+            session_id, other_person=other["category"],
+            other_person_label=other["label"], other_person_gender=other["gender"],
+        )
         await _send(update, context, session_id, "B", Q_B)
         return B_NARRATIVE
     await _send(update, context, session_id, "A_other", OTHER_PERSON_QUESTION)
@@ -601,8 +611,11 @@ async def _process_a_other_person(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
 
     await _bump_messages(session_id)
-    resolved = await llm.classify_other_person(text) or "другое"
-    db.update_relationship_session(session_id, other_person=resolved)
+    other = await llm.classify_other_person_full(text)
+    db.update_relationship_session(
+        session_id, other_person=other["category"] or "другое",
+        other_person_label=other["label"] or text.strip()[:60], other_person_gender=other["gender"],
+    )
     await _send(update, context, session_id, "B", Q_B)
     return B_NARRATIVE
 
@@ -645,7 +658,7 @@ async def _process_b_narrative(update: Update, context: ContextTypes.DEFAULT_TYP
         return dozhim_state
 
     row = db.get_relationship_session(session_id)
-    reformulated = await llm.reformulate_narrative(row["a_event"], text)
+    reformulated = await llm.reformulate_narrative(row["a_event"], text, other=_other(row))
     context.user_data["rel_pending_narrative"] = reformulated
     await _send(update, context, session_id, "B_confirm", reformulated)
     return B_CONFIRM
@@ -682,7 +695,7 @@ async def _process_b_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if verdict == "correct":
         row = db.get_relationship_session(session_id)
         reformulated = await llm.reformulate_narrative(
-            row["a_event"], context.user_data["rel_raw_narrative"], correction=text
+            row["a_event"], context.user_data["rel_raw_narrative"], correction=text, other=_other(row)
         )
         context.user_data["rel_pending_narrative"] = reformulated
         await _send(update, context, session_id, "B_confirm", reformulated)
@@ -834,7 +847,9 @@ async def _process_c_discomfort(update: Update, context: ContextTypes.DEFAULT_TY
     await analytics.log(context, update.effective_user.id, "step_C_done")
 
     row = db.get_relationship_session(session_id)
-    advice = await llm.generate_i_would_advice(row["a_event"], row["b_narrative_confirmed"], row["c_consequence"])
+    advice = await llm.generate_i_would_advice(
+        row["a_event"], row["b_narrative_confirmed"], row["c_consequence"], other=_other(row)
+    )
     await _send(update, context, session_id, "D_confirm", advice)
     context.user_data["rel_d_offer_text"] = advice
     return D_CONFIRM
@@ -880,7 +895,7 @@ async def _process_d_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return ConversationHandler.END
 
     row = db.get_relationship_session(session_id)
-    question = await llm.adapt_dispute_question(1, row["b_narrative_confirmed"])
+    question = await llm.adapt_dispute_question(1, row["b_narrative_confirmed"], other=_other(row))
     context.user_data["rel_d_index"] = 1
     await _send(update, context, session_id, "D1", question)
     return D_QUESTION
@@ -889,7 +904,10 @@ async def _process_d_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
 # B5 (ТЗ 01.10.2026): D8 — семантическая переформулировка «я бы предпочёл, чтобы...» — должна быть
 # про самого клиента. Живой баг (сессия 18:49:17): ответ «я бы сказала ей поговорить с партнёром»
 # был про третье лицо (подругу из D7), а не про себя. Переспрашиваем один раз, не больше.
-D8_THIRD_PERSON_RETRY_TEXT = "Это про тебя? Что меняется, когда ты говоришь это про себя?"
+D8_THIRD_PERSON_RETRY_TEXT = (
+    "Уточню: а что меняется в твоих собственных ощущениях, когда говоришь «мне бы хотелось» вместо "
+    "«должен(на)»?"
+)
 FIRST_PERSON_RE = re.compile(r"\b(я|мне|меня|мной|мною)\b", re.IGNORECASE)
 
 
@@ -916,7 +934,12 @@ async def _process_d_question(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
 
     count = await _bump_messages(session_id)
-    db.update_relationship_session(session_id, **{D_FIELDS[idx]: text})
+    if idx == 8 and context.user_data.get("rel_d8_reasked"):
+        # ответ на уточнение D8 не затирает первый ответ — в резюме идут оба
+        first = db.get_relationship_session(session_id)[D_FIELDS[8]] or ""
+        db.update_relationship_session(session_id, **{D_FIELDS[8]: f"{first} / на уточнение: {text}"})
+    else:
+        db.update_relationship_session(session_id, **{D_FIELDS[idx]: text})
 
     await _check_exit_intent(context, session_id, f"D{idx}", text)
 
@@ -936,16 +959,20 @@ async def _process_d_question(update: Update, context: ContextTypes.DEFAULT_TYPE
             # A3 (ТЗ 01.10.2026): D7 разбит на два отдельных сообщения — себе (D7_SELF), затем
             # другу (D7_FRIEND, см. ниже), вместо одного вопроса из двух смешанных частей.
             row = db.get_relationship_session(session_id)
-            question = await llm.adapt_dispute_question("7a", row["b_narrative_confirmed"])
+            question = await llm.adapt_dispute_question("7a", row["b_narrative_confirmed"], other=_other(row))
             await _send(update, context, session_id, "D7_self", question)
             return D7_SELF
         row = db.get_relationship_session(session_id)
-        question = await llm.adapt_dispute_question(idx, row["b_narrative_confirmed"])
+        question = await llm.adapt_dispute_question(idx, row["b_narrative_confirmed"], other=_other(row))
         await _send(update, context, session_id, f"D{idx}", question)
         return D_QUESTION
 
     # idx == 8: только что получен ответ на D8.
-    if not FIRST_PERSON_RE.search(text) and not context.user_data.get("rel_d8_reasked"):
+    if (
+        not context.user_data.get("rel_d8_reasked")
+        and not FIRST_PERSON_RE.search(text)
+        and await llm.is_d8_answer_about_other(text)
+    ):
         context.user_data["rel_d8_reasked"] = True
         await _send(update, context, session_id, "D8_проверка", D8_THIRD_PERSON_RETRY_TEXT)
         return D_QUESTION
@@ -981,7 +1008,7 @@ async def _process_d7_self(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         return wrap_state
 
     row = db.get_relationship_session(session_id)
-    question = await llm.adapt_dispute_question("7b", row["b_narrative_confirmed"])
+    question = await llm.adapt_dispute_question("7b", row["b_narrative_confirmed"], other=_other(row))
     await _send(update, context, session_id, "D7_friend", question)
     return D7_FRIEND
 
@@ -1015,7 +1042,7 @@ async def _process_d7_friend(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     context.user_data["rel_d_index"] = 8
     row = db.get_relationship_session(session_id)
-    question = await llm.adapt_dispute_question(8, row["b_narrative_confirmed"])
+    question = await llm.adapt_dispute_question(8, row["b_narrative_confirmed"], other=_other(row))
     await _send(update, context, session_id, "D8", question)
     return D_QUESTION
 
@@ -1069,7 +1096,7 @@ async def _process_d5_question(update: Update, context: ContextTypes.DEFAULT_TYP
 async def _advance_past_d5(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> int:
     row = db.get_relationship_session(session_id)
     context.user_data["rel_d_index"] = 6
-    question = await llm.adapt_dispute_question(6, row["b_narrative_confirmed"])
+    question = await llm.adapt_dispute_question(6, row["b_narrative_confirmed"], other=_other(row))
     await _send(update, context, session_id, "D6", question)
     return D_QUESTION
 
@@ -1266,6 +1293,7 @@ async def _send_summary_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     summary = await llm.generate_session_summary(
         row["a_event"], row["b_narrative_confirmed"], row["c_consequence"], d_answers,
         discomfort_before=row["discomfort_before"], discomfort_after=row["discomfort_after"],
+        other=_other(row),
     )
     context.user_data["rel_summary"] = summary
     keyboard = InlineKeyboardMarkup(
@@ -1338,7 +1366,7 @@ async def _process_e_summary_correction(update: Update, context: ContextTypes.DE
     await _check_exit_intent(context, session_id, "E_correction", text)
 
     narrative_with_correction = f"{row['b_narrative_confirmed']}\n(поправка от пользователя: {text})"
-    e_question = await llm.generate_e_question(row["a_event"], narrative_with_correction)
+    e_question = await llm.generate_e_question(row["a_event"], narrative_with_correction, other=_other(row))
     context.user_data["rel_e_question"] = e_question
     await _send(update, context, session_id, "E", e_question)
     return E_SUMMARY

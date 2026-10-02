@@ -18,7 +18,11 @@ GENDER_NEUTRAL_RULE = (
     " Пол собеседника неизвестен и не спрашивается: обращайся на «ты», избегай "
     "гендерно-окрашенных форм глаголов прошедшего времени по отношению к нему "
     "(вместо «ты почувствовал/почувствовала» используй настоящее время или "
-    "безличные обороты)."
+    "безличные обороты). Это касается и фраз от лица самого человека: не «я бы "
+    "предпочёл», а «мне бы хотелось»; не «ты прошёл восемь вопросов», а «позади "
+    "восемь вопросов»; не «ты сам/сама», а «ты»; не «вас обеих/обоих», а «вас». Пол "
+    "человека неизвестен, даже если из ситуации он кажется очевидным (свекровь, муж, "
+    "жена) — не выводи его оттуда."
 )
 
 
@@ -218,8 +222,10 @@ REFORMULATE_SYSTEM = (
 )
 
 
-async def reformulate_narrative(event: str, raw_narrative: str, correction: str | None = None) -> str:
-    user_text = f"Событие (A): {event}\nОтвет пользователя (B): {raw_narrative}"
+async def reformulate_narrative(
+    event: str, raw_narrative: str, correction: str | None = None, other: str = ""
+) -> str:
+    user_text = f"{other}\nСобытие (A): {event}\nОтвет пользователя (B): {raw_narrative}".lstrip()
     if correction:
         user_text += f"\nПоправка пользователя к предыдущей формулировке: {correction}"
     return await _ask(REFORMULATE_SYSTEM, user_text, MODEL_SONNET, max_tokens=200)
@@ -238,22 +244,56 @@ OTHER_PERSON_SYSTEM = (
     "увольнение/уволиться, работа, задачи, дедлайн, директор, руководитель, выжимает (в рабочем "
     "смысле) — указывает на «начальник», даже без прямого слова «начальник». Если из текста "
     "однозначно не понятно, кто это (например, текст вообще не называет и не намекает на роль "
-    "человека) — верни null. Ответь СТРОГО валидным JSON без markdown: "
-    '{"other_person": "<один вариант из списка>" или null}.'
+    "человека) — верни null.\n\n"
+    "Дополнительно: \"label\" — кто это, ДОСЛОВНО как назвал пользователь, одним-двумя словами в "
+    "именительном падеже («свекровь», «бывший муж», «начальница», «Лена»), null если не назван; "
+    "\"gender\" — грамматический род этого человека: \"f\" (свекровь, мама, начальница, подруга, она), "
+    "\"m\" (муж, отец, начальник, он), \"unknown\" — если по тексту не понять (например, «коллега», "
+    "«ребёнок», «партнёр» без других признаков).\n\n"
+    "Ответь СТРОГО валидным JSON без markdown: "
+    '{"other_person": "<один вариант из списка>" или null, "label": "..." или null, '
+    '"gender": "f" или "m" или "unknown"}.'
 )
 
 
-async def classify_other_person(text: str) -> str | None:
+async def classify_other_person_full(text: str) -> dict:
+    """{"category": один из OTHER_PERSON_OPTIONS или None, "label": дословно или None,
+    "gender": "f"/"m"/"unknown"}."""
     try:
-        raw = await _ask(OTHER_PERSON_SYSTEM, text, MODEL_HAIKU, max_tokens=50)
+        raw = await _ask(OTHER_PERSON_SYSTEM, text, MODEL_HAIKU, max_tokens=80)
         data = json.loads(_strip_code_fence(raw))
         value = data.get("other_person")
-        if value in OTHER_PERSON_OPTIONS:
-            return value
-        return None
+        gender = data.get("gender")
+        label = data.get("label")
+        return {
+            "category": value if value in OTHER_PERSON_OPTIONS else None,
+            "label": str(label).strip() if label else None,
+            "gender": gender if gender in ("f", "m") else "unknown",
+        }
     except Exception:  # noqa: BLE001
         logger.exception("classify_other_person упал/не распарсился")
-        return None
+        return {"category": None, "label": None, "gender": "unknown"}
+
+
+async def classify_other_person(text: str) -> str | None:
+    return (await classify_other_person_full(text))["category"]
+
+
+def other_person_note(label: str | None, gender: str | None) -> str:
+    """Строка-подсказка для генерации вопросов/резюме: кто другой и в каком роде о нём говорить."""
+    who = f"«{label}»" if label else "другой человек из ситуации"
+    if gender == "f":
+        rule = "женский род — говори о ней «она», «её», «должна была»; никогда не «он»"
+    elif gender == "m":
+        rule = "мужской род — говори о нём «он», «его», «должен был»"
+    else:
+        rule = ("род неизвестен — не пиши «он» или «она», называй по роли или «этот человек», "
+                "избегай родовых форм глаголов прошедшего времени о нём")
+    return (
+        f"Другой человек: {who}; {rule}. Пол САМОГО пользователя отсюда НЕ следует и неизвестен: "
+        "о пользователе — без родовых форм («ты сама», «посмотрела», «заметила» запрещены; пиши «ты», "
+        "настоящее время, «получается признать», «видно, что»)."
+    )
 
 
 # ТЗ-доп. №6, часть 2 (заменяет разделы 2-3 ТЗ-доп. №3): на A и B недостаточно, чтобы текст был
@@ -351,8 +391,8 @@ ADVICE_SYSTEM = (
 )
 
 
-async def generate_i_would_advice(event: str, narrative: str, consequence: str) -> str:
-    user_text = f"Событие (A): {event}\nДолженствование (B): {narrative}\nСледствие (C): {consequence}"
+async def generate_i_would_advice(event: str, narrative: str, consequence: str, other: str = "") -> str:
+    user_text = f"{other}\nСобытие (A): {event}\nДолженствование (B): {narrative}\nСледствие (C): {consequence}".lstrip()
     return await _ask(ADVICE_SYSTEM, user_text, MODEL_SONNET, max_tokens=400)
 
 
@@ -373,7 +413,7 @@ DISPUTE_BASE_QUESTIONS = {
         "Двойной стандарт (другу). Если бы близкий друг рассказал тебе похожую ситуацию — ты "
         "посоветуешь ему требовать того же от [него/неё]?"
     ),
-    8: "Семантическая переформулировка. Если заменить «[он/она] должен» на «я бы предпочёл, чтобы…», что меняется в ощущении?",
+    8: "Семантическая переформулировка. Если заменить «[он/она] должен» на «мне бы хотелось, чтобы…», что меняется в ощущении?",
 }
 
 DISPUTE_SYSTEM = (
@@ -386,9 +426,9 @@ DISPUTE_SYSTEM = (
 )
 
 
-async def adapt_dispute_question(index: int | str, narrative: str) -> str:
+async def adapt_dispute_question(index: int | str, narrative: str, other: str = "") -> str:
     base = DISPUTE_BASE_QUESTIONS[index]
-    user_text = f"Долженствование (B): {narrative}\nБазовый вопрос: {base}"
+    user_text = f"{other}\nДолженствование (B): {narrative}\nБазовый вопрос: {base}".lstrip()
     try:
         return await _ask(DISPUTE_SYSTEM, user_text, MODEL_SONNET, max_tokens=200)
     except Exception:  # noqa: BLE001
@@ -1405,7 +1445,7 @@ E_QUESTION_SYSTEM = (
     "все восемь оспариваний своего долженствования (событие A, долженствование B — что другой человек "
     "«должен был» сделать). Сформулируй финальный вопрос шага E строго по этой структуре и в этом "
     "регистре (не копируй дословно, подставляй конкретику из A и B):\n\n"
-    "«Смотри, вы прошли восемь вопросов про то, что [пересказ B своими словами, конкретно, не "
+    "«Смотри, позади восемь вопросов про то, что [пересказ B своими словами, конкретно, не "
     "абстрактно]. Что-то изменилось в том, как это ощущается, или всё чувствуется так же, как раньше? "
     "И если представить похожий момент в будущем — хочется ли отреагировать как-то иначе, чем раньше?»"
     "\n\n"
@@ -1418,17 +1458,38 @@ E_QUESTION_SYSTEM = (
 )
 
 
-async def generate_e_question(event: str, narrative: str) -> str:
-    user_text = f"Событие (A): {event}\nДолженствование (B): {narrative}"
+async def generate_e_question(event: str, narrative: str, other: str = "") -> str:
+    user_text = f"{other}\nСобытие (A): {event}\nДолженствование (B): {narrative}".lstrip()
     try:
         return await _ask(E_QUESTION_SYSTEM, user_text, MODEL_SONNET, max_tokens=250)
     except Exception:  # noqa: BLE001
         logger.exception("generate_e_question упал, используем базовую формулировку")
         return (
-            "Смотри, вы прошли восемь вопросов про это долженствование. Что-то изменилось в том, как "
+            "Смотри, позади восемь вопросов про это долженствование. Что-то изменилось в том, как "
             "это ощущается, или всё чувствуется так же, как раньше? И если представить похожий момент "
             "в будущем — хочется ли отреагировать как-то иначе, чем раньше?"
         )
+
+
+# Живой кейс 02.10: D8 переспрашивал «Это про тебя?» по регулярке (нет «я/мне») на ответ «Снижается
+# градус эмоций и нетерпения» — это про собственное ощущение, просто безлично. Человек растерялся.
+D8_ABOUT_OTHER_SYSTEM = (
+    "Шаг D8 разбора: человеку предложили заменить «он/она должен(на)» на «мне бы хотелось, чтобы…» и "
+    "спросили, что меняется в ощущении. Определи, про кого его ответ. \"other\" — ТОЛЬКО если ответ "
+    "описывает поведение/обязанности ДРУГОГО человека («он всё равно должен», «она так не сделает»), "
+    "а не собственное ощущение. \"self\" — если ответ про собственные чувства/ощущения/состояние, в "
+    "том числе безлично («снижается градус эмоций», «спокойнее», «ничего не меняется», «легче»), или "
+    "это отказ/непонимание. Сомневаешься — self. Ответь ровно одним словом: self или other."
+)
+
+
+async def is_d8_answer_about_other(text: str) -> bool:
+    try:
+        result = await _ask(D8_ABOUT_OTHER_SYSTEM, text, MODEL_HAIKU, max_tokens=10)
+        return "other" in result.lower()
+    except Exception:  # noqa: BLE001
+        logger.exception("is_d8_answer_about_other упал")
+        return False
 
 
 E_SHIFT_SYSTEM = (
@@ -1536,7 +1597,15 @@ SESSION_SUMMARY_SYSTEM = (
     "другого человека, что при этом чувствуешь(ла), и что нового заметил(а) в ответах на восемь "
     "вопросов (если там было что-то содержательное). Не добавляй советов и выводов — только "
     "пересказ/зеркало того, что человек уже сказал. Не задавай вопрос в конце — просто пересказ, без "
-    "«похоже ли это на правду» — эту фразу добавит код отдельно. Ответь только текстом пересказа."
+    "«похоже ли это на правду» — эту фразу добавит код отдельно. Ответь только текстом пересказа.\n\n"
+    # Живой кейс 02.10: резюме сделало из растерянного «Что говорю про себя?» «интересный вопрос к
+    # самому себе», из «Охуеть теперь» — «ироничную реакцию», и написало «почти не вызывает
+    # сомнений» вопреки ответу «не могу» на вопрос о доказательствах.
+    "ЖЁСТКО: пересказывай только то, что человек сказал по существу. Растерянность и переспросы "
+    "(«что?», «в смысле?», «что говорю про себя?»), односложные реакции, мат и междометия — не "
+    "смыслы: не толкуй их, не приписывай им инсайты и «что-то недоговорённое», просто пропусти. "
+    "Не противоречь ответам: если человек признал, что доказательств нет или что «не обязан» — не "
+    "пиши, что мысль «не вызывает сомнений». Ничего не додумывай сверх сказанного."
     + GENDER_NEUTRAL_RULE
 )
 
@@ -1549,6 +1618,18 @@ NO_FALSE_IMPROVEMENT_RULE = (
 
 
 D_SUMMARY_LABELS = ["D1", "D2", "D3", "D4", "D5", "D6", "D7_себе", "D7_другу", "D8"]
+# что спрашивали на каждом шаге — без этого модель путала D5 (катастрофичность 0-100) с D2 (доказательства)
+D_SUMMARY_HINTS = {
+    "D1": "логично ли, что другой обязан",
+    "D2": "есть ли доказательства, что другой должен был",
+    "D3": "приближает или отдаляет это убеждение",
+    "D4": "что даёт убеждение и чего стоит",
+    "D5": "насколько ситуация катастрофична по шкале 0-100, где 100 — инвалидность на годы",
+    "D6": "откуда правило, всегда ли люди так поступали",
+    "D7_себе": "сам ли человек всегда поступает так, как требует",
+    "D7_другу": "посоветовал бы ли другу требовать того же",
+    "D8": "что меняется, если «должен» заменить на «мне бы хотелось»",
+}
 
 
 async def generate_session_summary(
@@ -1558,14 +1639,16 @@ async def generate_session_summary(
     d_answers: dict[str, str],
     discomfort_before: int | None = None,
     discomfort_after: int | None = None,
+    other: str = "",
 ) -> str:
     d_text = "\n".join(
-        f"{label}: {d_answers.get(label, '')}" for label in D_SUMMARY_LABELS if d_answers.get(label)
+        f"{label} ({D_SUMMARY_HINTS[label]}): {d_answers.get(label, '')}"
+        for label in D_SUMMARY_LABELS if d_answers.get(label)
     )
     user_text = (
-        f"Событие (A): {event}\nДолженствование (B): {narrative}\nСледствие/чувство (C): {consequence}\n"
+        f"{other}\nСобытие (A): {event}\nДолженствование (B): {narrative}\nСледствие/чувство (C): {consequence}\n"
         f"Ответы на восемь оспариваний:\n{d_text}"
-    )
+    ).lstrip()
     system = SESSION_SUMMARY_SYSTEM
     if discomfort_before is not None and discomfort_after is not None and discomfort_after >= discomfort_before:
         system += NO_FALSE_IMPROVEMENT_RULE.format(before=discomfort_before, after=discomfort_after)

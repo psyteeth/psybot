@@ -173,6 +173,10 @@ MIGRATIONS = [
     "ALTER TABLE relationship_sessions ADD COLUMN discomfort_after_raw TEXT",
     "ALTER TABLE relationship_sessions ADD COLUMN discomfort_doubt INTEGER NOT NULL DEFAULT 0",
     "ALTER TABLE relationship_sessions ADD COLUMN e_outcome TEXT",
+    # 02.10: кто другой дословно («свекровь») и его род — чтобы вопросы D/резюме не писали «он» про
+    # свекровь (живой кейс 502643542): категория other_person («родственник») рода не несёт.
+    "ALTER TABLE relationship_sessions ADD COLUMN other_person_label TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN other_person_gender TEXT",
 ]
 
 
