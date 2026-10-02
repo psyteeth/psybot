@@ -75,11 +75,12 @@ OTHER_PERSON_ANXIOUS_TEXT = (
 FEELING_DIG_MAX_ATTEMPTS = 2
 FEELING_DIG_TEXT = (
     "Диагностика — штука не самая комфортная, и всё же это самый важный шаг на пути к тому, чтобы "
-    'понять, откуда идёт проблема с зубами. Так что скажи честно: ты сказал(а) «{label}» — а какой '
-    'ты сам(а), если назвать это одним словом? Закончи: «Я...»'
+    "понять, откуда идёт проблема с зубами. Поэтому здесь я тебя немного помучаю. Ранее ты сказал(а) "
+    "«{label}» — а какой ты сам(а), если назвать это парой слов? Закончи: «Я...»"
 )
-# второй переспрос короче: длинное вступление про диагностику дважды подряд читается как зацикливание
-FEELING_DIG_TEXT_AGAIN = "Давай ещё раз: а если всё это одним словом? Закончи: «Я...»"
+FEELING_DIG_TEXT_AGAIN = "И ещё раз, но теперь одним словом? Закончи: «Я...»"
+# все ответы на вопрос о чувстве (исходный + уточнения) — в финал идут вместе (02.10)
+FEELING_ANSWERS_KEY = "teeth_feeling_answers"
 
 
 def _other_person_note_text(subject_age: str, motivation: str) -> str:
@@ -228,6 +229,7 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data["teeth_session_id"] = session_id
     context.user_data.pop("teeth_feeling_attempts", None)
     context.user_data.pop(UNFINISHED_KEY, None)
+    context.user_data.pop(FEELING_ANSWERS_KEY, None)
     hostility.reset_session(context)
 
     with open(TEETH_CHART_PATH, "rb") as photo:
@@ -389,6 +391,7 @@ async def _process_ask_feeling(update: Update, context: ContextTypes.DEFAULT_TYP
         return ASK_FEELING
 
     await _log_turn(session_id, update.effective_user, "ask_feeling", "человек", text)
+    context.user_data.setdefault(FEELING_ANSWERS_KEY, []).append(text)
 
     attempts = context.user_data.get("teeth_feeling_attempts", 0)
     if attempts < FEELING_DIG_MAX_ATTEMPTS:
@@ -410,10 +413,13 @@ async def finish_with_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE
     когда человек ушёл из «Зубов» на этом вопросе и ответил на него уже там (см. UNFINISHED_KEY)."""
     context.user_data.pop("teeth_feeling_attempts", None)
     context.user_data.pop(UNFINISHED_KEY, None)
-    db.update_teeth_session(session_id, feeling_word=text)
+    answers = context.user_data.pop(FEELING_ANSWERS_KEY, None) or []
+    if not answers or answers[-1] != text:
+        answers.append(text)  # ответ пришёл не через ask_feeling (из «Концепции»)
+    db.update_teeth_session(session_id, feeling_word=" / ".join(answers))
     db.finish_teeth_session(session_id, completed=True)
     await sheets_logger.append("Зубы", _fetch_teeth_row(session_id))
-    insert = await llm.normalize_feeling_insert(text)
+    insert = await llm.normalize_feeling_insert(answers)
     final_text = FINAL_TEMPLATE.format(
         insert_instr=html.escape(insert["instr"]), insert_nom=html.escape(insert["nom"]),
     )
