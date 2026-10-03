@@ -378,6 +378,33 @@ async def classify_concrete_answer(step: str, text: str) -> dict:
         return {"target": "other", "concrete_behavior": True, "confidence": 0.0}
 
 
+# 04.10, решение заказчика: жёсткий дожим («Слышь, давай без этого, мозги не еби») — только тому,
+# кто реально уходит от ответа, а не тому, кто честно пытается объяснить, но пока не попал в
+# конкретику (живой кейс Tatiana_P0pova: ответ был честный, получил грубость, ушёл).
+DOZHIM_EFFORT_SYSTEM = (
+    "Шаг {step} разбора в психостоматологическом боте. Бот просит назвать КОНКРЕТНОЕ поведение "
+    "другого человека (A) или как он должен был бы себя вести (B). Ответ пользователя пока не принят "
+    "как конкретный. Тебе даны предыдущие ответы пользователя на этом шаге и его новый ответ. "
+    "Определи, как он отвечает:\n"
+    '- "trying" — честно пытается объяснить: добавляет детали, переформулирует, описывает, что '
+    "происходит, пусть и неточно или обобщённо;\n"
+    '- "evasive" — уходит от ответа: повторяет то же самое, отмахивается («не знаю», «просто бесит», '
+    "«ну так», «ведёт себя не как я хочу»), троллит, отвечает не по делу, грубит, издевается.\n"
+    "Сомневаешься — trying. Ответь ровно одним словом: trying или evasive."
+)
+
+
+async def classify_dozhim_effort(step: str, previous: list[str], text: str) -> str:
+    prev = "\n".join(f"- {p}" for p in previous) or "- (нет)"
+    user_text = f"Предыдущие ответы на этом шаге:\n{prev}\n\nНовый ответ: {text}"
+    try:
+        result = await _ask(DOZHIM_EFFORT_SYSTEM.replace("{step}", step), user_text, MODEL_SONNET, max_tokens=10)
+        return "evasive" if "evasive" in result.lower() else "trying"
+    except Exception:  # noqa: BLE001
+        logger.exception("classify_dozhim_effort упал")
+        return "trying"
+
+
 CONFIRM_CLASSIFY_SYSTEM = (
     "Ты классификатор. Бот задал пользователю уточняющий вопрос («Правильно понимаю, что...?»). "
     "Пользователь ответил. Определи: он подтвердил формулировку (confirm) или поправляет её (correct)? "

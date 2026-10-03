@@ -370,6 +370,7 @@ async def _start_session(
 
     session_id = db.create_relationship_session(user.id, user.username)
     context.user_data["rel_session_id"] = session_id
+    _reset_dozhim_state(context)
     hostility.reset_session(context)
     # Живой кейс: на вопросе A нет способа выйти кроме /start — несколько раз подряд человек
     # открывал разбор, не отвечал и уходил (см. SeliverstovaMarina, 3 пустых cancelled-сессии
@@ -433,10 +434,34 @@ DOZHIM_EVASIVE_CLOSE_TEXT = (
     "тебя раздражает другой, — начинай заново, и я тебе помогу.\n\n"
     f"Если считаешь, что это ошибка, напиши администратору {ADMIN_USERNAME} — она решит этот вопрос."
 )
+# 04.10: тому, кто честно пытается объяснить (llm.classify_dozhim_effort = trying), — мягкие тексты;
+# жёсткие DOZHIM_ATTEMPT2_TEXT/DOZHIM_EVASIVE_CLOSE_TEXT остаются только для тех, кто уходит от ответа.
+DOZHIM_ATTEMPT2_SOFT_TEXT = {
+    "A": (
+        "Давай ещё чуть конкретнее: что именно он делает или говорит такого, от чего тебя бесит?\n"
+        "Продолжи: «Меня в нём бесит то, что он…» (или «она…»)."
+    ),
+    "B": (
+        "Давай ещё чуть конкретнее: что именно он должен был бы сделать по-другому?\n"
+        "Продолжи: «Он должен был бы…» (или «она должна была бы…»)."
+    ),
+}
+DOZHIM_SOFT_CLOSE_TEXT = (
+    "Похоже, пока сложно сформулировать, что именно задевает в поведении другого — так бывает. "
+    "Вспомни конкретный недавний случай: что он или она сделал(а) или сказал(а) — и начни разбор "
+    "заново, я помогу.\n\n"
+    f"Если считаешь, что это ошибка, напиши администратору {ADMIN_USERNAME} — она решит этот вопрос."
+)
 DOZHIM_SELF_CLOSE_TEXT = (
     SELF_REFUSAL_TEXT + "\n\n"
     f"Если считаешь, что это ошибка, напиши администратору {ADMIN_USERNAME} — она решит этот вопрос."
 )
+
+
+def _reset_dozhim_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    for step in ("a", "b"):
+        for suffix in ("attempts", "answers", "prompt"):
+            context.user_data.pop(f"rel_dozhim_{step}_{suffix}", None)
 
 
 async def _check_dozhim(
@@ -452,20 +477,32 @@ async def _check_dozhim(
     classification = await llm.classify_concrete_answer(step, text)
     accepted = classification["target"] == "other" and classification["concrete_behavior"]
 
+    answers_key = f"rel_dozhim_{step.lower()}_answers"
+    prompt_key = f"rel_dozhim_{step.lower()}_prompt"
     if accepted:
         outcome = "принят с первого раза" if attempts == 0 else "переформулировал"
         db.update_relationship_session(
             session_id, **{f"attempts_{step.lower()}": attempts, "dozhim_outcome": outcome}
         )
+        # раньше счётчик не сбрасывался — в следующем разборе первый же промах сразу получал 2-ю ступень
+        for key in (attempts_key, answers_key, prompt_key):
+            context.user_data.pop(key, None)
         return None
 
+    previous = context.user_data.get(answers_key, [])
+    effort = await llm.classify_dozhim_effort(step, previous, text) if attempts >= 1 else "trying"
+    context.user_data[answers_key] = previous + [text]
     attempts += 1
     context.user_data[attempts_key] = attempts
 
     if attempts >= 3:
         is_self = classification["target"] == "self"
-        outcome = "отказ_самообвинение" if is_self else "отказ_юлит"
-        close_text = DOZHIM_SELF_CLOSE_TEXT if is_self else DOZHIM_EVASIVE_CLOSE_TEXT
+        if is_self:
+            outcome, close_text = "отказ_самообвинение", DOZHIM_SELF_CLOSE_TEXT
+        elif effort == "evasive":
+            outcome, close_text = "отказ_юлит", DOZHIM_EVASIVE_CLOSE_TEXT
+        else:
+            outcome, close_text = "отказ_не_сформулировал", DOZHIM_SOFT_CLOSE_TEXT
         db.update_relationship_session(
             session_id, self_refused=1,
             **{f"attempts_{step.lower()}": attempts, "dozhim_outcome": outcome},
@@ -478,11 +515,14 @@ async def _check_dozhim(
         )
         await hostility.maybe_send_self_harm_note(update, context)
         context.user_data.pop("rel_session_id", None)
-        context.user_data.pop("rel_dozhim_a_attempts", None)
-        context.user_data.pop("rel_dozhim_b_attempts", None)
+        _reset_dozhim_state(context)
         return ConversationHandler.END
 
-    prompt = DOZHIM_ATTEMPT1_TEXT[step] if attempts == 1 else DOZHIM_ATTEMPT2_TEXT[step]
+    if attempts == 1:
+        prompt = DOZHIM_ATTEMPT1_TEXT[step]
+    else:
+        prompt = DOZHIM_ATTEMPT2_TEXT[step] if effort == "evasive" else DOZHIM_ATTEMPT2_SOFT_TEXT[step]
+    context.user_data[prompt_key] = prompt
     await _send(update, context, session_id, f"проверка_{step}", prompt, msg_type="уточнение")
     return A_EVENT if step == "A" else B_NARRATIVE
 
@@ -541,7 +581,7 @@ async def _process_a_event(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     attempts_a = context.user_data.get("rel_dozhim_a_attempts", 0)
     in_dozhim_retry = attempts_a > 0
     log_step = "проверка_A" if in_dozhim_retry else "A"
-    bot_question = (DOZHIM_ATTEMPT1_TEXT["A"] if attempts_a == 1 else DOZHIM_ATTEMPT2_TEXT["A"]) if in_dozhim_retry else Q_A
+    bot_question = context.user_data.get("rel_dozhim_a_prompt", DOZHIM_ATTEMPT1_TEXT["A"]) if in_dozhim_retry else Q_A
     await _log_turn(session_id, update.effective_user, log_step, "человек", text)
 
     status = await hostility.precheck(
@@ -665,7 +705,7 @@ async def _process_b_narrative(update: Update, context: ContextTypes.DEFAULT_TYP
     attempts_b = context.user_data.get("rel_dozhim_b_attempts", 0)
     in_dozhim_retry = attempts_b > 0
     log_step = "проверка_B" if in_dozhim_retry else "B"
-    bot_question = (DOZHIM_ATTEMPT1_TEXT["B"] if attempts_b == 1 else DOZHIM_ATTEMPT2_TEXT["B"]) if in_dozhim_retry else Q_B
+    bot_question = context.user_data.get("rel_dozhim_b_prompt", DOZHIM_ATTEMPT1_TEXT["B"]) if in_dozhim_retry else Q_B
     await _log_turn(session_id, update.effective_user, log_step, "человек", text)
 
     status = await hostility.precheck(
