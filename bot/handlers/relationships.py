@@ -155,6 +155,9 @@ SELF_REFUSAL_TEXT = (
 )
 
 SUMMARY_CONFIRM_SUFFIX = "\n\nПохоже ли это на правду?"
+SUMMARY_CONFIRM_PREFIX = (
+    "Давай я теперь всё срезюмирую, как понял, а ты скажешь, правильно я тебя понял или подкорректируешь.\n\n"
+)
 PARANOID_BOT_TEMPLATE = (
     "Прости, я совсем забыл сказать, что я бот-параноик, и сейчас я ощущаю космический посыл "
     "передать тебе следующую информацию из космоса: попахивает тем, что тебе хочется {hidden_need}, "
@@ -1303,7 +1306,7 @@ async def _send_summary_confirm(update: Update, context: ContextTypes.DEFAULT_TY
         ]
     )
     await _send(
-        update, context, session_id, "E_summary_confirm", summary + SUMMARY_CONFIRM_SUFFIX,
+        update, context, session_id, "E_summary_confirm", SUMMARY_CONFIRM_PREFIX + summary + SUMMARY_CONFIRM_SUFFIX,
         reply_markup=keyboard,
     )
     return E_SUMMARY_CONFIRM
