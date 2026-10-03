@@ -113,21 +113,49 @@ def _parse_scale_100(text: str) -> int | None:
 
 
 # --- ТЗ-доп. №5, раздел 2: избегание или интеграция ---
+# 04.10: прежний вопрос («ты начинаешь позволять себе вести себя так же, как он — Критиковать… .
+# — по отношению к людям?») был непонятен без объяснения идеи (живой отзыв: «не понимаю второй
+# вариант»), фраза поведения вставлялась сырой (заглавная, точка посреди), «он» был вписан жёстко.
 EXIT_INTENT_STEP1_TEMPLATE = (
-    "Стоп, это очень важный момент, на него стоит обратить внимание.\n\n"
-    "Скажи честно: это больше про то, что ты лучше, а он плохой, и с такими тебе не по пути? Или "
-    "про то, что ты начинаешь позволять себе вести себя так же, как он, — {behavior} — по "
-    "отношению к людям?"
+    "Стоп, это важный момент.\n\n"
+    "Бывает два варианта:\n"
+    "1) «Я лучше, {he} {bad} — и с такими мне не по пути». Тогда ты просто уходишь от таких людей.\n"
+    "2) Тебя так задевает {his} поведение — {behavior}, — потому что ты себе такое строго "
+    "запрещаешь. И, может, тебе пора разрешить себе немного того же: {permission}.\n\n"
+    "Как думаешь, что из этого больше про тебя?"
+)
+EXIT_INTENT_EXPLAIN_TEMPLATE = (
+    "Скажу проще.\n\n"
+    "1) Ты считаешь, что {he} {bad}, и просто перестаёшь с такими общаться.\n"
+    "2) То, что бесит в другом, часто то, что запрещаешь себе. {his_cap} поведение — {behavior} — "
+    "цепляет так сильно, потому что тебе так нельзя. А в мягкой дозе это бывает полезно: "
+    "{permission}.\n\n"
+    "Что ближе — 1 или 2?"
 )
 AVOIDANCE_TEXT = (
-    "Если это избегание — ты лучше, он плохой, и с такими ты больше не общаешься, — "
-    "психостоматология рекомендует здесь хорошенечко подумать."
+    "Уйти — самый простой путь, но такие люди будут встречаться снова, и снова будет задевать. "
+    "Стоит подумать, что именно в {him} так цепляет."
 )
 INTEGRATION_TEXT = (
-    "Если ты начинаешь позволять себе вести себя так же — {behavior} — по отношению к людям, это "
-    "очень интересный момент. Обрати на него внимание: может быть, это начало чего-то нового в "
-    "жизни."
+    "То, что бесит в другом, часто то, что ты себе запрещаешь. Если начинаешь позволять себе "
+    "немного этого же — это может быть началом чего-то нового."
 )
+# ответ номером варианта классификатору без вопроса не понять («2» он принимал за избегание)
+_CHOICE_RE = re.compile(r"^\s*(?:(1|один|первое|первый|первый вариант)|(2|два|второе|второй|второй вариант))\s*[.!)]?\s*$", re.IGNORECASE)
+
+_PRONOUNS = {
+    "m": {"he": "он", "bad": "плохой", "his": "его", "him": "нём"},
+    "f": {"he": "она", "bad": "плохая", "his": "её", "him": "ней"},
+    "unknown": {"he": "этот человек", "bad": "плохой", "his": "его", "him": "этом человеке"},
+}
+
+
+def _pronouns(row) -> dict:
+    forms = dict(_PRONOUNS.get(row["other_person_gender"] or "unknown", _PRONOUNS["unknown"]))
+    forms["his_cap"] = forms["his"][:1].upper() + forms["his"][1:]
+    return forms
+
+
 EXIT_INTENT_CLOSING_TEXT = (
     f"Хочется подробностей — приходи в работу с зубами: {ROADMAP_URL} или пиши {ADMIN_USERNAME}."
 )
@@ -1237,7 +1265,7 @@ async def _finish_e(
         row = db.get_relationship_session(session_id)
         behavior = await llm.extract_disowned_behavior(row["a_event"], row["b_narrative_confirmed"])
         context.user_data["exit_intent_behavior"] = behavior
-        question = EXIT_INTENT_STEP1_TEMPLATE.format(behavior=behavior)
+        question = EXIT_INTENT_STEP1_TEMPLATE.format(**behavior, **_pronouns(row))
         await _send(update, context, session_id, "exit_intent_check", question)
         return EXIT_INTENT_CLARIFY
 
@@ -1268,15 +1296,38 @@ async def _process_exit_intent_clarify(update: Update, context: ContextTypes.DEF
         return ConversationHandler.END
 
     await _bump_messages(session_id)
-    verdict = await llm.classify_avoidance_integration(text)
-    behavior = context.user_data.get("exit_intent_behavior", "вести себя так же, как он")
+    choice = _CHOICE_RE.match(text)
+    digits = set(re.findall(r"(?<!\d)[12](?!\d)", text))
+    if choice:
+        verdict = "avoidance" if choice.group(1) else "integration"
+    elif len(digits) == 1:  # «скорее 2», «наверное 1»
+        verdict = "avoidance" if digits == {"1"} else "integration"
+    else:
+        verdict = await llm.classify_avoidance_integration(text)
+    row = db.get_relationship_session(session_id)
+    forms = _pronouns(row)
+    behavior = context.user_data.get("exit_intent_behavior")
+    if not isinstance(behavior, dict):  # разборы, начатые до 04.10, хранили строку
+        behavior = {"behavior": behavior or "вести себя так же", "permission": "иногда позволять себе то же самое"}
+
+    if verdict == "confused" and not context.user_data.get("exit_intent_explained"):
+        # человек не понял вопрос — объясняем проще один раз и ждём ответа, а не закрываем разбор
+        context.user_data["exit_intent_explained"] = True
+        await _send(
+            update, context, session_id, "exit_intent_check",
+            EXIT_INTENT_EXPLAIN_TEMPLATE.format(**behavior, **forms), msg_type="уточнение",
+        )
+        return EXIT_INTENT_CLARIFY
+    if verdict == "confused":
+        verdict = "unclear"
+    context.user_data.pop("exit_intent_explained", None)
     db.update_relationship_session(session_id, avoidance_or_integration=verdict, exit_intent_answer=text)
 
     parts = []
     if verdict in ("avoidance", "unclear"):
-        parts.append(AVOIDANCE_TEXT)
+        parts.append(AVOIDANCE_TEXT.format(**forms))
     if verdict in ("integration", "unclear"):
-        parts.append(INTEGRATION_TEXT.format(behavior=behavior))
+        parts.append(INTEGRATION_TEXT)
     parts.append(EXIT_INTENT_CLOSING_TEXT)
     await _send(
         update, context, session_id, "exit_intent_check", "\n\n".join(parts),

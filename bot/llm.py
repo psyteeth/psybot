@@ -501,21 +501,38 @@ async def classify_exit_intent(text: str) -> dict:
 
 DISOWNED_BEHAVIOR_SYSTEM = (
     "Ты — ассистент психостоматологического бота, ветка «Отношения». Тебе даны событие (A) и "
-    "долженствование пользователя (B) про другого человека. Опиши КОРОТКОЙ фразой (3-6 слов, через "
-    "запятую, в форме глаголов-инфинитивов) конкретное поведение ДРУГОГО человека, которое "
-    "пользователь описывает как проблемное — например «приказывать, требовать подчинения, ставить "
-    "свои интересы выше», «обесценивать, повышать голос», «игнорировать, не отвечать». Только "
-    "поведение, без оценок и без имён. Ответь только этой фразой, без пояснений."
+    "долженствование пользователя (B) про другого человека. Верни СТРОГО валидный JSON без markdown:\n"
+    '{"behavior": "...", "permission": "..."}\n'
+    '- "behavior" — конкретное поведение ДРУГОГО человека, которое пользователь описывает как '
+    "проблемное: 2-3 пункта через запятую, глаголы-инфинитивы, со строчной буквы, без точки в конце "
+    "(«критиковать выбор сына, навязывать своё мнение», «обесценивать, повышать голос»). Только "
+    "поведение, без оценок и без имён.\n"
+    '- "permission" — мягкая, допустимая доза ТОГО ЖЕ поведения, которую сам пользователь мог бы '
+    "себе разрешить: 2 пункта через запятую, инфинитивы, со строчной буквы, без точки (для примера "
+    "выше: «иногда прямо говорить, что думаешь о чужом выборе, настаивать на своём»)."
 )
 
+_DISOWNED_FALLBACK = {"behavior": "вести себя так же", "permission": "иногда позволять себе то же самое"}
 
-async def extract_disowned_behavior(event: str, narrative: str) -> str:
+
+def _clean_phrase(text: str) -> str:
+    text = str(text or "").strip().strip("«»\"").rstrip(".").strip()
+    return text[:1].lower() + text[1:] if text else text
+
+
+async def extract_disowned_behavior(event: str, narrative: str) -> dict:
+    """{"behavior": поведение другого, "permission": его допустимая доза для самого пользователя}."""
     user_text = f"Событие (A): {event}\nДолженствование (B): {narrative}"
     try:
-        return await _ask(DISOWNED_BEHAVIOR_SYSTEM, user_text, MODEL_HAIKU, max_tokens=60)
+        raw = await _ask(DISOWNED_BEHAVIOR_SYSTEM, user_text, MODEL_SONNET, max_tokens=150)
+        data = json.loads(_strip_code_fence(raw))
+        behavior, permission = _clean_phrase(data.get("behavior")), _clean_phrase(data.get("permission"))
+        if not behavior or not permission:
+            raise ValueError(f"пустые поля: {data!r}")
+        return {"behavior": behavior, "permission": permission}
     except Exception:  # noqa: BLE001
         logger.exception("extract_disowned_behavior упал")
-        return "вести себя так же, как он"
+        return dict(_DISOWNED_FALLBACK)
 
 
 AVOIDANCE_INTEGRATION_SYSTEM = (
@@ -528,8 +545,12 @@ AVOIDANCE_INTEGRATION_SYSTEM = (
     '- "avoidance" — явно про первое: другой плохой, я лучше, ухожу, чтобы не сталкиваться.\n'
     '- "integration" — явно про второе: замечает у себя такое же поведение, перенимает его.\n'
     '- "unclear" — ответ не даёт понять однозначно, или человек говорит про оба варианта сразу, '
-    "или уклоняется.\n\n"
-    "Ответь СТРОГО одним словом: avoidance, integration или unclear."
+    "или уклоняется.\n"
+    '- "confused" — человек не понял вопрос и просит объяснить («не понимаю», «скажи иначе», «в '
+    'смысле?», «что значит второй вариант?»).\n'
+    "Варианты пронумерованы: ответ «1», «первое», «первый» — avoidance; «2», «второе», «второй» — "
+    "integration.\n\n"
+    "Ответь СТРОГО одним словом: avoidance, integration, unclear или confused."
 )
 
 
@@ -537,7 +558,7 @@ async def classify_avoidance_integration(text: str) -> str:
     try:
         result = await _ask(AVOIDANCE_INTEGRATION_SYSTEM, text, MODEL_SONNET, max_tokens=10)
         result = result.lower().strip()
-        for verdict in ("avoidance", "integration", "unclear"):
+        for verdict in ("avoidance", "integration", "confused", "unclear"):
             if verdict in result:
                 return verdict
         return "unclear"
