@@ -405,7 +405,7 @@ ADVICE_SYSTEM = (
 
 async def generate_i_would_advice(event: str, narrative: str, consequence: str, other: str = "") -> str:
     user_text = f"{other}\nСобытие (A): {event}\nДолженствование (B): {narrative}\nСледствие (C): {consequence}".lstrip()
-    return await _ask(ADVICE_SYSTEM, user_text, MODEL_SONNET, max_tokens=400)
+    return await neutralize_user_gender(await _ask(ADVICE_SYSTEM, user_text, MODEL_SONNET, max_tokens=400))
 
 
 DISPUTE_BASE_QUESTIONS = {
@@ -442,7 +442,7 @@ async def adapt_dispute_question(index: int | str, narrative: str, other: str = 
     base = DISPUTE_BASE_QUESTIONS[index]
     user_text = f"{other}\nДолженствование (B): {narrative}\nБазовый вопрос: {base}".lstrip()
     try:
-        return await _ask(DISPUTE_SYSTEM, user_text, MODEL_SONNET, max_tokens=200)
+        return await neutralize_user_gender(await _ask(DISPUTE_SYSTEM, user_text, MODEL_SONNET, max_tokens=200))
     except Exception:  # noqa: BLE001
         logger.exception("adapt_dispute_question упал, используем базовую формулировку")
         return base
@@ -1430,6 +1430,39 @@ async def generate_punchline(
 # Разное (грамматический род по контексту, динамический вопрос E, да/нет)
 # ---------------------------------------------------------------------------
 
+# Живой кейс 03.10: правило GENDER_NEUTRAL_RULE в промпте модель всё равно нарушает («ты сама не
+# всегда поступаешь», «ты бы стала», «посмотрела») — пол пользователя она выводит из ситуации
+# (свекровь, бывшая). Вторым проходом переписываем готовый текст: только формы о пользователе.
+NEUTRALIZE_USER_GENDER_SYSTEM = (
+    "Тебе дан текст бота, обращённый к пользователю на «ты». Пол пользователя неизвестен. Найди "
+    "формы, где у слов ПРО САМОГО ПОЛЬЗОВАТЕЛЯ есть грамматический род: «ты сама/сам», «ты "
+    "посмотрела/посмотрел», «ты бы стала», «ты заметила», «была уверена», «рад(а)» и т.п. Перепиши "
+    "только эти места нейтрально: настоящее время («замечаешь»), безличные обороты («видно, что», "
+    "«получается признать»), убери «сам/сама» в любом месте фразы («сама оцениваешь» → «оцениваешь»). "
+    "Если нейтральная перестройка меняет смысл — используй форму со скобками: «ты бы стала "
+    "требовать» → «ты бы стал(а) требовать». Формы «сказал(а)», «сам(а)» со скобками допустимы, их не "
+    "трогай. Слова про ДРУГИХ людей (мама, свекровь, бывшая, друг — «она "
+    "должна была», «он сказал») и про самого бота («я понял») НЕ меняй. Всё остальное — слово в слово, "
+    "без сокращений и улучшений. Если править нечего — верни текст без изменений. Ответь только "
+    "итоговым текстом."
+)
+
+
+async def neutralize_user_gender(text: str) -> str:
+    if not text:
+        return text
+    try:
+        fixed = await _ask(NEUTRALIZE_USER_GENDER_SYSTEM, text, MODEL_SONNET, max_tokens=1200)
+    except Exception:  # noqa: BLE001
+        logger.exception("neutralize_user_gender упал, оставляем исходный текст")
+        return text
+    # предохранитель: если модель заметно ужала/раздула текст — это уже не правка рода
+    if not fixed or not (0.8 * len(text) <= len(fixed) <= 1.2 * len(text)):
+        logger.warning("neutralize_user_gender: длина ушла слишком далеко, оставляем исходный текст")
+        return text
+    return fixed
+
+
 GENDER_HINT_SYSTEM = (
     "Определи, если это вообще возможно, грамматический род, которым человек описывает СЕБЯ в тексте "
     "— по глаголам и прилагательным прошедшего времени о себе («я сделал» vs «я сделала», «я сам» vs "
@@ -1473,7 +1506,7 @@ E_QUESTION_SYSTEM = (
 async def generate_e_question(event: str, narrative: str, other: str = "") -> str:
     user_text = f"{other}\nСобытие (A): {event}\nДолженствование (B): {narrative}".lstrip()
     try:
-        return await _ask(E_QUESTION_SYSTEM, user_text, MODEL_SONNET, max_tokens=250)
+        return await neutralize_user_gender(await _ask(E_QUESTION_SYSTEM, user_text, MODEL_SONNET, max_tokens=250))
     except Exception:  # noqa: BLE001
         logger.exception("generate_e_question упал, используем базовую формулировку")
         return (
@@ -1666,7 +1699,7 @@ async def generate_session_summary(
         system += NO_FALSE_IMPROVEMENT_RULE.format(before=discomfort_before, after=discomfort_after)
     try:
         answer = await _ask(system, user_text, MODEL_SONNET, max_tokens=700)
-        return _trim_incomplete_tail(answer)
+        return await neutralize_user_gender(_trim_incomplete_tail(answer))
     except Exception:  # noqa: BLE001
         logger.exception("generate_session_summary упал")
         return "Похоже, мы разобрали и событие, и то, чего ты ждал(а) от другого человека, и что при этом чувствуешь(ла)."
