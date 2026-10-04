@@ -264,6 +264,16 @@ async def _process_ask_tooth(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     await _log_turn(session_id, update.effective_user, "ask_tooth", "человек", text)
 
+    several = [int(n) for n in re.findall(r"\d{2}", text)]
+    if len(several) >= 2 and all(n in VALID_TEETH_NUMBERS for n in several):
+        # «33, 34» — раньше отвечали «Не понял, какой это зуб», хотя человек всё написал верно
+        await _send(
+            update, context, session_id, "ask_tooth",
+            "Давай разберём по одному зубу за раз. Какой из них беспокоит больше всего? Напиши один номер.",
+            msg_type="уточнение",
+        )
+        return ASK_TOOTH
+
     digits = re.sub(r"\D", "", text)
     if digits and digits.isdigit() and text.strip() == digits:
         number = int(digits)
