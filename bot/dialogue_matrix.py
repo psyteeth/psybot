@@ -141,6 +141,12 @@ def _append_session_column_sync(
             ws = _ensure_matrix_tab_sync(client, tab, row_labels)
             header_row = ws.row_values(1)
             next_col = len(header_row) + 1  # колонка A — метки, значит первая сессия в B
+            # Живой баг 04.10: лист создавался на 26 колонок и не расширялся — после ~22 разборов
+            # запись падала с «exceeds grid limits», и новые разборы в матрицу больше не попадали.
+            if ws.col_count < next_col:
+                ws.add_cols(next_col - ws.col_count + 20)
+            if ws.row_count < len(row_labels) + 1:
+                ws.add_rows(len(row_labels) + 1 - ws.row_count)
             values = [[session_id], [username], [date]]
             for label in row_labels[2:]:  # первые два — username/дата, уже заполнены выше
                 values.append([cells.get(label, "")])
