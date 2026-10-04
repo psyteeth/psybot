@@ -177,6 +177,12 @@ MIGRATIONS = [
     # свекровь (живой кейс 502643542): категория other_person («родственник») рода не несёт.
     "ALTER TABLE relationship_sessions ADD COLUMN other_person_label TEXT",
     "ALTER TABLE relationship_sessions ADD COLUMN other_person_gender TEXT",
+    # ТЗ-доп. №7: один вопрос в сообщении (D3/D4 разбиты на подшаги, C — реакция и чувство отдельно),
+    # флаг сдвига на E
+    "ALTER TABLE relationship_sessions ADD COLUMN d3b_helps TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN d4b_cost TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN c_feeling TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN e_has_shift INTEGER",
 ]
 
 

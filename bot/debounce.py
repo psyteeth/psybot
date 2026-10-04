@@ -28,6 +28,12 @@ logger = logging.getLogger(__name__)
 
 _buffers: dict[tuple[int, str], list[str]] = {}
 _jobs: dict[tuple[int, str], object] = {}
+# ТЗ-доп. №7, п.6: пока шаг обрабатывается (LLM-вызовы идут секундами), состояние разговора ещё
+# старое — сообщение, пришедшее в это окно, раньше запускало тот же шаг второй раз (живой кейс:
+# «Да» + «Стараюсь» на D7_self → D7_friend ушёл дважды, а «Да» затёрлось). Теперь такие апдейты
+# откладываются и прогоняются заново через диспетчер ПОСЛЕ смены состояния.
+_inflight: set[int] = set()
+_late_updates: dict[int, list[Update]] = {}
 
 
 async def collect(
@@ -51,6 +57,10 @@ async def collect(
     user = update.effective_user
     key = (user.id, step_id)
 
+    if user.id in _inflight:
+        _late_updates.setdefault(user.id, []).append(update)
+        return state
+
     text = update.effective_message.text or ""
     _buffers.setdefault(key, []).append(text)
 
@@ -69,12 +79,21 @@ async def collect(
     async def _fire(job_context: ContextTypes.DEFAULT_TYPE) -> None:
         combined = "\n".join(_buffers.pop(key, []))
         _jobs.pop(key, None)
+        _inflight.add(user.id)
         try:
             new_state = await process(combined)
         except Exception:  # noqa: BLE001
             logger.exception("debounce: обработка отложенного шага упала (step_id=%s)", step_id)
             return
-        conv_handler._update_state(new_state, conv_key)  # noqa: SLF001
+        else:
+            conv_handler._update_state(new_state, conv_key)  # noqa: SLF001
+        finally:
+            _inflight.discard(user.id)
+            late = _late_updates.pop(user.id, [])
+            for late_update in late:
+                # уже в новом состоянии — обработчик нового шага сам решит, что это за ответ
+                # (в «Отношениях» на D-шагах это ловит проверка релевантности, п.4 ТЗ-доп. №7)
+                await job_context.application.process_update(late_update)
 
     job = context.application.job_queue.run_once(_fire, DEBOUNCE_SECONDS)
     _jobs[key] = job

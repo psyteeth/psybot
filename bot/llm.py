@@ -51,6 +51,58 @@ def _strip_cjk(text: str) -> str:
     return re.sub(r"[ \t]{2,}", " ", _CJK_RE.sub(" ", text))
 
 
+# ТЗ-доп. №7, п.2/п.6: в одном сообщении — один вопрос (живые кейсы: «Можешь задавать по одному
+# вопросу?», «Не поняла вопрос» на двойных вопросах C/D2/D3/D4), и никакой латиницы внутри русского
+# текста («at этом» вместо «при этом» в резюме). Правило — в промптах, проверка — программно.
+ONE_QUESTION_RULE = (
+    " В сообщении — РОВНО ОДИН вопрос и один знак «?». Не задавай два вопроса подряд и не "
+    "склеивай их через «и»/«или» в одно предложение с двумя смыслами."
+)
+
+_URLISH_RE = re.compile(r"https?://\S+|<a [^>]*>|</a>|@\w+|t\.me/\S+")
+_LATIN_WORD_RE = re.compile(r"\b[A-Za-z]{2,}\b")
+
+
+def _text_problems(text: str, max_questions: int, check_latin: bool) -> list[str]:
+    problems = []
+    if text.count("?") > max_questions:
+        problems.append(f"вопросов: {text.count('?')}")
+    if check_latin and _LATIN_WORD_RE.search(_URLISH_RE.sub(" ", text)):
+        problems.append("латиница: " + ", ".join(_LATIN_WORD_RE.findall(_URLISH_RE.sub(" ", text)))[:80])
+    return problems
+
+
+def limit_questions(text: str, max_questions: int = 1) -> str:
+    """Последний предохранитель: лишние «?» (кроме последних max_questions) → «.»."""
+    extra = text.count("?") - max_questions
+    if extra <= 0:
+        return text
+    out = []
+    for ch in text:
+        if ch == "?" and extra > 0:
+            out.append(".")
+            extra -= 1
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+async def _ask_checked(
+    system: str, user_text: str, model: str, max_tokens: int = 500,
+    max_questions: int = 1, check_latin: bool = True, attempts: int = 3,
+) -> str:
+    """_ask с проверкой результата: если вопросов больше max_questions или есть латиница —
+    перегенерировать (до attempts раз), в конце — программно убрать лишние «?»."""
+    text = ""
+    for attempt in range(attempts):
+        text = await _ask(system, user_text, model, max_tokens=max_tokens)
+        problems = _text_problems(text, max_questions, check_latin)
+        if not problems:
+            return text
+        logger.warning("Генерация не прошла проверку (попытка %s): %s", attempt + 1, problems)
+    return limit_questions(text, max_questions)
+
+
 # ---------------------------------------------------------------------------
 # Меню / маршрутизация (haiku, минимум LLM)
 # ---------------------------------------------------------------------------
@@ -237,7 +289,14 @@ REFORMULATE_SYSTEM = (
     "формулировка B звучит как самокритика, ищи в ней требование к другому и адресуй его другому. "
     "Если тебе также дана предыдущая формулировка и поправка пользователя к ней — учти поправку "
     "и сформулируй заново. Пиши живо, без канцелярита, без имён авторов методик. "
+    # ТЗ-доп. №7, п.5: «должен подстраиваться под меня» → бот дописал «сдерживать раздражение» (взял
+    # из события A). Требование к другому берётся ТОЛЬКО из ответа B и поправок.
+    "ЖЁСТКО: в долженствование входит ТОЛЬКО то, что человек сам сказал в ответе B (и в поправках). "
+    "Событие A — лишь контекст: не выводи из него новых требований. Перефразировать можно, дополнять "
+    "— нельзя (пример: B «должен подстраиваться под меня» → «должен был бы подстраиваться под тебя», "
+    "без «сдерживать раздражение»). "
     "Ответь только текстом вопроса, без пояснений." + GENDER_NEUTRAL_RULE
+    + ONE_QUESTION_RULE
 )
 
 
@@ -247,7 +306,7 @@ async def reformulate_narrative(
     user_text = f"{other}\nСобытие (A): {event}\nОтвет пользователя (B): {raw_narrative}".lstrip()
     if correction:
         user_text += f"\nПоправка пользователя к предыдущей формулировке: {correction}"
-    return await _ask(REFORMULATE_SYSTEM, user_text, MODEL_SONNET, max_tokens=200)
+    return await _ask_checked(REFORMULATE_SYSTEM, user_text, MODEL_SONNET, max_tokens=200)
 
 
 OTHER_PERSON_OPTIONS = [
@@ -442,22 +501,28 @@ ADVICE_SYSTEM = (
     "может быть что-то, что мешает видеть ситуацию иначе — без диагнозов и оценок.\n"
     "4) Ровно текст: «Давай я задам тебе 8 вопросов, и посмотрим на твоё убеждение?»\n"
     "Не упоминай имена авторов методик. Пиши живым языком." + GENDER_NEUTRAL_RULE
+    + ONE_QUESTION_RULE
 )
 
 
 async def generate_i_would_advice(event: str, narrative: str, consequence: str, other: str = "") -> str:
     user_text = f"{other}\nСобытие (A): {event}\nДолженствование (B): {narrative}\nСледствие (C): {consequence}".lstrip()
-    return await neutralize_user_gender(await _ask(ADVICE_SYSTEM, user_text, MODEL_SONNET, max_tokens=400))
+    return await neutralize_user_gender(await _ask_checked(ADVICE_SYSTEM, user_text, MODEL_SONNET, max_tokens=400))
 
 
 DISPUTE_BASE_QUESTIONS = {
     1: "Логическое. Из того, что тебе этого хочется, следует ли, что [он/она] обязан так делать?",
-    2: "Эмпирическое. Правда ли это? Можешь ли ты знать абсолютно точно, что [он/она] должен был [...]? Где доказательства?",
-    3: "Прагматическое. Как ты реагируешь, когда веришь в эту мысль? Помогает ли это убеждение получить то, чего ты хочешь?",
-    4: "Гедонистический калькулятор. Что тебе даёт держаться за это убеждение и чего оно тебе стоит — сейчас и в долгую?",
+    # ТЗ-доп. №7, п.2: один вопрос в сообщении. D2 — только «можешь ли знать точно»; про
+    # доказательства спрашиваем отдельно (2b) и только если человек ответил «да».
+    2: "Эмпирическое. Можешь ли ты знать абсолютно точно, что [он/она] должен был [...]?",
+    "2b": "Доказательства. Какие у тебя есть доказательства, что [он/она] действительно должен был [...]?",
+    3: "Прагматическое. Как ты реагируешь, когда веришь в эту мысль?",
+    "3b": "Прагматическое, польза. Помогает ли эта мысль получить то, чего тебе на самом деле хочется?",
+    4: "Гедонистический калькулятор. Что тебе даёт держаться за эту мысль?",
+    "4b": "Гедонистический калькулятор, цена. А во что эта мысль тебе обходится — сейчас и в долгую?",
     # 5 (шкала катастроф) — больше НЕ через adapt_dispute_question, фиксированный текст с опорой
     # 100 (см. relationships.py::D5_QUESTION_TEMPLATE, ТЗ-доп. №5) — LLM не смягчает формулировку.
-    6: "Историческое. Всегда ли в твоей жизни люди делали так, как «должны»? Откуда у тебя это правило?",
+    6: "Историческое. Откуда у тебя взялось это правило — что люди «должны» так поступать?",
     # ТЗ 01.10.2026, п.A3: раньше это был один вопрос из двух частей (себе + про друга) в одном
     # сообщении — ответы смешивались, статистика по D7 была нечитаема. Разбито на два отдельных
     # шага D7a/D7b (см. relationships.py). Будущее время вместо «посоветовал бы» — гендерно
@@ -477,6 +542,7 @@ DISPUTE_SYSTEM = (
     "естественным языком), но сохрани смысл и суть вопроса. Не отвечай на вопрос сам, только "
     "сформулируй его пользователю, одним-двумя предложениями, без нумерации и без названия техники."
     + GENDER_NEUTRAL_RULE
+    + ONE_QUESTION_RULE
 )
 
 
@@ -484,10 +550,84 @@ async def adapt_dispute_question(index: int | str, narrative: str, other: str = 
     base = DISPUTE_BASE_QUESTIONS[index]
     user_text = f"{other}\nДолженствование (B): {narrative}\nБазовый вопрос: {base}".lstrip()
     try:
-        return await neutralize_user_gender(await _ask(DISPUTE_SYSTEM, user_text, MODEL_SONNET, max_tokens=200))
+        return await neutralize_user_gender(await _ask_checked(DISPUTE_SYSTEM, user_text, MODEL_SONNET, max_tokens=200))
     except Exception:  # noqa: BLE001
         logger.exception("adapt_dispute_question упал, используем базовую формулировку")
         return base
+
+
+# ТЗ-доп. №7, п.2/п.4: после ответа на D-шаг — отвечает ли он на текущий вопрос, или это ответ на
+# предыдущий (живой кейс: на D7 «посоветуешь ли другу…» пришло про мужа, а ответ на D7 — уже на D8),
+# или просьба «задавай по одному» / «не поняла вопрос» (это не выпад — повторить текущий вопрос проще).
+D_ANSWER_CHECK_SYSTEM = (
+    "Разбор в психостоматологическом боте. Даны предыдущий вопрос бота, текущий вопрос бота и ответ "
+    "человека. Определи:\n"
+    '- "meta": "one_at_a_time" — человек просит задавать вопросы по одному; "not_understood" — не '
+    'понял вопрос, просит объяснить или переспрашивает («не поняла вопрос», «в смысле?», «о чём ты?»); '
+    '"none" — обычный ответ, даже с опечатками или сбивчивый. «Не знаю», «ничего», «не уверен(а)» — это '
+    'ответ (none), не непонимание. Сомневаешься — none.\n'
+    '- "answers_current": true — ответ по смыслу отвечает на ТЕКУЩИЙ вопрос (даже коротко: «да», '
+    '«нет», «не знаю», число, если вопрос это допускает; даже если человек спорит или отвечает уклончиво).\n'
+    '- "answers_previous": true — ответ по смыслу явно отвечает на ПРЕДЫДУЩИЙ вопрос, а не на текущий.\n'
+    "Если ответ подходит к обоим — answers_current=true. Ответь СТРОГО валидным JSON без markdown: "
+    '{"meta": "none", "answers_current": true, "answers_previous": false}.'
+)
+
+
+async def check_d_answer(previous_question: str, current_question: str, text: str) -> dict:
+    user_text = (
+        f"Предыдущий вопрос бота: {previous_question or '(нет)'}\n"
+        f"Текущий вопрос бота: {current_question}\nОтвет человека: {text}"
+    )
+    try:
+        raw = await _ask(D_ANSWER_CHECK_SYSTEM, user_text, MODEL_HAIKU, max_tokens=60)
+        data = json.loads(_strip_code_fence(raw))
+        meta = data.get("meta")
+        return {
+            "meta": meta if meta in ("one_at_a_time", "not_understood") else "none",
+            "answers_current": bool(data.get("answers_current", True)),
+            "answers_previous": bool(data.get("answers_previous", False)),
+        }
+    except Exception:  # noqa: BLE001
+        logger.exception("check_d_answer упал/не распарсился")
+        return {"meta": "none", "answers_current": True, "answers_previous": False}
+
+
+META_REQUEST_SYSTEM = (
+    "Бот задал человеку вопрос, даны вопрос и ответ. Определи: \"one_at_a_time\" — человек ЯВНО просит "
+    "задавать вопросы по одному; \"not_understood\" — человек ЯВНО говорит, что не понял вопрос, или "
+    "просит объяснить/переспрашивает («не поняла вопрос», «в смысле?», «что ты имеешь в виду?», «о чём "
+    "ты?»); \"none\" — всё остальное: любой ответ по существу, даже с опечатками, коротко, сбивчиво или "
+    "не совсем по теме. «Не знаю», «ничего», «не уверен(а)», «хз» — это ОТВЕТ (none). Сомневаешься — "
+    "none. Ответь ровно одним словом: one_at_a_time, not_understood или none."
+)
+
+
+async def classify_meta_request(text: str, question: str = "") -> str:
+    user_text = f"Вопрос бота: {question}\nОтвет человека: {text}" if question else text
+    try:
+        result = (await _ask(META_REQUEST_SYSTEM, user_text, MODEL_HAIKU, max_tokens=10)).lower()
+        for verdict in ("one_at_a_time", "not_understood"):
+            if verdict in result:
+                return verdict
+    except Exception:  # noqa: BLE001
+        logger.exception("classify_meta_request упал")
+    return "none"
+
+
+SIMPLIFY_QUESTION_SYSTEM = (
+    "Перескажи вопрос бота проще и короче — так, чтобы его понял подросток: одно короткое "
+    "предложение, обычные слова, тот же смысл, без новых деталей. Если в вопросе несколько вопросов "
+    "— оставь только главный. Ответь только текстом вопроса." + ONE_QUESTION_RULE + GENDER_NEUTRAL_RULE
+)
+
+
+async def simplify_question(question: str) -> str:
+    try:
+        return await _ask_checked(SIMPLIFY_QUESTION_SYSTEM, question, MODEL_SONNET, max_tokens=120)
+    except Exception:  # noqa: BLE001
+        logger.exception("simplify_question упал")
+        return limit_questions(question)
 
 
 # ---------------------------------------------------------------------------
@@ -666,6 +806,59 @@ async def analyze_e_insight(event: str, narrative: str, prior_context: str, late
         return {"has_insight": False, "reflection": "", "wants_change": False}
 
 
+# ТЗ-доп. №7, п.1: шаблон «ответ не находится» уходил людям, которые сформулировали сдвиг
+# («хочется просто пойти и делать своё, для себя», «будто легче ей помочь, чем сопротивляться»).
+E_HAS_SHIFT_SYSTEM = (
+    "Финальный шаг разбора: человека спросили, как ему теперь хочется реагировать в похожей "
+    "ситуации (после восьми вопросов о его убеждении «другой должен»). Даны его ответ на этот вопрос "
+    "и, если был, ответ на уточнение. Определи, есть ли в ответах СДВИГ — хоть что-то новое: другое "
+    "ощущение, желание повести себя иначе, новый взгляд на себя или другого, новое действие "
+    "(«хочется просто пойти и делать своё», «будто легче помочь, чем сопротивляться», «спокойнее», "
+    "«скажу прямо», «не буду встревать»). has_shift=false ТОЛЬКО если ответ пустой по смыслу: «не "
+    "знаю», «ничего», «не изменилось», «так же», «всё равно», прочерк, одно слово без содержания. "
+    'Ответь СТРОГО валидным JSON без markdown: {"has_shift": true или false, "confidence": число от 0 до 1}.'
+)
+
+
+async def classify_e_has_shift(answer: str, followup_answer: str = "") -> dict:
+    user_text = f"Ответ на вопрос: {answer}"
+    if followup_answer:
+        user_text += f"\nОтвет на уточнение: {followup_answer}"
+    try:
+        raw = await _ask(E_HAS_SHIFT_SYSTEM, user_text, MODEL_HAIKU, max_tokens=40)
+        data = json.loads(_strip_code_fence(raw))
+        return {"has_shift": bool(data.get("has_shift", False)), "confidence": float(data.get("confidence", 0.0))}
+    except Exception:  # noqa: BLE001
+        logger.exception("classify_e_has_shift упал/не распарсился")
+        # при сбое не говорим человеку «ответ не находится» — безопаснее отразить его слова
+        return {"has_shift": True, "confidence": 0.0}
+
+
+E_SHIFT_QUOTE_SYSTEM = (
+    "Финальный шаг разбора. Даны ответы человека на вопрос, как ему теперь хочется реагировать. "
+    "Сформулируй, что у него появилось, ЕГО ЖЕ СЛОВАМИ — коротко, как продолжение фразы «Похоже, у "
+    "тебя появилось: …» (с маленькой буквы, без точки в конце, без кавычек). Исправь опечатки и "
+    "приведи к форме от второго лица, если нужно («хочется просто пойти и делать своё, для себя»; "
+    "«ощущение, что легче ей помочь, чем сопротивляться — и это откликается в той части тебя, "
+    "которая воспринимала маму в штыки»). Ничего не добавляй от себя, не толкуй, не советуй. Пол "
+    "человека неизвестен — без родовых форм о нём. Ответь только этой фразой."
+)
+
+
+async def quote_e_shift(answer: str, followup_answer: str = "") -> str:
+    user_text = f"Ответ: {answer}"
+    if followup_answer:
+        user_text += f"\nОтвет на уточнение: {followup_answer}"
+    try:
+        quote = await _ask_checked(E_SHIFT_QUOTE_SYSTEM, user_text, MODEL_SONNET, max_tokens=150, max_questions=0)
+        # модель иногда повторяет начало фразы, которое добавит шаблон
+        quote = re.sub(r"^\s*похоже,?\s*у тебя появилось\s*:?\s*", "", quote.strip(), flags=re.IGNORECASE)
+        return quote.strip().strip("«»\"").rstrip(".")
+    except Exception:  # noqa: BLE001
+        logger.exception("quote_e_shift упал")
+        return " ".join(a for a in (answer, followup_answer) if a).strip()
+
+
 E_FOLLOWUP_SYSTEM = (
     "Ты — ассистент психостоматологического бота, ветка «Отношения», финальный шаг E. Пользователь "
     "ответил на вопрос о том, кто он в этой ситуации без старой мысли, но пока не сформулировал "
@@ -674,12 +867,13 @@ E_FOLLOWUP_SYSTEM = (
     "независимо от другого человека. НЕ предлагай вариант ответа, не советуй, не утверждай ничего от "
     "себя — только спроси. Ответь только текстом вопроса, без пояснений."
     + GENDER_NEUTRAL_RULE
+    + ONE_QUESTION_RULE
 )
 
 
 async def ask_e_followup(narrative: str, user_answer: str) -> str:
     user_text = f"Долженствование (B): {narrative}\nОтвет пользователя на E: {user_answer}"
-    return await _ask(E_FOLLOWUP_SYSTEM, user_text, MODEL_SONNET, max_tokens=150)
+    return await _ask_checked(E_FOLLOWUP_SYSTEM, user_text, MODEL_SONNET, max_tokens=150)
 
 
 # ---------------------------------------------------------------------------
@@ -808,6 +1002,7 @@ CONCEPT_SYSTEM = (
     + DIAGNOSTICS_RULE
     + TOOTH_MEANING_RULE
     + CONCEPT_ONLY_HOOK_RULE
+    + ONE_QUESTION_RULE
 )
 
 
@@ -880,7 +1075,7 @@ async def answer_concept_question(
     system = CONCEPT_SYSTEM + (SIMPLE_MODE_ADDENDUM if simple else "")
     # max_tokens с запасом (не 200) — предохранитель по предложениям режет ЛИШНЕЕ чисто, а вот
     # обрубленный на полуслове ответ от нехватки токенов уже не почистить.
-    answer = await _ask(system, user_text, MODEL_SONNET, max_tokens=400 if simple else 1536)
+    answer = await _ask_checked(system, user_text, MODEL_SONNET, max_tokens=400 if simple else 1536, check_latin=False)
     answer = answer.replace("**", "").replace("##", "").replace("# ", "")
     return _cap_sentences(answer, 3) if simple else answer
 
@@ -986,7 +1181,7 @@ async def generate_concept_clarify_question(
         user_text += f"\nЧего не хватает: {missing}"
     system = CONCEPT_CLARIFY_QUESTION_SHORT_SYSTEM if short else CONCEPT_CLARIFY_QUESTION_SYSTEM
     try:
-        return await _ask(system, user_text, MODEL_SONNET, max_tokens=100)
+        return await _ask_checked(system, user_text, MODEL_SONNET, max_tokens=100, check_latin=False)
     except Exception:  # noqa: BLE001
         logger.exception("generate_concept_clarify_question упал")
         return "Уточни, пожалуйста, одним предложением, что именно ты имеешь в виду?"
@@ -1057,6 +1252,7 @@ SECRET_REVEAL_SYSTEM = (
     + DIAGNOSTICS_RULE
     + TOOTH_MEANING_RULE
     + CONCEPT_ONLY_HOOK_RULE
+    + ONE_QUESTION_RULE
 )
 
 
@@ -1080,7 +1276,7 @@ async def generate_secret_reveal(
     )
     system = SECRET_REVEAL_SYSTEM + (FULL_REVEAL_ADDENDUM if full else "")
     try:
-        return await _ask(system, user_text, MODEL_SONNET, max_tokens=800 if full else 300)
+        return await _ask_checked(system, user_text, MODEL_SONNET, max_tokens=800 if full else 300, check_latin=False)
     except Exception:  # noqa: BLE001
         logger.exception("generate_secret_reveal упал")
         return ""
@@ -1482,7 +1678,7 @@ async def generate_punchline(
         return {
             "hidden_need": str(data.get("hidden_need", "")),
             "category": str(data.get("category", "2")),
-            "reply": str(data.get("reply", "")).strip(),
+            "reply": limit_questions(str(data.get("reply", "")).strip()),
         }
     except Exception:  # noqa: BLE001
         logger.exception("generate_punchline упал/не распарсился")
@@ -1554,8 +1750,8 @@ E_QUESTION_SYSTEM = (
     "«должен был» сделать). Сформулируй финальный вопрос шага E строго по этой структуре и в этом "
     "регистре (не копируй дословно, подставляй конкретику из A и B):\n\n"
     "«Смотри, позади восемь вопросов про то, что [пересказ B своими словами, конкретно, не "
-    "абстрактно]. Что-то изменилось в том, как это ощущается, или всё чувствуется так же, как раньше? "
-    "И если представить похожий момент в будущем — хочется ли отреагировать как-то иначе, чем раньше?»"
+    "абстрактно]. Если представить похожий момент в будущем — как тебе теперь хочется на него "
+    "отреагировать?»"
     "\n\n"
     "ЖЁСТКОЕ ПРАВИЛО: НЕ утверждай и не предполагай заранее, что мысль «теряет свою силу», что стало "
     "легче или что-то улучшилось — честно допускай любой ответ, в том числе что ничего не изменилось "
@@ -1563,19 +1759,19 @@ E_QUESTION_SYSTEM = (
     "результат уже известен. Не используй абстрактное «эта мысль» без пояснения — назови её конкретно "
     "по сути B и событию A. Пиши тепло и просто. Ответь только текстом вопроса, без пояснений."
     + GENDER_NEUTRAL_RULE
+    + ONE_QUESTION_RULE
 )
 
 
 async def generate_e_question(event: str, narrative: str, other: str = "") -> str:
     user_text = f"{other}\nСобытие (A): {event}\nДолженствование (B): {narrative}".lstrip()
     try:
-        return await neutralize_user_gender(await _ask(E_QUESTION_SYSTEM, user_text, MODEL_SONNET, max_tokens=250))
+        return await neutralize_user_gender(await _ask_checked(E_QUESTION_SYSTEM, user_text, MODEL_SONNET, max_tokens=250))
     except Exception:  # noqa: BLE001
         logger.exception("generate_e_question упал, используем базовую формулировку")
         return (
-            "Смотри, позади восемь вопросов про это долженствование. Что-то изменилось в том, как "
-            "это ощущается, или всё чувствуется так же, как раньше? И если представить похожий момент "
-            "в будущем — хочется ли отреагировать как-то иначе, чем раньше?"
+            "Смотри, позади восемь вопросов про это долженствование. Если представить похожий момент "
+            "в будущем — как тебе теперь хочется на него отреагировать?"
         )
 
 
@@ -1725,13 +1921,15 @@ NO_FALSE_IMPROVEMENT_RULE = (
 )
 
 
-D_SUMMARY_LABELS = ["D1", "D2", "D3", "D4", "D5", "D6", "D7_себе", "D7_другу", "D8"]
+D_SUMMARY_LABELS = ["D1", "D2", "D3", "D3b", "D4", "D4b", "D5", "D6", "D7_себе", "D7_другу", "D8"]
 # что спрашивали на каждом шаге — без этого модель путала D5 (катастрофичность 0-100) с D2 (доказательства)
 D_SUMMARY_HINTS = {
     "D1": "логично ли, что другой обязан",
     "D2": "есть ли доказательства, что другой должен был",
-    "D3": "приближает или отдаляет это убеждение",
-    "D4": "что даёт убеждение и чего стоит",
+    "D3": "как человек реагирует, когда верит в эту мысль",
+    "D3b": "помогает ли мысль получить желаемое",
+    "D4": "что даёт держаться за убеждение",
+    "D4b": "во что убеждение обходится",
     "D5": "насколько ситуация катастрофична по шкале 0-100, где 100 — инвалидность на годы",
     "D6": "откуда правило, всегда ли люди так поступали",
     "D7_себе": "сам ли человек всегда поступает так, как требует",
@@ -1761,7 +1959,7 @@ async def generate_session_summary(
     if discomfort_before is not None and discomfort_after is not None and discomfort_after >= discomfort_before:
         system += NO_FALSE_IMPROVEMENT_RULE.format(before=discomfort_before, after=discomfort_after)
     try:
-        answer = await _ask(system, user_text, MODEL_SONNET, max_tokens=700)
+        answer = await _ask_checked(system, user_text, MODEL_SONNET, max_tokens=700, max_questions=0)
         return await neutralize_user_gender(_trim_incomplete_tail(answer))
     except Exception:  # noqa: BLE001
         logger.exception("generate_session_summary упал")

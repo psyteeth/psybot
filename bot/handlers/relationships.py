@@ -50,27 +50,22 @@ Q_A = (
     "Опиши событие или поведение другого человека, от которого тебе дискомфортно: "
     "триггерит, бесит, раздражает, обламывает, достаёт."
 )
-Q_B = "Как бы тебе хотелось, чтобы было иначе? Что другой человек должен был сделать по-другому?"
-Q_C_TEMPLATE = (
-    "Когда {narrative_short}не совпадает с тем, что происходит на самом деле — что ты чувствуешь "
-    "и как реагируешь?"
-)
+Q_B = "Как бы тебе хотелось, чтобы было иначе — что другой человек должен был сделать по-другому?"
+# ТЗ-доп. №7, п.2: C — только реакция (чувство спрашивает следующий шаг C_feeling).
+Q_C = "Как ты реагируешь, когда так происходит?"
 WRAP_TEXT = "Мы прошли уже много — давай подведём предварительный итог."
-E_NO_INSIGHT_TEXT = (
-    "Похоже, сейчас ответ не находится — и это тоже нормально, не обязательно сразу. Если захочется "
-    f"разобрать это глубже — приходи на диагностику, пиши {ADMIN_USERNAME}."
-)
-# B7 (ТЗ 01.10.2026): отдельный текст для исхода «хочу иначе, но не умею» — раньше это закрывалось
-# тем же E_NO_INSIGHT_TEXT, что и полное отсутствие движения, хотя человек уже сам заметил желание
-# реагировать по-другому (живой пример: «хочется по-другому, но я не умею», сессия 05:16:46).
+# ТЗ-доп. №7, п.1/п.3/п.7: финал — ОДНО сообщение: отражение (или «ответ не находится») + ссылки + CTA.
+# «Ответ не находится» — только если на E/E_followup нет сдвига (llm.classify_e_has_shift).
+E_NO_INSIGHT_TEXT = "Похоже, сейчас ответ не находится — и это тоже нормально, не обязательно сразу."
+# B7 (ТЗ 01.10.2026): отдельный текст для исхода «хочу иначе, но не умею» — человек уже сам заметил
+# желание реагировать по-другому (живой пример: «хочется по-другому, но я не умею», сессия 05:16:46).
 E_WANTS_CHANGE_TEXT = (
     "Похоже, ты уже чувствуешь, что хочется реагировать иначе — а готовой формулировки для этого "
-    "пока нет, и это тоже нормально, так и бывает. Если захочется найти её — приходи на диагностику, "
-    f"пиши {ADMIN_USERNAME}."
+    "пока нет, и это тоже нормально, так и бывает."
 )
 DECLINE_D_TEXT = "Ок, как скажешь. Если захочешь вернуться — я здесь."
 
-PRIOR_EVENT_QUESTION = "А что было до этого? Может, чуть раньше что-то уже задело?"
+PRIOR_EVENT_QUESTION = "А что было до этого — может, чуть раньше что-то уже задело?"
 OTHER_PERSON_QUESTION = "А кто это для тебя?"
 DISCOMFORT_BEFORE_Q = "Насколько тебе сейчас дискомфортно от этой ситуации, от 0 до 10?"
 DISCOMFORT_AFTER_Q = "И ещё раз, от 0 до 10: насколько тебе дискомфортно от этой ситуации сейчас?"
@@ -156,9 +151,6 @@ def _pronouns(row) -> dict:
     return forms
 
 
-EXIT_INTENT_CLOSING_TEXT = (
-    f"Хочется подробностей — приходи в работу с зубами: {ROADMAP_URL} или пиши {ADMIN_USERNAME}."
-)
 
 
 async def _check_exit_intent(context: ContextTypes.DEFAULT_TYPE, session_id: int, step: str, text: str) -> None:
@@ -191,16 +183,20 @@ PARANOID_BOT_TEMPLATE = (
     "передать тебе следующую информацию из космоса: попахивает тем, что тебе хочется {hidden_need}, "
     "голос передаёт тебе: {punchline}"
 )
-FINAL_INSIGHT_TEMPLATE = (
-    "{opener} сформулировать новую реакцию.\n\n"
-    "В следующий раз в подобной ситуации ты можешь {insertion}\n\n"
+FINAL_SHIFT_TEMPLATE = "Похоже, у тебя появилось: {quote}."
+FINAL_NEXT_TIME_TEMPLATE = "В следующий раз в подобной ситуации ты можешь {insertion}"
+FINAL_LINKS_TEXT = (
     "Меняй своё мышление, а не других людей.\n"
     "Психостоматология №1\n\n"
     f'<a href="{ROADMAP_URL}">Зайти в работу</a>\n'
     "Пройти серию тестов и получить персональный портрет коммуникации - "
     f'<a href="{TESTS_URL}">здесь</a>'
 )
-FINAL_INSIGHT_OPENERS = ["Похоже, у тебя получилось", "Кажется, у тебя получилось"]
+# п.7: без «консультации» (такой кнопки нет) и без «он» про администратора
+FINAL_CTA_TEXT = (
+    "Если хочется разобраться глубже — приходи на эфир, поговорим. "
+    f"В любом случае пиши {ADMIN_USERNAME}, администратор Мария сориентирует."
+)
 
 D_FIELDS = {
     1: "d1_logical", 2: "d2_empirical", 3: "d3_pragmatic", 4: "d4_hedonistic",
@@ -265,6 +261,10 @@ def _row_for_sheets(row) -> list:
         row["e_outcome"] or "",
         row["other_person_label"] or "",
         row["other_person_gender"] or "",
+        row["d3b_helps"] or "",
+        row["d4b_cost"] or "",
+        row["c_feeling"] or "",
+        "" if row["e_has_shift"] is None else ("да" if row["e_has_shift"] else "нет"),
     ]
 
 
@@ -780,7 +780,7 @@ async def _process_b_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if wrap_state is not None:
         return wrap_state
 
-    c_question = Q_C_TEMPLATE.format(narrative_short="то, как ты хочешь, ")
+    c_question = Q_C
     await _send(update, context, session_id, "C", c_question)
     return C_CONSEQUENCE
 
@@ -798,7 +798,7 @@ async def _process_c_consequence(update: Update, context: ContextTypes.DEFAULT_T
 
     status = await hostility.precheck(
         update, context, branch="relationships", step="C",
-        bot_question=Q_C_TEMPLATE.format(narrative_short="то, как ты хочешь, "),
+        bot_question=Q_C,
         text_override=text,
     )
     if status == "crisis":
@@ -811,6 +811,8 @@ async def _process_c_consequence(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
 
     count = await _bump_messages(session_id)
+    if await _maybe_meta_reask(update, context, session_id, "C", Q_C, text):
+        return C_CONSEQUENCE
     db.update_relationship_session(session_id, c_consequence=text)
 
     await _check_exit_intent(context, session_id, "C", text)
@@ -851,9 +853,11 @@ async def _process_c_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return ConversationHandler.END
 
     count = await _bump_messages(session_id)
+    if await _maybe_meta_reask(update, context, session_id, "C_feeling", feeling_question, text):
+        return C_FEELING
     row = db.get_relationship_session(session_id)
     combined_consequence = f"{row['c_consequence']}\nЧувство: {text}"
-    db.update_relationship_session(session_id, c_consequence=combined_consequence)
+    db.update_relationship_session(session_id, c_consequence=combined_consequence, c_feeling=text)
 
     await _check_exit_intent(context, session_id, "C_feeling", text)
 
@@ -965,11 +969,9 @@ async def _process_d_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
         context.user_data.pop("rel_session_id", None)
         return ConversationHandler.END
 
-    row = db.get_relationship_session(session_id)
-    question = await llm.adapt_dispute_question(1, row["b_narrative_confirmed"], other=_other(row))
-    context.user_data["rel_d_index"] = 1
-    await _send(update, context, session_id, "D1", question)
-    return D_QUESTION
+    for key in ("rel_d_step", "rel_d_cur_q", "rel_d_prev_q", "rel_d_prev_step", "rel_d_reasked", "rel_d8_reasked"):
+        context.user_data.pop(key, None)
+    return await _ask_d(update, context, session_id, "1")
 
 
 # B5 (ТЗ 01.10.2026): D8 — семантическая переформулировка «я бы предпочёл, чтобы...» — должна быть
@@ -982,17 +984,92 @@ D8_THIRD_PERSON_RETRY_TEXT = (
 FIRST_PERSON_RE = re.compile(r"\b(я|мне|меня|мной|мною)\b", re.IGNORECASE)
 
 
+async def _maybe_meta_reask(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, step: str, question: str, text: str
+) -> bool:
+    """ТЗ-доп. №7, п.2: «задавай по одному» / «не поняла вопрос» — не выпад и не ответ. Коротко
+    соглашаемся и задаём текущий вопрос заново, проще. True — переспросили, шаг не двигаем."""
+    if not question:
+        return False
+    meta = await llm.classify_meta_request(text, question)
+    if meta == "none":
+        return False
+    ack = D_ONE_AT_A_TIME_ACK if meta == "one_at_a_time" else D_NOT_UNDERSTOOD_ACK
+    simpler = await llm.simplify_question(question)
+    await _send(update, context, session_id, step, f"{ack} {simpler}", msg_type="уточнение")
+    return True
+
+
+# --- Шаги D (ТЗ-доп. №7, п.2/п.4) ---
+# Один вопрос в сообщении: D2 → (2b — доказательства, только если ответ «да»), D3 → 3b, D4 → 4b.
+# D7 себе/другу теперь тоже идут через D_QUESTION (состояния D7_SELF/D7_FRIEND оставлены только для
+# разборов, начатых до деплоя). Ключ шага хранится в user_data["rel_d_step"].
+D_STEP_FIELDS = {
+    "1": "d1_logical", "2": "d2_empirical", "2b": "d2_empirical", "3": "d3_pragmatic", "3b": "d3b_helps",
+    "4": "d4_hedonistic", "4b": "d4b_cost", "6": "d6_historical", "7a": "d7_self", "7b": "d7_friend",
+    "8": "d8_semantic",
+}
+D_STEP_LOG = {
+    "1": "D1", "2": "D2", "2b": "D2b", "3": "D3", "3b": "D3b", "4": "D4", "4b": "D4b",
+    "6": "D6", "7a": "D7_self", "7b": "D7_friend", "8": "D8",
+}
+D_NEXT = {"1": "2", "2b": "3", "3": "3b", "3b": "4", "4": "4b", "4b": "5", "6": "7a", "7a": "7b", "7b": "8"}
+D_ONE_AT_A_TIME_ACK = "Понял, по одному."
+D_NOT_UNDERSTOOD_ACK = "Скажу проще."
+D_PREVIOUS_ANSWER_ACK = "Похоже, это к прошлому вопросу — записал 👌 А теперь:"
+
+
+def _d_base_key(step: str) -> int | str:
+    return int(step) if step.isdigit() else step
+
+
+async def _ask_d(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, step: str) -> int:
+    """Задать D-шаг step (кроме 5 — у него свой фиксированный текст и состояние)."""
+    row = db.get_relationship_session(session_id)
+    if step == "5":
+        context.user_data["rel_d_index"] = 5
+        question = D5_QUESTION_TEMPLATE.format(situation=row["a_event"])
+        await _send(update, context, session_id, "D5", question)
+        return D5_QUESTION
+    question = await llm.adapt_dispute_question(_d_base_key(step), row["b_narrative_confirmed"], other=_other(row))
+    context.user_data["rel_d_prev_q"] = context.user_data.get("rel_d_cur_q", "")
+    context.user_data["rel_d_prev_step"] = context.user_data.get("rel_d_step")
+    context.user_data["rel_d_step"] = step
+    context.user_data["rel_d_cur_q"] = question
+    context.user_data["rel_d_index"] = int(step[0])
+    context.user_data.pop("rel_d_reasked", None)
+    await _send(update, context, session_id, D_STEP_LOG[step], question)
+    return D_QUESTION
+
+
+def _store_d_answer(session_id: int, step: str, text: str, append: bool = False) -> None:
+    field = D_STEP_FIELDS[step]
+    current = db.get_relationship_session(session_id)[field] or ""
+    if step == "2b":
+        value = f"{current} / доказательства: {text}" if current else text
+    elif append and current:
+        value = f"{current} / {text}"
+    else:
+        value = text
+    db.update_relationship_session(session_id, **{field: value})
+
+
 async def d_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await debounce.collect(
         update, context, step_id="rel_d", conv_handler=conv_handler, state=D_QUESTION,
-        process=lambda text: _process_d_question(update, context, text),
+        process=lambda text: _process_d_answer(update, context, text),
     )
 
 
-async def _process_d_question(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+async def _process_d_answer(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, forced_step: str | None = None
+) -> int:
     session_id = context.user_data["rel_session_id"]
-    idx = context.user_data["rel_d_index"]
-    await _log_turn(session_id, update.effective_user, f"D{idx}", "человек", text)
+    # разборы, начатые до деплоя ТЗ-доп. №7, знают только rel_d_index
+    step = forced_step or context.user_data.get("rel_d_step") or str(context.user_data.get("rel_d_index", 1))
+    if step not in D_STEP_FIELDS:
+        step = "8" if step.startswith("8") else step[0]
+    await _log_turn(session_id, update.effective_user, D_STEP_LOG[step], "человек", text)
 
     # По умолчанию модуль панчлайнов на шаге D выключен: сопротивление вроде
     # «да это бред, он всё равно виноват» — материал самого разбора, не выпад
@@ -1005,117 +1082,77 @@ async def _process_d_question(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
 
     count = await _bump_messages(session_id)
-    if idx == 8 and context.user_data.get("rel_d8_reasked"):
+    current_q = context.user_data.get("rel_d_cur_q", "")
+    previous_q = context.user_data.get("rel_d_prev_q", "")
+    previous_step = context.user_data.get("rel_d_prev_step")
+    reasked = context.user_data.get("rel_d_reasked", False)
+
+    if current_q and not (step == "8" and context.user_data.get("rel_d8_reasked")):
+        check = await llm.check_d_answer(previous_q, current_q, text)
+        if check["meta"] != "none":
+            # «задавай по одному» / «не поняла вопрос» — не выпад и не ответ: повторить проще, шаг не пропускать
+            ack = D_ONE_AT_A_TIME_ACK if check["meta"] == "one_at_a_time" else D_NOT_UNDERSTOOD_ACK
+            simpler = await llm.simplify_question(current_q)
+            await _send(update, context, session_id, D_STEP_LOG[step], f"{ack} {simpler}", msg_type="уточнение")
+            return D_QUESTION
+        if not check["answers_current"] and check["answers_previous"] and previous_step in D_STEP_FIELDS:
+            _store_d_answer(session_id, previous_step, text, append=True)
+            await _send(
+                update, context, session_id, D_STEP_LOG[step], f"{D_PREVIOUS_ANSWER_ACK} {current_q}",
+                msg_type="уточнение",
+            )
+            return D_QUESTION
+        if not check["answers_current"] and not reasked:
+            context.user_data["rel_d_reasked"] = True
+            simpler = await llm.simplify_question(current_q)
+            await _send(update, context, session_id, D_STEP_LOG[step], simpler, msg_type="уточнение")
+            return D_QUESTION
+
+    if step == "8" and context.user_data.get("rel_d8_reasked"):
         # ответ на уточнение D8 не затирает первый ответ — в резюме идут оба
         first = db.get_relationship_session(session_id)[D_FIELDS[8]] or ""
         db.update_relationship_session(session_id, **{D_FIELDS[8]: f"{first} / на уточнение: {text}"})
     else:
-        db.update_relationship_session(session_id, **{D_FIELDS[idx]: text})
+        _store_d_answer(session_id, step, text, append=reasked)
 
-    await _check_exit_intent(context, session_id, f"D{idx}", text)
+    await _check_exit_intent(context, session_id, D_STEP_LOG[step], text)
 
     wrap_state = await _maybe_wrap_to_summary(update, context, session_id, count)
     if wrap_state is not None:
         return wrap_state
 
-    if idx < 8:
-        idx += 1
-        context.user_data["rel_d_index"] = idx
-        if idx == 5:
-            row = db.get_relationship_session(session_id)
-            question = D5_QUESTION_TEMPLATE.format(situation=row["a_event"])
-            await _send(update, context, session_id, "D5", question)
-            return D5_QUESTION
-        if idx == 7:
-            # A3 (ТЗ 01.10.2026): D7 разбит на два отдельных сообщения — себе (D7_SELF), затем
-            # другу (D7_FRIEND, см. ниже), вместо одного вопроса из двух смешанных частей.
-            row = db.get_relationship_session(session_id)
-            question = await llm.adapt_dispute_question("7a", row["b_narrative_confirmed"], other=_other(row))
-            await _send(update, context, session_id, "D7_self", question)
-            return D7_SELF
-        row = db.get_relationship_session(session_id)
-        question = await llm.adapt_dispute_question(idx, row["b_narrative_confirmed"], other=_other(row))
-        await _send(update, context, session_id, f"D{idx}", question)
-        return D_QUESTION
+    if step == "8":
+        if (
+            not context.user_data.get("rel_d8_reasked")
+            and not FIRST_PERSON_RE.search(text)
+            and await llm.is_d8_answer_about_other(text)
+        ):
+            context.user_data["rel_d8_reasked"] = True
+            await _send(update, context, session_id, "D8_проверка", D8_THIRD_PERSON_RETRY_TEXT)
+            return D_QUESTION
+        context.user_data.pop("rel_d8_reasked", None)
+        return await _start_e_finale(update, context, session_id)
 
-    # idx == 8: только что получен ответ на D8.
-    if (
-        not context.user_data.get("rel_d8_reasked")
-        and not FIRST_PERSON_RE.search(text)
-        and await llm.is_d8_answer_about_other(text)
-    ):
-        context.user_data["rel_d8_reasked"] = True
-        await _send(update, context, session_id, "D8_проверка", D8_THIRD_PERSON_RETRY_TEXT)
-        return D_QUESTION
-    context.user_data.pop("rel_d8_reasked", None)
-    return await _start_e_finale(update, context, session_id)
+    if step == "2":
+        next_step = "2b" if await llm.classify_yes_no(text) else "3"
+    else:
+        next_step = D_NEXT[step]
+    return await _ask_d(update, context, session_id, next_step)
 
 
+# Состояния D7_SELF/D7_FRIEND — только для разборов, начатых до ТЗ-доп. №7.
 async def d7_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await debounce.collect(
         update, context, step_id="rel_d7_self", conv_handler=conv_handler, state=D7_SELF,
-        process=lambda text: _process_d7_self(update, context, text),
+        process=lambda text: _process_d_answer(update, context, text, forced_step="7a"),
     )
-
-
-async def _process_d7_self(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
-    session_id = context.user_data["rel_session_id"]
-    await _log_turn(session_id, update.effective_user, "D7_self", "человек", text)
-
-    status = await hostility.precheck(
-        update, context, branch="relationships", step="D", skip_hostility=True, text_override=text
-    )
-    if status == "crisis":
-        await _close_after_hostility(update, context, session_id, "crisis")
-        return ConversationHandler.END
-
-    count = await _bump_messages(session_id)
-    db.update_relationship_session(session_id, d7_self=text)
-
-    await _check_exit_intent(context, session_id, "D7_self", text)
-
-    wrap_state = await _maybe_wrap_to_summary(update, context, session_id, count)
-    if wrap_state is not None:
-        return wrap_state
-
-    row = db.get_relationship_session(session_id)
-    question = await llm.adapt_dispute_question("7b", row["b_narrative_confirmed"], other=_other(row))
-    await _send(update, context, session_id, "D7_friend", question)
-    return D7_FRIEND
 
 
 async def d7_friend(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await debounce.collect(
         update, context, step_id="rel_d7_friend", conv_handler=conv_handler, state=D7_FRIEND,
-        process=lambda text: _process_d7_friend(update, context, text),
+        process=lambda text: _process_d_answer(update, context, text, forced_step="7b"),
     )
-
-
-async def _process_d7_friend(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
-    session_id = context.user_data["rel_session_id"]
-    await _log_turn(session_id, update.effective_user, "D7_friend", "человек", text)
-
-    status = await hostility.precheck(
-        update, context, branch="relationships", step="D", skip_hostility=True, text_override=text
-    )
-    if status == "crisis":
-        await _close_after_hostility(update, context, session_id, "crisis")
-        return ConversationHandler.END
-
-    count = await _bump_messages(session_id)
-    db.update_relationship_session(session_id, d7_friend=text)
-
-    await _check_exit_intent(context, session_id, "D7_friend", text)
-
-    wrap_state = await _maybe_wrap_to_summary(update, context, session_id, count)
-    if wrap_state is not None:
-        return wrap_state
-
-    context.user_data["rel_d_index"] = 8
-    row = db.get_relationship_session(session_id)
-    question = await llm.adapt_dispute_question(8, row["b_narrative_confirmed"], other=_other(row))
-    await _send(update, context, session_id, "D8", question)
-    return D_QUESTION
 
 
 async def d5_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1165,11 +1202,7 @@ async def _process_d5_question(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def _advance_past_d5(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> int:
-    row = db.get_relationship_session(session_id)
-    context.user_data["rel_d_index"] = 6
-    question = await llm.adapt_dispute_question(6, row["b_narrative_confirmed"], other=_other(row))
-    await _send(update, context, session_id, "D6", question)
-    return D_QUESTION
+    return await _ask_d(update, context, session_id, "6")
 
 
 async def d5_hundred_followup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1243,10 +1276,6 @@ async def _process_e_discomfort_after(update: Update, context: ContextTypes.DEFA
     return await _send_summary_confirm(update, context, session_id)
 
 
-CTA_OFFER_TEXT = (
-    "Если хочется разобраться глубже — приходи на эфир, поговорим, или на консультацию. В любом "
-    f"случае пиши {ADMIN_USERNAME} — он сориентирует."
-)
 
 
 async def _complete_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> int:
@@ -1262,46 +1291,49 @@ async def _complete_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, ses
     await _log_session(update, context, session_id)
     await hostility.maybe_send_self_harm_note(update, context)
 
-    await _send(update, context, session_id, "cta_offer", CTA_OFFER_TEXT)
-
     context.user_data.pop("rel_session_id", None)
+    context.user_data.pop("rel_pending_final", None)
     context.user_data.pop("rel_e_first_answer", None)
     context.user_data.pop("rel_summary", None)
     return ConversationHandler.END
 
 
-async def _finish_e(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, insertion: str | None,
-    wants_change: bool = False,
-) -> int:
-    """Три разных текста закрытия по исходу (B7, ТЗ 01.10.2026): (1) найдена новая реакция —
-    insertion есть; (2) хочется иначе, но пока не сформулировано — wants_change; (3) без движения."""
-    db.finish_relationship_session(session_id, exit_step="E")
-
-    if insertion:
-        outcome = "insight"
-        closing_text = FINAL_INSIGHT_TEMPLATE.format(
-            opener=random.choice(FINAL_INSIGHT_OPENERS), insertion=html.escape(insertion)
-        )
-        await _send(
-            update, context, session_id, "E_finish", closing_text,
-            reply_markup=back_to_menu_keyboard(), parse_mode=ParseMode.HTML,
-        )
-    elif wants_change:
-        outcome = "wants_change"
-        await _send(
-            update, context, session_id, "E_finish", E_WANTS_CHANGE_TEXT,
-            reply_markup=back_to_menu_keyboard(),
-        )
+def _build_final_text(outcome: str, quote: str | None, insertion: str | None) -> str:
+    if outcome == "insight":
+        parts = [FINAL_SHIFT_TEMPLATE.format(quote=html.escape(quote or ""))]
+        if insertion:
+            parts.append(FINAL_NEXT_TIME_TEMPLATE.format(insertion=html.escape(insertion)))
+    elif outcome == "wants_change":
+        parts = [html.escape(E_WANTS_CHANGE_TEXT)]
     else:
-        outcome = "no_change"
-        await _send(update, context, session_id, "E_finish", E_NO_INSIGHT_TEXT, reply_markup=back_to_menu_keyboard())
-    db.update_relationship_session(session_id, e_outcome=outcome)
+        parts = [html.escape(E_NO_INSIGHT_TEXT)]
+    return "\n\n".join(parts + [FINAL_LINKS_TEXT, html.escape(FINAL_CTA_TEXT)])
+
+
+async def _send_final(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, text: str) -> None:
+    await _send(
+        update, context, session_id, "E_finish", text,
+        reply_markup=back_to_menu_keyboard(), parse_mode=ParseMode.HTML,
+    )
+
+
+async def _finish_e(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, outcome: str,
+    quote: str | None = None, insertion: str | None = None,
+) -> int:
+    """Исходы (B7, ТЗ 01.10.2026 + ТЗ-доп. №7, п.1): insight — есть сдвиг (отражаем его словами
+    человека, плюс новое поведение на будущее, если оно названо); wants_change — хочется иначе, но не
+    сформулировано; no_change — пусто по смыслу. Порядок (п.3): проверка «избегание/интеграция»,
+    если сработала, — ДО финала, а финал — одно сообщение со ссылками и CTA."""
+    db.finish_relationship_session(session_id, exit_step="E")
+    db.update_relationship_session(session_id, e_outcome=outcome, e_has_shift=1 if outcome == "insight" else 0)
+    final_text = _build_final_text(outcome, quote, insertion)
 
     # «Избегание или интеграция» (ТЗ-доп. №5, раздел 2) — если хоть раз сработало на C-D8/E,
-    # разбор не заканчивается тут же, а продолжается ещё одним обменом. Лог в Sheets поэтому
-    # откладывается до полного разрешения (иначе пришлось бы потом патчить уже отправленную строку).
+    # сначала ещё один обмен, финал уходит вместе с ответом на него. Лог в Sheets откладывается до
+    # полного разрешения (иначе пришлось бы потом патчить уже отправленную строку).
     if context.user_data.get("exit_intent_flagged"):
+        context.user_data["rel_pending_final"] = final_text
         row = db.get_relationship_session(session_id)
         behavior = await llm.extract_disowned_behavior(row["a_event"], row["b_narrative_confirmed"])
         context.user_data["exit_intent_behavior"] = behavior
@@ -1309,6 +1341,7 @@ async def _finish_e(
         await _send(update, context, session_id, "exit_intent_check", question)
         return EXIT_INTENT_CLARIFY
 
+    await _send_final(update, context, session_id, final_text)
     return await _complete_flow(update, context, session_id)
 
 
@@ -1365,14 +1398,11 @@ async def _process_exit_intent_clarify(update: Update, context: ContextTypes.DEF
 
     parts = []
     if verdict in ("avoidance", "unclear"):
-        parts.append(AVOIDANCE_TEXT.format(**forms))
+        parts.append(html.escape(AVOIDANCE_TEXT.format(**forms)))
     if verdict in ("integration", "unclear"):
-        parts.append(INTEGRATION_TEXT)
-    parts.append(EXIT_INTENT_CLOSING_TEXT)
-    await _send(
-        update, context, session_id, "exit_intent_check", "\n\n".join(parts),
-        reply_markup=back_to_menu_keyboard(),
-    )
+        parts.append(html.escape(INTEGRATION_TEXT))
+    final_text = context.user_data.pop("rel_pending_final", None) or _build_final_text("no_change", None, None)
+    await _send_final(update, context, session_id, "\n\n".join(parts + [final_text]))
 
     context.user_data.pop("exit_intent_flagged", None)
     context.user_data.pop("exit_intent_behavior", None)
@@ -1382,6 +1412,8 @@ async def _process_exit_intent_clarify(update: Update, context: ContextTypes.DEF
 async def _send_summary_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> int:
     row = db.get_relationship_session(session_id)
     d_answers = {f"D{i}": row[D_FIELDS[i]] for i in D_FIELDS}
+    d_answers["D3b"] = row["d3b_helps"]
+    d_answers["D4b"] = row["d4b_cost"]
     d_answers["D7_себе"] = row["d7_self"]
     d_answers["D7_другу"] = row["d7_friend"]
     summary = await llm.generate_session_summary(
@@ -1491,28 +1523,36 @@ async def _process_e_summary(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return ConversationHandler.END
 
     await _bump_messages(session_id)
+    if await _maybe_meta_reask(update, context, session_id, "E", e_question, text):
+        return E_SUMMARY
     db.update_relationship_session(session_id, e_summary=text)
 
     await _check_exit_intent(context, session_id, "E", text)
 
-    row = db.get_relationship_session(session_id)
+    # ТЗ-доп. №7, п.1: «ответ не находится» — только если ответ пустой по смыслу. Есть сдвиг —
+    # отражаем его словами человека (и новое поведение на будущее, если оно названо).
+    shift = await llm.classify_e_has_shift(text)
+    if shift["has_shift"]:
+        return await _finish_e_with_shift(update, context, session_id, "", text)
 
-    # Живой баг: E_QUESTION_SYSTEM раньше сразу утверждал, что мысль «теряет силу» — а человек мог
-    # прямо ответить, что стало ХУЖЕ. Теперь вопрос честный (не предполагает результат), и если
-    # ответ явно про «не изменилось/стало хуже» — не продолжаем выискивать инсайт, а закрываем
-    # честно (тот же текст, что и при отсутствии инсайта, приглашение на диагностику).
-    shift = await llm.classify_e_shift(text)
-    if shift == "same_or_worse":
-        return await _finish_e(update, context, session_id, None)
-
-    analysis = await llm.analyze_e_insight(row["a_event"], row["b_narrative_confirmed"], "", text)
-    if analysis["has_insight"]:
-        return await _finish_e(update, context, session_id, analysis["reflection"])
-
-    followup = await llm.ask_e_followup(row["b_narrative_confirmed"], text)
+    followup = await llm.ask_e_followup(db.get_relationship_session(session_id)["b_narrative_confirmed"], text)
     context.user_data["rel_e_first_answer"] = text
+    context.user_data["rel_e_followup_q"] = followup
     await _send(update, context, session_id, "E_followup", followup)
     return E_FOLLOWUP
+
+
+async def _finish_e_with_shift(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, first_answer: str, latest: str
+) -> int:
+    row = db.get_relationship_session(session_id)
+    analysis = await llm.analyze_e_insight(row["a_event"], row["b_narrative_confirmed"], first_answer, latest)
+    if first_answer:
+        quote = await llm.quote_e_shift(first_answer, latest)
+    else:
+        quote = await llm.quote_e_shift(latest)
+    insertion = analysis["reflection"] if analysis["has_insight"] else None
+    return await _finish_e(update, context, session_id, "insight", quote=quote, insertion=insertion)
 
 
 async def e_followup(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1539,17 +1579,22 @@ async def _process_e_followup(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
 
     await _bump_messages(session_id)
+    if await _maybe_meta_reask(update, context, session_id, "E_followup", context.user_data.get("rel_e_followup_q", ""), text):
+        return E_FOLLOWUP
     first_answer = context.user_data.get("rel_e_first_answer", "")
     db.update_relationship_session(session_id, e_summary=f"{first_answer}\n{text}")
 
     await _check_exit_intent(context, session_id, "E_followup", text)
 
+    # ответы на E и на уточнение оцениваются вместе (ТЗ-доп. №7, п.1)
+    shift = await llm.classify_e_has_shift(first_answer, text)
+    if shift["has_shift"]:
+        return await _finish_e_with_shift(update, context, session_id, first_answer, text)
+
     row = db.get_relationship_session(session_id)
     analysis = await llm.analyze_e_insight(row["a_event"], row["b_narrative_confirmed"], first_answer, text)
-    if analysis["has_insight"]:
-        return await _finish_e(update, context, session_id, analysis["reflection"])
-
-    return await _finish_e(update, context, session_id, None, wants_change=analysis.get("wants_change", False))
+    outcome = "wants_change" if analysis.get("wants_change") else "no_change"
+    return await _finish_e(update, context, session_id, outcome)
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

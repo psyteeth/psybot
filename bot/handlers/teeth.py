@@ -29,6 +29,9 @@ from bot.sheets import sheets_logger
 logger = logging.getLogger(__name__)
 
 ASK_TOOTH, CONFIRM_TOOTH, ASK_SCARY, ASK_FEELING = range(4)
+# ТЗ-доп. №7, п.8: после вопроса «почему он/она сам(а) не проходит диагностику?» ждём ответа, а не
+# шлём следующий вопрос в ту же секунду. Дописано в конец — persistent хранит номера состояний.
+OTHER_REPLY = 4
 
 # Живой кейс 02.10 (502643542): ушёл из «Зубов» на вопросе «Каким ты тогда себя чувствуешь?»
 # (/start → меню → «Концепция») и первым сообщением там написал «Неловкая» — ответ на брошенный
@@ -87,7 +90,8 @@ def _other_person_note_text(subject_age: str, motivation: str) -> str:
     if subject_age == "minor":
         return OTHER_PERSON_MINOR_TEXT
     if motivation == "anxious":
-        return f"{OTHER_PERSON_ADULT_QUESTION}\n\n{OTHER_PERSON_ANXIOUS_TEXT}"
+        # вопрос — последним, на него и ждём ответа
+        return f"{OTHER_PERSON_ANXIOUS_TEXT}\n\n{OTHER_PERSON_ADULT_QUESTION}"
     return OTHER_PERSON_ADULT_QUESTION
 
 Q_TOOTH = "Какой зуб тебя беспокоит? Напиши номер по схеме."
@@ -267,10 +271,15 @@ async def _process_ask_tooth(update: Update, context: ContextTypes.DEFAULT_TYPE,
     several = [int(n) for n in re.findall(r"\d{2}", text)]
     if len(several) >= 2 and all(n in VALID_TEETH_NUMBERS for n in several):
         # «33, 34» — раньше отвечали «Не понял, какой это зуб», хотя человек всё написал верно
+        # ТЗ-доп. №7, п.9 — кнопки с названными номерами
+        unique = list(dict.fromkeys(several))
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton(str(n), callback_data=f"tooth_pick:{n}") for n in unique[:6]]]
+        )
         await _send(
             update, context, session_id, "ask_tooth",
-            "Давай разберём по одному зубу за раз. Какой из них беспокоит больше всего? Напиши один номер.",
-            msg_type="уточнение",
+            "Давай по одному. Какой из них беспокоит больше всего? Остальные можно разобрать следующими сессиями.",
+            msg_type="уточнение", reply_markup=keyboard,
         )
         return ASK_TOOTH
 
@@ -333,6 +342,21 @@ async def confirm_tooth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return await _accept_tooth(update, context, number, via_query=True)
 
 
+async def tooth_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Выбор одного зуба кнопкой из нескольких названных (ТЗ-доп. №7, п.9) — выбор явный, без сверки."""
+    query = update.callback_query
+    session_id = context.user_data["teeth_session_id"]
+    await query.answer()
+    await _log_turn(session_id, update.effective_user, "ask_tooth", "человек", query.data, msg_type="кнопка")
+    number = int(query.data.split(":", 1)[1])
+    if number not in VALID_TEETH_NUMBERS:
+        return ASK_TOOTH
+    confirm_text = f"Принято — {describe_tooth(number)} (зуб {number})."
+    await query.edit_message_text(confirm_text)
+    await _log_turn(session_id, update.effective_user, "confirm_tooth", "бот", confirm_text)
+    return await _accept_tooth(update, context, number, via_query=True)
+
+
 async def _accept_tooth(update, context, number: int, via_query: bool = False) -> int:
     session_id = context.user_data["teeth_session_id"]
     db.update_teeth_session(session_id, tooth_number=number)
@@ -371,7 +395,33 @@ async def _process_ask_scary(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if subject["subject"] == "other":
         note_text = _other_person_note_text(subject["subject_age"], subject["motivation"])
         await _send(update, context, session_id, "ask_scary", note_text, msg_type="уточнение")
+        if subject["subject_age"] != "minor":
+            return OTHER_REPLY
 
+    await _send(update, context, session_id, "ask_feeling", Q_FEELING)
+    return ASK_FEELING
+
+
+async def other_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="teeth_other_reply", conv_handler=conv_handler, state=OTHER_REPLY,
+        process=lambda text: _process_other_reply(update, context, text),
+    )
+
+
+async def _process_other_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    session_id = context.user_data["teeth_session_id"]
+    status = await hostility.precheck(
+        update, context, branch="teeth", step="other_reply",
+        bot_question=OTHER_PERSON_ADULT_QUESTION, text_override=text,
+    )
+    if status in ("crisis", "closed"):
+        db.finish_teeth_session(session_id, completed=False)
+        await hostility.maybe_send_self_harm_note(update, context)
+        return ConversationHandler.END
+    if status == "hostile":
+        return OTHER_REPLY
+    await _log_turn(session_id, update.effective_user, "ask_scary", "человек", text)
     await _send(update, context, session_id, "ask_feeling", Q_FEELING)
     return ASK_FEELING
 
@@ -459,10 +509,14 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 conv_handler = ConversationHandler(
     entry_points=[CallbackQueryHandler(entry, pattern="^menu:teeth$")],
     states={
-        ASK_TOOTH: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_tooth)],
+        ASK_TOOTH: [
+            CallbackQueryHandler(tooth_pick, pattern="^tooth_pick:"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, ask_tooth),
+        ],
         CONFIRM_TOOTH: [CallbackQueryHandler(confirm_tooth, pattern="^tooth_confirm:")],
         ASK_SCARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_scary)],
         ASK_FEELING: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_feeling)],
+        OTHER_REPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, other_reply)],
     },
     fallbacks=[
         CommandHandler("cancel", cancel),
