@@ -252,14 +252,40 @@ NORMALIZE_FEELING_SYSTEM = (
     "остаётся «чмом позорным»). КАЖДУЮ характеристику ставь в нужный падеж (творительный: «неуклюжий» → "
     "«неуклюжим»). Слова-состояния, которые не склоняются («неловко», «стыдно»), оставляй как есть. "
     "Явные опечатки исправляй («присмыкающийся» → «пресмыкающийся»), смысл и слова не меняй.\n"
+    # живой кейс 04.10: «Сгниет» — про зуб, а не про себя — ушло в финал как «чувствуешь себя сгнившим»
+    "ПРОПУСКАЙ ответы, которые описывают ЗУБ или событие, а не самого человека («сгниет», «выпадет», "
+    "«разрушится», «удалят»). Если таких все — возьми их как есть.\n"
     'Ответь СТРОГО валидным JSON без markdown: {"instr": "...", "nom": "..."}'
 )
+
+
+ABOUT_TOOTH_SYSTEM = (
+    "Человека спросили «Каким ты тогда себя чувствуешь?» (сразу после вопроса, что страшного может "
+    "случиться с его зубом). Иногда по инерции отвечают про зуб. Определи:\n"
+    "tooth — ответ это ГЛАГОЛ о судьбе зуба или событие с ним: «сгниет», «выпадет», «разрушится», "
+    "«удалят», «его не станет», «сломается».\n"
+    "self — всё остальное: любое прилагательное или существительное о человеке («старый», «убогой», "
+    "«пустым», «отживший», «никчёмный», «грустный»), даже если слово могло бы подойти и к зубу.\n"
+    "Ответь ровно одним словом: tooth или self."
+)
+
+
+async def is_about_tooth(answer: str) -> bool:
+    try:
+        return "tooth" in (await _ask(ABOUT_TOOTH_SYSTEM, answer, MODEL_HAIKU, max_tokens=10)).lower()
+    except Exception:  # noqa: BLE001
+        logger.exception("is_about_tooth упал")
+        return False
 
 
 async def normalize_feeling_insert(answers: list[str] | str) -> dict:
     """Дословная вставка ответов в двух падежах: {"instr": творительный, "nom": именительный}."""
     if isinstance(answers, str):
         answers = [answers]
+    if len(answers) > 1:
+        # живой кейс 04.10: «Сгниет» (про зуб) ушло в финал как «чувствуешь себя сгнившим»
+        about_self = [a for a in answers if not await is_about_tooth(a)]
+        answers = about_self or answers
     raw_answer = ", ".join(a.strip() for a in answers if a.strip())
     user_text = "\n".join(f"Ответ {i}: {a}" for i, a in enumerate(answers, 1))
     try:
@@ -857,6 +883,45 @@ async def quote_e_shift(answer: str, followup_answer: str = "") -> str:
     except Exception:  # noqa: BLE001
         logger.exception("quote_e_shift упал")
         return " ".join(a for a in (answer, followup_answer) if a).strip()
+
+
+# Живой кейс 04.10 (502643542): на уточнение E — «Не знаю, подскажи мне», а бот закрыл разбор
+# «ответ не находится». Просьбу подсказать теперь видим и предлагаем вариант из ЕГО ЖЕ ответов.
+HINT_REQUEST_SYSTEM = (
+    "Человека спросили, как ему теперь хочется реагировать в похожей ситуации. Просит ли он в ответе "
+    "подсказать, предложить вариант, помочь сформулировать («подскажи», «а ты как думаешь?», «помоги», "
+    "«не знаю, предложи»)? Ответь ровно одним словом: yes или no."
+)
+
+
+async def is_hint_request(text: str) -> bool:
+    try:
+        return "yes" in (await _ask(HINT_REQUEST_SYSTEM, text, MODEL_HAIKU, max_tokens=10)).lower()
+    except Exception:  # noqa: BLE001
+        logger.exception("is_hint_request упал")
+        return False
+
+
+E_HINT_SYSTEM = (
+    "Финал разбора. Человек просит подсказать, как ему можно реагировать в похожей ситуации в будущем. "
+    "Даны событие, его долженствование и его собственные ответы на вопросы разбора. Предложи ОДИН "
+    "вариант новой реакции, собранный ТОЛЬКО из того, что человек уже сам сказал (особенно — что "
+    "менялось, когда «должен» превращалось в «мне бы хотелось», и что он советовал бы другу). Не "
+    "добавляй ничего от себя. Формат — короткая вставка, продолжающая фразу «Например, можно …» (с "
+    "маленькой буквы, без точки в конце). Пол человека неизвестен — без родовых форм о нём. Ответь "
+    "только этой вставкой."
+)
+
+
+async def suggest_e_hint(event: str, narrative: str, answers: str) -> str:
+    user_text = f"Событие (A): {event}\nДолженствование (B): {narrative}\nОтветы человека:\n{answers}"
+    try:
+        hint = await _ask_checked(E_HINT_SYSTEM, user_text, MODEL_SONNET, max_tokens=150, max_questions=0)
+        hint = re.sub(r"^\s*например,?\s*(можно\s*)?", "", hint.strip(), flags=re.IGNORECASE)
+        return hint.strip().strip("«»\"").rstrip(".")
+    except Exception:  # noqa: BLE001
+        logger.exception("suggest_e_hint упал")
+        return ""
 
 
 E_FOLLOWUP_SYSTEM = (

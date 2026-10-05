@@ -454,7 +454,10 @@ async def _process_ask_feeling(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data.setdefault(FEELING_ANSWERS_KEY, []).append(text)
 
     attempts = context.user_data.get("teeth_feeling_attempts", 0)
-    if attempts < FEELING_DIG_MAX_ATTEMPTS:
+    # живой кейс 04.10: на первое уточнение уже пришло одно слово («Я грустный») — второе «одним
+    # словом» в таком случае лишнее, человек просто повторял то же самое
+    already_one_word = attempts >= 1 and len([w for w in re.findall(r"\w+", text.lower()) if w != "я"]) <= 1
+    if attempts < FEELING_DIG_MAX_ATTEMPTS and not already_one_word:
         depth = await llm.classify_feeling_depth(text)
         if not depth["is_deep"]:
             context.user_data["teeth_feeling_attempts"] = attempts + 1

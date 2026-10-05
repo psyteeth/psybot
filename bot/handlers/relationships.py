@@ -184,6 +184,7 @@ PARANOID_BOT_TEMPLATE = (
     "голос передаёт тебе: {punchline}"
 )
 FINAL_SHIFT_TEMPLATE = "Похоже, у тебя появилось: {quote}."
+FINAL_HINT_ACCEPTED_TEXT = "Кажется, у тебя получилось найти новую реакцию."
 FINAL_NEXT_TIME_TEMPLATE = "В следующий раз в подобной ситуации ты можешь {insertion}"
 FINAL_LINKS_TEXT = (
     "Меняй своё мышление, а не других людей.\n"
@@ -371,6 +372,8 @@ async def _start_session(
     session_id = db.create_relationship_session(user.id, user.username)
     context.user_data["rel_session_id"] = session_id
     _reset_dozhim_state(context)
+    for key in ("rel_e_hint_offered", "rel_e_hint", "rel_pending_final"):
+        context.user_data.pop(key, None)
     hostility.reset_session(context)
     # Живой кейс: на вопросе A нет способа выйти кроме /start — несколько раз подряд человек
     # открывал разбор, не отвечал и уходил (см. SeliverstovaMarina, 3 пустых cancelled-сессии
@@ -1293,6 +1296,8 @@ async def _complete_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, ses
 
     context.user_data.pop("rel_session_id", None)
     context.user_data.pop("rel_pending_final", None)
+    context.user_data.pop("rel_e_hint_offered", None)
+    context.user_data.pop("rel_e_hint", None)
     context.user_data.pop("rel_e_first_answer", None)
     context.user_data.pop("rel_summary", None)
     return ConversationHandler.END
@@ -1300,7 +1305,8 @@ async def _complete_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, ses
 
 def _build_final_text(outcome: str, quote: str | None, insertion: str | None) -> str:
     if outcome == "insight":
-        parts = [FINAL_SHIFT_TEMPLATE.format(quote=html.escape(quote or ""))]
+        # quote нет, когда человек принял подсказку бота — тогда отражать нечего, только новая реакция
+        parts = [FINAL_SHIFT_TEMPLATE.format(quote=html.escape(quote)) if quote else FINAL_HINT_ACCEPTED_TEXT]
         if insertion:
             parts.append(FINAL_NEXT_TIME_TEMPLATE.format(insertion=html.escape(insertion)))
     elif outcome == "wants_change":
@@ -1529,6 +1535,10 @@ async def _process_e_summary(update: Update, context: ContextTypes.DEFAULT_TYPE,
 
     await _check_exit_intent(context, session_id, "E", text)
 
+    if await _maybe_offer_hint(update, context, session_id, text):
+        context.user_data["rel_e_first_answer"] = text
+        return E_FOLLOWUP
+
     # ТЗ-доп. №7, п.1: «ответ не находится» — только если ответ пустой по смыслу. Есть сдвиг —
     # отражаем его словами человека (и новое поведение на будущее, если оно названо).
     shift = await llm.classify_e_has_shift(text)
@@ -1540,6 +1550,31 @@ async def _process_e_summary(update: Update, context: ContextTypes.DEFAULT_TYPE,
     context.user_data["rel_e_followup_q"] = followup
     await _send(update, context, session_id, "E_followup", followup)
     return E_FOLLOWUP
+
+
+E_HINT_TEXT = "Например, можно {hint}. Откликается?"
+
+
+async def _maybe_offer_hint(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, text: str) -> bool:
+    """«Подскажи мне» на E/E_followup — один раз предлагаем вариант из ответов самого человека."""
+    if context.user_data.get("rel_e_hint_offered") or not await llm.is_hint_request(text):
+        return False
+    row = db.get_relationship_session(session_id)
+    answers = "\n".join(
+        f"{label}: {row[field]}" for label, field in (
+            ("C", "c_consequence"), ("D3", "d3_pragmatic"), ("D4", "d4_hedonistic"), ("D6", "d6_historical"),
+            ("D7 себе", "d7_self"), ("D7 другу", "d7_friend"), ("D8", "d8_semantic"),
+        ) if row[field]
+    )
+    hint = await llm.suggest_e_hint(row["a_event"], row["b_narrative_confirmed"], answers)
+    if not hint:
+        return False
+    context.user_data["rel_e_hint_offered"] = True
+    context.user_data["rel_e_hint"] = hint
+    question = E_HINT_TEXT.format(hint=hint)
+    context.user_data["rel_e_followup_q"] = question
+    await _send(update, context, session_id, "E_followup", question)
+    return True
 
 
 async def _finish_e_with_shift(
@@ -1585,6 +1620,14 @@ async def _process_e_followup(update: Update, context: ContextTypes.DEFAULT_TYPE
     db.update_relationship_session(session_id, e_summary=f"{first_answer}\n{text}")
 
     await _check_exit_intent(context, session_id, "E_followup", text)
+
+    hint = context.user_data.pop("rel_e_hint", None)
+    if hint:
+        # ответ на предложенный вариант: откликается — это и есть сдвиг, словами из его же ответов
+        if await llm.classify_yes_no(text):
+            return await _finish_e(update, context, session_id, "insight", insertion=hint)
+    elif await _maybe_offer_hint(update, context, session_id, text):
+        return E_FOLLOWUP
 
     # ответы на E и на уточнение оцениваются вместе (ТЗ-доп. №7, п.1)
     shift = await llm.classify_e_has_shift(first_answer, text)
