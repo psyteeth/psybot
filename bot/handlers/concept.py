@@ -373,7 +373,14 @@ async def _process_concept_text(
             context.user_data["concept_hook_followup"] = True
             return await _route_and_respond(update, context)
 
-        if await llm.is_offtopic_concept(text, prior_topic=prior_topic):
+        await concept_store.ensure_fresh()
+        await secrets_index.ensure_fresh()
+        best = secrets_index.search_scored(text, top_k=1) if secrets_index.is_loaded() else []
+        relevance_threshold = secrets_index.param("relevance_threshold", CONCEPT_ROUTER_RELEVANCE_THRESHOLD)
+        matches_table = bool(best) and best[0][1] >= relevance_threshold
+        if not matches_table and await llm.is_offtopic_concept(
+            text, prior_topic=prior_topic, topics=concept_store.titles()
+        ):
             if pending_marker:
                 await sheets_logger.update_concept_reaction(pending_marker, user.id, "ушёл")
             await _send(update, context, "offtopic", OFFTOPIC_TEXT, msg_type="отказ", reply_markup=back_to_menu_keyboard())
@@ -511,13 +518,11 @@ async def _respond_deepen(
     user = update.effective_user
     raw_question = context.user_data.get("concept_raw_question", question)
 
-    if not scored:
-        return await _respond_simple(update, context, raw_question, question, route, capped=False)
-
-    top_chunk, _score = scored[0]
-    neighbors = secrets_index.neighbors(top_chunk.chunk_id, limit=2)
-    full_source = "\n\n".join([top_chunk.text] + [n.text for n in neighbors])
-    answer = await llm.generate_secret_reveal(full_source, top_chunk.status, question, full=True)
+    # 05.10: «подробно» — полноценный разбор по материалам всей таблицы, а не «секрет» из 1-3 кусков
+    context_text = await _build_concept_context(question)
+    similar_nums = await llm.pick_similar_author_answers(question, AUTHOR_ANSWERS)
+    author_examples = [e for e in AUTHOR_ANSWERS if e["num"] in similar_nums]
+    answer = await llm.answer_concept_question(question, context_text, author_examples, simple=False)
     if not answer:
         return await _respond_simple(update, context, raw_question, question, route, capped=False)
 
@@ -548,16 +553,33 @@ async def _respond_deepen(
     return ASKING
 
 
+async def _build_concept_context(question: str) -> str:
+    """Нужный лист целиком + лучшие куски со всех листов + начало нарратива (в этом порядке —
+    обрезка CONCEPT_CONTEXT_MAX_CHARS режет хвост, а не главное)."""
+    await concept_store.ensure_fresh()
+    await secrets_index.ensure_fresh()
+    parts = []
+    relevant_title = await llm.pick_relevant_sheet(question, concept_store.titles())
+    if relevant_title:
+        parts.append(f"[Раздел: {relevant_title}]\n{concept_store.get(relevant_title)[:30000]}")
+    if secrets_index.is_loaded():
+        chunks = [c for c, _s in secrets_index.search_scored(question, top_k=10) if c.sheet != relevant_title]
+        if chunks:
+            parts.append("\n\n".join(f"[Раздел: {c.sheet}] {c.text}" for c in chunks))
+    narrative = concept_store.main_narrative()
+    if narrative and relevant_title and "нарратив" not in relevant_title.lower():
+        parts.append(f"[Раздел: основной нарратив]\n{narrative[:15000]}")
+    elif not relevant_title:
+        parts.append(narrative)
+    return "\n\n".join(parts)
+
+
 async def _respond_simple(
     update: Update, context: ContextTypes.DEFAULT_TYPE, raw_question: str, question: str, route: dict, capped: bool
 ) -> int:
     user = update.effective_user
 
-    await concept_store.ensure_fresh()
-    context_text = concept_store.main_narrative()
-    relevant_title = await llm.pick_relevant_sheet(question, concept_store.titles())
-    if relevant_title:
-        context_text += "\n\n" + concept_store.get(relevant_title)
+    context_text = await _build_concept_context(question)
 
     dispute = await llm.is_dispute(raw_question)
     similar_nums = await llm.pick_similar_author_answers(question, AUTHOR_ANSWERS)
