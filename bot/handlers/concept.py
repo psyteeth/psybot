@@ -460,10 +460,12 @@ async def _route_and_respond(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     mode = route["mode"]
     capped = False
-    # согласие на крючок — выполняем обещанное простым ответом: «углубление» достаёт случайный кусок
-    # базы и уводит тему в сторону (живой кейс 02.10), а уточнять после «да» нечего
+    # согласие на крючок — выполняем обещанное одним развёрнутым ответом. Не «простым»: лимит в 3
+    # предложения обрезал пример на середине (живой кейс 05.10: показана только версия стабилизатора,
+    # катализатора — нет), а после простого ответа ещё и подмешивался «секрет» вторым сообщением со
+    # своим вопросом. «Углубление» теперь строит ответ по всей таблице, а не по случайному куску.
     if context.user_data.pop("concept_hook_followup", False):
-        mode = "simple"
+        mode = "deepen"
     if mode == "clarify":
         if best_score >= relevance_threshold and route["confidence"] >= confidence_threshold:
             mode = "simple"
