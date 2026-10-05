@@ -1,5 +1,6 @@
 import logging
 import random
+import re
 import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -278,10 +279,12 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, t
 
     is_first = not context.user_data.get("concept_raw_question")
     bot_question = None if is_first else context.user_data.get("concept_last_bot_question", "")
+    prior_topic = context.user_data.get("concept_last_topic") or context.user_data.get("concept_raw_question")
+    sources_request = await llm.is_sources_request(text, prior_topic)
 
     status = await hostility.precheck(
         update, context, branch="concept", step="ask" if is_first else "clarify",
-        bot_question=bot_question, text_override=text,
+        bot_question=bot_question, text_override=text, skip_hostility=sources_request,
     )
     if status == "crisis":
         return ConversationHandler.END
@@ -293,6 +296,9 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         return ASKING if is_first else CLARIFY
 
     db.increment_concept_messages(user.id)
+
+    if sources_request:
+        return await _respond_sources(update, context, text, prior_topic)
 
     if is_first and await _offer_teeth_resume(update, context, text):
         return ASKING
@@ -550,6 +556,84 @@ async def _respond_deepen(
 
     _reset_concept_topic_state(context)
     await hostility.maybe_send_self_harm_note(update, context)
+    return ASKING
+
+
+SOURCES_UNKNOWN_TEXT = (
+    "Точных научных источников по этому в моих материалах нет — и выдумывать не буду. Я передал "
+    "твой вопрос автору, вернусь к тебе с ответом."
+)
+TELEGRAM_CHUNK = 3900
+
+
+def _split_for_telegram(text: str, limit: int = TELEGRAM_CHUNK) -> list[str]:
+    parts, buf = [], ""
+    for line in text.split("\n"):
+        if len(buf) + len(line) + 1 > limit and buf:
+            parts.append(buf.rstrip())
+            buf = ""
+        buf += line + "\n"
+    if buf.strip():
+        parts.append(buf.rstrip())
+    return parts
+
+
+def _select_citations(topic: str, max_chars: int = 25000) -> str:
+    """Строки таблицы с исследованиями, относящиеся к теме: по совпадению слов темы (основы слов),
+    самые релевантные — первыми."""
+    stems = {w[:5] for w in re.findall(r"\w+", topic.lower()) if len(w) > 3}
+    scored = []
+    for sheet, cell in concept_store.citation_lines():
+        low = f"{sheet} {cell}".lower()
+        score = sum(1 for st in stems if st in low)
+        if score:
+            scored.append((score, sheet, cell))
+    scored.sort(key=lambda x: -x[0])
+    out, total = [], 0
+    for _score, sheet, cell in scored:
+        line = f"[{sheet}] {cell}"
+        if total + len(line) > max_chars:
+            break
+        out.append(line)
+        total += len(line)
+    return "\n".join(out)
+
+
+async def _respond_sources(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, prior_topic: str | None) -> int:
+    """05.10, решение автора: на запрос источников — либо ВСЁ, что есть в таблице, либо честное «не
+    знаю, спрошу автора» (вопрос уходит админу, автор отвечает через /send). Без уговоров."""
+    user = update.effective_user
+    if not context.user_data.get("concept_session_id"):
+        context.user_data["concept_session_id"] = f"{user.id}_{db.now()}"
+    await _log_turn(context, user, "sources", "человек", text)
+    topic = f"{prior_topic}\n{text}" if prior_topic else text
+    await concept_store.ensure_fresh()
+    citations = _select_citations(topic)
+    answer = await llm.answer_sources(topic, citations) if citations else None
+    if answer:
+        for part in _split_for_telegram(answer):
+            await _send(update, context, "sources", part, reply_markup=back_to_menu_keyboard())
+    else:
+        await _send(update, context, "sources", SOURCES_UNKNOWN_TEXT, reply_markup=back_to_menu_keyboard())
+        if ADMIN_CHAT_ID:
+            try:
+                relay = (
+                    f"📚 Нужны источники — в таблице не нашлось.\nОт: @{user.username or '—'} (id {user.id})\n"
+                    f"Тема: {prior_topic or '—'}\nВопрос: {text}\n\nОтветить: /send {user.id} <текст>"
+                )
+                await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=relay[:4000])
+            except Exception:  # noqa: BLE001
+                logger.exception("Не удалось отправить админу запрос источников")
+    await sheets_logger.append(
+        "Концепция",
+        [
+            db.now(), user.id, user.username or "", text, answer or SOURCES_UNKNOWN_TEXT,
+            "нет", "да" if (not answer and ADMIN_CHAT_ID) else "нет", topic,
+            "sources", 1.0, 0, "нет", "нет", "",
+        ],
+    )
+    context.user_data["concept_last_topic"] = prior_topic or text
+    _reset_concept_topic_state(context)
     return ASKING
 
 

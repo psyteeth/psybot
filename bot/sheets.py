@@ -7,6 +7,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from typing import Optional
 
@@ -239,6 +240,9 @@ class SheetsLogger:
             logger.exception("update_concept_reaction() упал")
 
 
+_CITATION_RE = re.compile(r"\b(18|19|20)\d{2}\b|et al|DOI|doi\.org")
+
+
 class ConceptStore:
     """Кэш таблицы концепции в памяти, обновление раз в час."""
 
@@ -286,6 +290,16 @@ class ConceptStore:
 
     def get(self, title: str) -> str:
         return self._sheets.get(title, "")
+
+    def citation_lines(self) -> list[tuple[str, str]]:
+        """(лист, ячейка) для всех ячеек, где упомянуто исследование (год, et al., DOI) — каталог
+        источников из уже закэшированной таблицы, без дополнительных чтений Sheets."""
+        out = []
+        for title, text in self._sheets.items():
+            for cell in re.split(r"\n| \| ", text):
+                if _CITATION_RE.search(cell):
+                    out.append((title, cell.strip()))
+        return out
 
     def is_loaded(self) -> bool:
         return bool(self._sheets)
