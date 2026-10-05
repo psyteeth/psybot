@@ -169,8 +169,11 @@ async def _handle_pending_secret_reaction(update: Update, context: ContextTypes.
     return None
 
 
+SECRET_INTRO_TEXT = "Ещё в моей базе данных по этой теме есть такая мысль."
+
+
 async def _maybe_share_secret(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, question: str, resolved_question: str
+    update: Update, context: ContextTypes.DEFAULT_TYPE, question: str, resolved_question: str, answer: str = ""
 ) -> None:
     user = update.effective_user
     answer_count = context.user_data.get("concept_secrets_answer_count", 0) + 1
@@ -189,13 +192,19 @@ async def _maybe_share_secret(
         if not secrets_index.is_loaded():
             return
         seen_ids = db.get_seen_secret_ids(user.id)
-        candidates = secrets_index.search(f"{question} {resolved_question}", top_k=5, exclude_ids=seen_ids)
+        # только заметно похожие на тему кандидаты — «по ассоциации» секрет выглядел несвязанным
+        threshold = secrets_index.param("relevance_threshold", CONCEPT_ROUTER_RELEVANCE_THRESHOLD)
+        candidates = [
+            c for c, score in secrets_index.search_scored(
+                f"{question} {resolved_question} {answer}", top_k=5, exclude_ids=seen_ids
+            ) if score >= threshold
+        ]
         if not candidates:
             return
 
         gate = await llm.classify_secret_gate(
             resolved_question,
-            f"Исходный вопрос: {question}\nУточнённый: {resolved_question}",
+            f"Исходный вопрос: {question}\nУточнённый: {resolved_question}\nОтвет бота: {answer}",
             [{"chunk_id": c.chunk_id, "status": c.status, "text": c.text} for c in candidates],
         )
         if not gate["share"] or not gate["chunk_id"]:
@@ -204,9 +213,10 @@ async def _maybe_share_secret(
         if not chunk:
             return
 
-        reveal_text = await llm.generate_secret_reveal(chunk.text, chunk.status, resolved_question)
+        reveal_text = await llm.generate_secret_reveal(chunk.text, chunk.status, resolved_question, main_answer=answer)
         if not reveal_text:
             return
+        reveal_text = f"{SECRET_INTRO_TEXT}\n\n{reveal_text}"
 
         await _send(update, context, "secret", reveal_text, msg_type="секрет")
         await sheets_logger.append(
@@ -689,7 +699,7 @@ async def _respond_simple(
     context.user_data["concept_last_answer"] = answer
 
     if not escalated:
-        await _maybe_share_secret(update, context, raw_question, question)
+        await _maybe_share_secret(update, context, raw_question, question, answer)
 
     row_timestamp = db.now()
     await sheets_logger.append(
