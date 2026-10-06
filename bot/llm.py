@@ -624,6 +624,8 @@ async def check_d_answer(previous_question: str, current_question: str, text: st
         raw = await _ask(D_ANSWER_CHECK_SYSTEM, user_text, MODEL_HAIKU, max_tokens=60)
         data = json.loads(_strip_code_fence(raw))
         meta = data.get("meta")
+        if not may_be_meta_request(text):
+            meta = "none"
         return {
             "meta": meta if meta in ("one_at_a_time", "not_understood") else "none",
             "answers_current": bool(data.get("answers_current", True)),
@@ -633,6 +635,20 @@ async def check_d_answer(previous_question: str, current_question: str, text: st
     except Exception:  # noqa: BLE001
         logger.exception("check_d_answer упал/не распарсился")
         return {"meta": "none", "answers_current": True, "answers_previous": False, "self_reaction": False}
+
+
+# Живой кейс 06.10 (Voves): «Мне хочется выдержать происходящее — я больше этого» — сильный ответ на
+# E — классификатор (нестабильно) счёл непониманием и переспросил «проще». Переспрос допустим, только
+# если в ответе есть вопрос или явные слова-маркеры; без них модель даже не спрашиваем.
+_META_MARKERS_RE = re.compile(
+    r"\?|не\s+понял|не\s+поняла|не\s+понимаю|непонятн|по\s+одному|в\s+смысле|что\s+значит|объясни|"
+    r"поясни|о\s+ч[её]м\s+ты|что\s+ты\s+имеешь|переформулируй",
+    re.IGNORECASE,
+)
+
+
+def may_be_meta_request(text: str) -> bool:
+    return bool(_META_MARKERS_RE.search(text))
 
 
 META_REQUEST_SYSTEM = (
@@ -646,6 +662,8 @@ META_REQUEST_SYSTEM = (
 
 
 async def classify_meta_request(text: str, question: str = "") -> str:
+    if not may_be_meta_request(text):
+        return "none"
     user_text = f"Вопрос бота: {question}\nОтвет человека: {text}" if question else text
     try:
         result = (await _ask(META_REQUEST_SYSTEM, user_text, MODEL_HAIKU, max_tokens=10)).lower()

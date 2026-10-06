@@ -82,6 +82,10 @@ FEELING_DIG_TEXT = (
     "«{label}» — а какой ты сам(а), если назвать это парой слов? Закончи: «Я...»"
 )
 FEELING_DIG_TEXT_AGAIN = "И ещё раз, но теперь одним словом? Закончи: «Я...»"
+FEELING_EXPLAIN_TEXT = (
+    "Про тот момент, когда с зубом случится то самое страшное. Не про зуб — про тебя: какой ты тогда "
+    "сам(а), в двух словах? Закончи: «Я...»"
+)
 # все ответы на вопрос о чувстве (исходный + уточнения) — в финал идут вместе (02.10)
 FEELING_ANSWERS_KEY = "teeth_feeling_answers"
 
@@ -234,6 +238,7 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("teeth_feeling_attempts", None)
     context.user_data.pop(UNFINISHED_KEY, None)
     context.user_data.pop(FEELING_ANSWERS_KEY, None)
+    context.user_data.pop("teeth_feeling_explained", None)
     hostility.reset_session(context)
 
     with open(TEETH_CHART_PATH, "rb") as photo:
@@ -454,6 +459,15 @@ async def _process_ask_feeling(update: Update, context: ContextTypes.DEFAULT_TYP
     context.user_data.setdefault(FEELING_ANSWERS_KEY, []).append(text)
 
     attempts = context.user_data.get("teeth_feeling_attempts", 0)
+    # живой кейс 06.10: «Не понимаю», «Я сейчас или с разрушенным зубом?» на уточнении — бот шёл
+    # дальше к «ещё раз, одним словом». Теперь объясняем и ждём ответа, попытку не засчитываем.
+    if attempts >= 1 and llm.may_be_meta_request(text) and not context.user_data.get("teeth_feeling_explained"):
+        context.user_data["teeth_feeling_explained"] = True
+        answers = context.user_data.get(FEELING_ANSWERS_KEY, [])
+        if answers and answers[-1] == text:
+            answers.pop()  # это вопрос, а не характеристика — в финал не идёт
+        await _send(update, context, session_id, "ask_feeling", FEELING_EXPLAIN_TEXT, msg_type="уточнение")
+        return ASK_FEELING
     # живой кейс 04.10: на первое уточнение уже пришло одно слово («Я грустный») — второе «одним
     # словом» в таком случае лишнее, человек просто повторял то же самое
     already_one_word = attempts >= 1 and len([w for w in re.findall(r"\w+", text.lower()) if w != "я"]) <= 1
