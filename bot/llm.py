@@ -354,9 +354,12 @@ OTHER_PERSON_SYSTEM = (
     "\"gender\" — грамматический род этого человека: \"f\" (свекровь, мама, начальница, подруга, она), "
     "\"m\" (муж, отец, начальник, он), \"unknown\" — если по тексту не понять (например, «коллега», "
     "«ребёнок», «партнёр» без других признаков).\n\n"
+    "Если людей несколько («соседки», «двое», «они», «2 …») — gender = \"pl\".\n"
+    "\"is_evaluation\": true — если вместо роли/отношения дана только оценка или оскорбление "
+    "(«сучки», «козёл», «неадекват», «токсичная») и неясно, кто это пользователю; тогда label = null.\n\n"
     "Ответь СТРОГО валидным JSON без markdown: "
     '{"other_person": "<один вариант из списка>" или null, "label": "..." или null, '
-    '"gender": "f" или "m" или "unknown"}.'
+    '"gender": "f" или "m" или "pl" или "unknown", "is_evaluation": true или false}.'
 )
 
 
@@ -369,14 +372,16 @@ async def classify_other_person_full(text: str) -> dict:
         value = data.get("other_person")
         gender = data.get("gender")
         label = data.get("label")
+        is_evaluation = bool(data.get("is_evaluation", False))
         return {
             "category": value if value in OTHER_PERSON_OPTIONS else None,
-            "label": str(label).strip() if label else None,
-            "gender": gender if gender in ("f", "m") else "unknown",
+            "label": None if is_evaluation else (str(label).strip() if label else None),
+            "gender": gender if gender in ("f", "m", "pl") else "unknown",
+            "is_evaluation": is_evaluation,
         }
     except Exception:  # noqa: BLE001
         logger.exception("classify_other_person упал/не распарсился")
-        return {"category": None, "label": None, "gender": "unknown"}
+        return {"category": None, "label": None, "gender": "unknown", "is_evaluation": False}
 
 
 async def classify_other_person(text: str) -> str | None:
@@ -386,7 +391,10 @@ async def classify_other_person(text: str) -> str | None:
 def other_person_note(label: str | None, gender: str | None) -> str:
     """Строка-подсказка для генерации вопросов/резюме: кто другой и в каком роде о нём говорить."""
     who = f"«{label}»" if label else "другой человек из ситуации"
-    if gender == "f":
+    if gender == "pl":
+        who = f"«{label}»" if label else "другие люди из ситуации"
+        rule = "их несколько — говори «они», «их», «должны были»; никогда не «этот человек» в единственном числе"
+    elif gender == "f":
         rule = "женский род — говори о ней «она», «её», «должна была»; никогда не «он»"
     elif gender == "m":
         rule = "мужской род — говори о нём «он», «его», «должен был»"
@@ -922,6 +930,29 @@ async def suggest_e_hint(event: str, narrative: str, answers: str) -> str:
     except Exception:  # noqa: BLE001
         logger.exception("suggest_e_hint упал")
         return ""
+
+
+SELF_OBSERVATION_SYSTEM = (
+    "Финал разбора. Даны ответы человека на вопрос, как ему теперь хочется реагировать, и на уточнение. "
+    "Назвал ли он в них что-то СОДЕРЖАТЕЛЬНОЕ о себе — свою особенность, неумение, паттерн, что в нём "
+    "остаётся неизменным («неумение отстаивать себя в конфликтах», «я всегда подстраиваюсь», «боюсь "
+    "показаться плохой»)? Если да — верни это ЕГО словами коротко, с маленькой буквы, без точки в "
+    "конце, от второго лица если нужно, без родовых форм о человеке. Если нет (пусто, «не знаю», "
+    "«ничего», только про другого человека) — верни ровно: NONE"
+)
+
+
+async def quote_self_observation(answer: str, followup_answer: str = "") -> str:
+    user_text = f"Ответ: {answer}\nОтвет на уточнение: {followup_answer}"
+    try:
+        result = await _ask_checked(
+            SELF_OBSERVATION_SYSTEM, user_text, MODEL_SONNET, max_tokens=100, max_questions=0, check_latin=False
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("quote_self_observation упал")
+        return ""
+    result = result.strip().strip("«»\"").rstrip(".")
+    return "" if "NONE" in result or not result else result
 
 
 E_FOLLOWUP_SYSTEM = (

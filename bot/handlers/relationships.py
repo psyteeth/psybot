@@ -53,6 +53,11 @@ Q_A = (
 Q_B = "Как бы тебе хотелось, чтобы было иначе — что другой человек должен был сделать по-другому?"
 # ТЗ-доп. №7, п.2: C — только реакция (чувство спрашивает следующий шаг C_feeling).
 Q_C = "Как ты реагируешь, когда так происходит?"
+Q_B_PLURAL = "Как бы тебе хотелось, чтобы было иначе — что они должны были сделать по-другому?"
+
+
+def _q_b(gender: str | None) -> str:
+    return Q_B_PLURAL if gender == "pl" else Q_B
 WRAP_TEXT = "Мы прошли уже много — давай подведём предварительный итог."
 # ТЗ-доп. №7, п.1/п.3/п.7: финал — ОДНО сообщение: отражение (или «ответ не находится») + ссылки + CTA.
 # «Ответ не находится» — только если на E/E_followup нет сдвига (llm.classify_e_has_shift).
@@ -67,6 +72,8 @@ DECLINE_D_TEXT = "Ок, как скажешь. Если захочешь вер�
 
 PRIOR_EVENT_QUESTION = "А что было до этого — может, чуть раньше что-то уже задело?"
 OTHER_PERSON_QUESTION = "А кто это для тебя?"
+OTHER_PERSON_REASK = "Понял. А кто он(а) тебе — коллега, сосед(ка), родственник, знакомый, незнакомый человек?"
+OTHER_PERSON_REASK_PLURAL = "Понял. А кто они тебе — коллеги, соседи, родственники, знакомые, незнакомые люди?"
 DISCOMFORT_BEFORE_Q = "Насколько тебе сейчас дискомфортно от этой ситуации, от 0 до 10?"
 DISCOMFORT_AFTER_Q = "И ещё раз, от 0 до 10: насколько тебе дискомфортно от этой ситуации сейчас?"
 DISCOMFORT_RETRY_TEXT = "Напиши, пожалуйста, просто число от 0 до 10."
@@ -139,6 +146,7 @@ INTEGRATION_TEXT = (
 _CHOICE_RE = re.compile(r"^\s*(?:(1|один|первое|первый|первый вариант)|(2|два|второе|второй|второй вариант))\s*[.!)]?\s*$", re.IGNORECASE)
 
 _PRONOUNS = {
+    "pl": {"he": "они", "bad": "плохие", "his": "их", "him": "них"},
     "m": {"he": "он", "bad": "плохой", "his": "его", "him": "нём"},
     "f": {"he": "она", "bad": "плохая", "his": "её", "him": "ней"},
     "unknown": {"he": "этот человек", "bad": "плохой", "his": "его", "him": "этом человеке"},
@@ -184,6 +192,10 @@ PARANOID_BOT_TEMPLATE = (
     "голос передаёт тебе: {punchline}"
 )
 FINAL_SHIFT_TEMPLATE = "Похоже, у тебя появилось: {quote}."
+FINAL_OBSERVATION_TEMPLATE = (
+    "Похоже, ты заметил(а) главное: {quote}. С этим и стоит работать дальше — это уже не про то, "
+    "как должны вести себя другие."
+)
 FINAL_HINT_ACCEPTED_TEXT = "Кажется, у тебя получилось найти новую реакцию."
 FINAL_NEXT_TIME_TEMPLATE = "В следующий раз в подобной ситуации ты можешь {insertion}"
 FINAL_LINKS_TEXT = (
@@ -372,7 +384,7 @@ async def _start_session(
     session_id = db.create_relationship_session(user.id, user.username)
     context.user_data["rel_session_id"] = session_id
     _reset_dozhim_state(context)
-    for key in ("rel_e_hint_offered", "rel_e_hint", "rel_pending_final"):
+    for key in ("rel_e_hint_offered", "rel_e_hint", "rel_pending_final", "rel_other_reasked"):
         context.user_data.pop(key, None)
     hostility.reset_session(context)
     # Живой кейс: на вопросе A нет способа выйти кроме /start — несколько раз подряд человек
@@ -625,7 +637,7 @@ async def _classify_or_ask_other_person(
             session_id, other_person=other["category"],
             other_person_label=other["label"], other_person_gender=other["gender"],
         )
-        await _send(update, context, session_id, "B", Q_B)
+        await _send(update, context, session_id, "B", _q_b(other["gender"]))
         return B_NARRATIVE
     await _send(update, context, session_id, "A_other", OTHER_PERSON_QUESTION)
     return A_OTHER_PERSON
@@ -686,11 +698,19 @@ async def _process_a_other_person(update: Update, context: ContextTypes.DEFAULT_
 
     await _bump_messages(session_id)
     other = await llm.classify_other_person_full(text)
+    if other["is_evaluation"] and not context.user_data.get("rel_other_reasked"):
+        # живой кейс 06.10: «2 проявленные сучки» вместо роли — оскорбление потом ушло в вопросы D и резюме
+        context.user_data["rel_other_reasked"] = True
+        question = OTHER_PERSON_REASK_PLURAL if other["gender"] == "pl" else OTHER_PERSON_REASK
+        await _send(update, context, session_id, "A_other", question, msg_type="уточнение")
+        return A_OTHER_PERSON
+    context.user_data.pop("rel_other_reasked", None)
+    label = None if other["is_evaluation"] else (other["label"] or text.strip()[:60])
     db.update_relationship_session(
         session_id, other_person=other["category"] or "другое",
-        other_person_label=other["label"] or text.strip()[:60], other_person_gender=other["gender"],
+        other_person_label=label, other_person_gender=other["gender"],
     )
-    await _send(update, context, session_id, "B", Q_B)
+    await _send(update, context, session_id, "B", _q_b(other["gender"]))
     return B_NARRATIVE
 
 
@@ -1309,6 +1329,8 @@ def _build_final_text(outcome: str, quote: str | None, insertion: str | None) ->
         parts = [FINAL_SHIFT_TEMPLATE.format(quote=html.escape(quote)) if quote else FINAL_HINT_ACCEPTED_TEXT]
         if insertion:
             parts.append(FINAL_NEXT_TIME_TEMPLATE.format(insertion=html.escape(insertion)))
+    elif outcome == "observation":
+        parts = [FINAL_OBSERVATION_TEMPLATE.format(quote=html.escape(quote or ""))]
     elif outcome == "wants_change":
         parts = [html.escape(E_WANTS_CHANGE_TEXT)]
     else:
@@ -1472,6 +1494,9 @@ async def _process_e_summary_correction(update: Update, context: ContextTypes.DE
     status = await hostility.precheck(
         update, context, branch="relationships", step="E_correction",
         bot_question="Что добавить или поправить?", text_override=text,
+        # живой кейс 06.10 (ValeryMozh): «…И получается, что мои желания в жопе» — главная мысль разбора —
+        # получила панчлайн про «бота-параноика». Поправка к резюме — всегда материал, не выпад.
+        skip_hostility=True,
     )
     if status == "crisis":
         await _close_after_hostility(update, context, session_id, "crisis")
@@ -1517,7 +1542,8 @@ async def _process_e_summary(update: Update, context: ContextTypes.DEFAULT_TYPE,
     await _log_turn(session_id, update.effective_user, "E", "человек", text)
 
     status = await hostility.precheck(
-        update, context, branch="relationships", step="E", bot_question=e_question, text_override=text
+        update, context, branch="relationships", step="E", bot_question=e_question, text_override=text,
+        skip_hostility=True,
     )
     if status == "crisis":
         await _close_after_hostility(update, context, session_id, "crisis")
@@ -1602,7 +1628,8 @@ async def _process_e_followup(update: Update, context: ContextTypes.DEFAULT_TYPE
     await _log_turn(session_id, update.effective_user, "E_followup", "человек", text)
 
     status = await hostility.precheck(
-        update, context, branch="relationships", step="E_followup", text_override=text
+        update, context, branch="relationships", step="E_followup", text_override=text,
+        skip_hostility=True,
     )
     if status == "crisis":
         await _close_after_hostility(update, context, session_id, "crisis")
@@ -1634,6 +1661,11 @@ async def _process_e_followup(update: Update, context: ContextTypes.DEFAULT_TYPE
     if shift["has_shift"]:
         return await _finish_e_with_shift(update, context, session_id, first_answer, text)
 
+    # живой кейс 06.10: «Неумение отстаивать себя в конфликтных ситуациях» — человек сам назвал суть,
+    # а финал был общим «формулировки пока нет». Наблюдение о себе отражаем его словами.
+    observation = await llm.quote_self_observation(first_answer, text)
+    if observation:
+        return await _finish_e(update, context, session_id, "observation", quote=observation)
     row = db.get_relationship_session(session_id)
     analysis = await llm.analyze_e_insight(row["a_event"], row["b_narrative_confirmed"], first_answer, text)
     outcome = "wants_change" if analysis.get("wants_change") else "no_change"
