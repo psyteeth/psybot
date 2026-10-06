@@ -603,8 +603,15 @@ D_ANSWER_CHECK_SYSTEM = (
     '- "answers_current": true — ответ по смыслу отвечает на ТЕКУЩИЙ вопрос (даже коротко: «да», '
     '«нет», «не знаю», число, если вопрос это допускает; даже если человек спорит или отвечает уклончиво).\n'
     '- "answers_previous": true — ответ по смыслу явно отвечает на ПРЕДЫДУЩИЙ вопрос, а не на текущий.\n'
-    "Если ответ подходит к обоим — answers_current=true. Ответь СТРОГО валидным JSON без markdown: "
-    '{"meta": "none", "answers_current": true, "answers_previous": false}.'
+    "Если ответ подходит к обоим — answers_current=true.\n"
+    # 06.10, решение автора (живой кейс ValeryMozh): «я не держусь за это», «я не требую от него, я от
+    # себя хочу другой реакции» — бот возвращает к исходному триггеру в другом человеке
+    '- "self_reaction": true — человек уводит разбор от другого человека к себе: говорит, что ни за '
+    'что не держится, ничего от другого не требует, что проблема только в его собственной реакции, '
+    'что хочет от себя другой реакции («я и не держусь за эту мысль», «я не требую от человека, я от '
+    'себя хочу другой реакции», «дело не в нём, дело во мне»).\n'
+    "Ответь СТРОГО валидным JSON без markdown: "
+    '{"meta": "none", "answers_current": true, "answers_previous": false, "self_reaction": false}.'
 )
 
 
@@ -621,10 +628,11 @@ async def check_d_answer(previous_question: str, current_question: str, text: st
             "meta": meta if meta in ("one_at_a_time", "not_understood") else "none",
             "answers_current": bool(data.get("answers_current", True)),
             "answers_previous": bool(data.get("answers_previous", False)),
+            "self_reaction": bool(data.get("self_reaction", False)),
         }
     except Exception:  # noqa: BLE001
         logger.exception("check_d_answer упал/не распарсился")
-        return {"meta": "none", "answers_current": True, "answers_previous": False}
+        return {"meta": "none", "answers_current": True, "answers_previous": False, "self_reaction": False}
 
 
 META_REQUEST_SYSTEM = (

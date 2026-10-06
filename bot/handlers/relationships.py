@@ -1040,6 +1040,13 @@ D_NEXT = {"1": "2", "2b": "3", "3": "3b", "3b": "4", "4": "4b", "4b": "5", "6": 
 D_ONE_AT_A_TIME_ACK = "Понял, по одному."
 D_NOT_UNDERSTOOD_ACK = "Скажу проще."
 D_PREVIOUS_ANSWER_ACK = "Похоже, это к прошлому вопросу — записал 👌 А теперь:"
+# 06.10, решение автора: когда человек уводит разбор к «я от себя хочу другой реакции», бот не
+# перестраивает разбор, а возвращает к исходной точке — к тому, что задело в другом.
+D_SELF_REACTION_TEMPLATE = (
+    "Слышу: хочется от себя другой реакции. Но работа с отношениями в Психостоматологии №1 "
+    "начинается с признания, что мне в другом что-то не нравится. Ты начал(а) с этого: «{event}». "
+    "Давай пока побудем с этим.\n\n{question}"
+)
 
 
 def _d_base_key(step: str) -> int | str:
@@ -1110,13 +1117,26 @@ async def _process_d_answer(
     previous_step = context.user_data.get("rel_d_prev_step")
     reasked = context.user_data.get("rel_d_reasked", False)
 
-    if current_q and not (step == "8" and context.user_data.get("rel_d8_reasked")):
+    # после напоминания про исходный триггер следующий ответ на этом шаге принимаем как есть —
+    # иначе человек, который спорит с формулировкой, ходит по кругу переспросов
+    already_reminded = context.user_data.get("rel_d_self_reminded_step") == step
+    if current_q and not already_reminded and not (step == "8" and context.user_data.get("rel_d8_reasked")):
         check = await llm.check_d_answer(previous_q, current_q, text)
         if check["meta"] != "none":
             # «задавай по одному» / «не поняла вопрос» — не выпад и не ответ: повторить проще, шаг не пропускать
             ack = D_ONE_AT_A_TIME_ACK if check["meta"] == "one_at_a_time" else D_NOT_UNDERSTOOD_ACK
             simpler = await llm.simplify_question(current_q)
             await _send(update, context, session_id, D_STEP_LOG[step], f"{ack} {simpler}", msg_type="уточнение")
+            return D_QUESTION
+        if check["self_reaction"] and context.user_data.get("rel_d_self_reminded_step") != step:
+            context.user_data["rel_d_self_reminded_step"] = step
+            event = (db.get_relationship_session(session_id)["a_event"] or "").strip().rstrip(".!…")
+            if len(event) > 160:
+                event = event[:157].rstrip() + "…"
+            await _send(
+                update, context, session_id, D_STEP_LOG[step],
+                D_SELF_REACTION_TEMPLATE.format(event=event, question=current_q), msg_type="уточнение",
+            )
             return D_QUESTION
         if not check["answers_current"] and check["answers_previous"] and previous_step in D_STEP_FIELDS:
             _store_d_answer(session_id, previous_step, text, append=True)
