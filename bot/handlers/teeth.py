@@ -347,6 +347,24 @@ async def confirm_tooth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     return await _accept_tooth(update, context, number, via_query=True)
 
 
+async def tooth_switch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    session_id = context.user_data["teeth_session_id"]
+    await query.answer()
+    await _log_turn(session_id, update.effective_user, "ask_scary", "человек", query.data, msg_type="кнопка")
+    choice = query.data.split(":", 1)[1]
+    if choice != "no" and int(choice) in VALID_TEETH_NUMBERS:
+        number = int(choice)
+        db.update_teeth_session(session_id, tooth_number=number)
+        text = f"Принято — {describe_tooth(number)} (зуб {number})."
+    else:
+        text = f"Хорошо, продолжаем с зубом {db.get_teeth_session(session_id)['tooth_number']}."
+    await query.edit_message_text(text)
+    await _log_turn(session_id, update.effective_user, "confirm_tooth", "бот", text)
+    await _send(update, context, session_id, "ask_scary", Q_SCARY)
+    return ASK_SCARY
+
+
 async def tooth_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Выбор одного зуба кнопкой из нескольких названных (ТЗ-доп. №7, п.9) — выбор явный, без сверки."""
     query = update.callback_query
@@ -394,6 +412,23 @@ async def _process_ask_scary(update: Update, context: ContextTypes.DEFAULT_TYPE,
         return ASK_SCARY
 
     await _log_turn(session_id, update.effective_user, "ask_scary", "человек", text)
+
+    # живой кейс 06.10 (vlad_smet): на вопрос про 26-й — «46 лучше». Другой номер зуба в ответе —
+    # спрашиваем, не переключиться ли, а не записываем это как «самое страшное».
+    current = db.get_teeth_session(session_id)["tooth_number"]
+    other_numbers = [int(n) for n in re.findall(r"(?<!\d)\d{2}(?!\d)", text) if int(n) in VALID_TEETH_NUMBERS and int(n) != current]
+    if other_numbers:
+        new_number = other_numbers[0]
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"Да, {new_number}-й", callback_data=f"tooth_switch:{new_number}"),
+            InlineKeyboardButton(f"Нет, продолжим с {current}-м", callback_data="tooth_switch:no"),
+        ]])
+        await _send(
+            update, context, session_id, "ask_scary",
+            f"Понял, хочешь разобрать {new_number}-й вместо {current}-го?", msg_type="уточнение", reply_markup=keyboard,
+        )
+        return ASK_SCARY
+
     db.update_teeth_session(session_id, scary_thing=text)
 
     subject = await llm.classify_diagnosis_subject(text)
@@ -531,7 +566,10 @@ conv_handler = ConversationHandler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, ask_tooth),
         ],
         CONFIRM_TOOTH: [CallbackQueryHandler(confirm_tooth, pattern="^tooth_confirm:")],
-        ASK_SCARY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_scary)],
+        ASK_SCARY: [
+            CallbackQueryHandler(tooth_switch, pattern="^tooth_switch:"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, ask_scary),
+        ],
         ASK_FEELING: [MessageHandler(filters.TEXT & ~filters.COMMAND, ask_feeling)],
         OTHER_REPLY: [MessageHandler(filters.TEXT & ~filters.COMMAND, other_reply)],
     },
