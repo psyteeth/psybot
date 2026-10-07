@@ -479,6 +479,15 @@ def _reset_dozhim_state(context: ContextTypes.DEFAULT_TYPE) -> None:
             context.user_data.pop(f"rel_dozhim_{step}_{suffix}", None)
 
 
+def _adds_detail(previous: str, text: str) -> bool:
+    """Новый ответ длиннее прошлого и приносит новые слова — человек объясняет, а не отмахивается."""
+    if re.search(r"не знаю|просто бесит|отстань|какая разница|сам[а]? думай|хз", text.lower()):
+        return False
+    prev_words = set(re.findall(r"\w+", previous.lower()))
+    new_words = [w for w in re.findall(r"\w+", text.lower()) if w not in prev_words]
+    return len(text.split()) > len(previous.split()) and len(new_words) >= 3
+
+
 async def _check_dozhim(
     update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, step: str, text: str
 ) -> object:
@@ -505,7 +514,15 @@ async def _check_dozhim(
         return None
 
     previous = context.user_data.get(answers_key, [])
-    effort = await llm.classify_dozhim_effort(step, previous, text) if attempts >= 1 else "trying"
+    # живой кейс 07.10: на шаблон бота человек ответил развёрнуто («бесит то, что она не считается с
+    # моими чувствами»), а модель сочла это отмахиванием — пришло «мозги не еби». Новый ответ, который
+    # длиннее прошлого и добавляет слова, — это «старается», без вопроса к модели.
+    if attempts == 0:
+        effort = "trying"
+    elif previous and _adds_detail(previous[-1], text):
+        effort = "trying"
+    else:
+        effort = await llm.classify_dozhim_effort(step, previous, text)
     context.user_data[answers_key] = previous + [text]
     attempts += 1
     context.user_data[attempts_key] = attempts

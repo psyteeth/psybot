@@ -218,6 +218,20 @@ async def test_10_no_duplicates():
     )
 
 
+async def test_11_dozhim_wife():
+    """Живой кейс 07.10: честные ответы про жену не должны получать «мозги не еби» и закрытие."""
+    SENT.clear()
+    sid = new_rel_session(a_event="", other_person_label="жена", other_person_gender="f")
+    ctx = fake_context({"rel_session_id": sid})
+    r1 = await rel._check_dozhim(fake_update(), ctx, sid, "A", "жена меня как-то расстраивает")
+    r2 = await rel._check_dozhim(fake_update(), ctx, sid, "A", "бесит то, что она не считается с моими чувствами")
+    texts = " ".join(m["text"] for m in SENT)
+    check(
+        "11. «не считается с моими чувствами» после переспроса — принят, без «мозги не еби»",
+        r1 == rel.A_EVENT and r2 is None and "мозги" not in texts, f"r1={r1}, r2={r2}",
+    )
+
+
 def test_3_one_question():
     bad = [m for m in SENT_ALL if m["text"].count("?") > 1]
     check("3. Ни одно сообщение бота не содержит больше одного «?»", not bad,
@@ -231,6 +245,7 @@ async def main():
     tests = [
         test_1_e_shift, test_2_e_empty, test_4_one_at_a_time, test_5_answer_to_previous,
         test_6_b_no_additions, test_7_single_final, test_8_teeth_his, test_9_two_teeth, test_10_no_duplicates,
+        test_11_dozhim_wife,
     ]
     for t in tests:
         try:
