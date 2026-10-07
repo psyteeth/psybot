@@ -326,6 +326,25 @@ REFORMULATE_SYSTEM = (
 )
 
 
+C_QUESTION_SYSTEM = (
+    "Шаг C разбора. Дано событие A — что человека бесит в другом. Сформулируй ОДИН вопрос: как он "
+    "реагирует, когда это происходит, — назвав само поведение другого, коротко, во втором лице "
+    "(«Как ты реагируешь, когда она не считается с твоими чувствами?», «Как ты реагируешь, когда "
+    "он повышает голос?»). Только реакция, без вопроса про чувства. Ответь только текстом вопроса."
+    + ONE_QUESTION_RULE + GENDER_NEUTRAL_RULE
+)
+
+
+async def generate_c_question(event: str, other: str = "") -> str:
+    if not event:
+        return ""
+    try:
+        return await _ask_checked(C_QUESTION_SYSTEM, f"{other}\nСобытие (A): {event}".lstrip(), MODEL_SONNET, max_tokens=120)
+    except Exception:  # noqa: BLE001
+        logger.exception("generate_c_question упал")
+        return ""
+
+
 async def reformulate_narrative(
     event: str, raw_narrative: str, correction: str | None = None, other: str = ""
 ) -> str:

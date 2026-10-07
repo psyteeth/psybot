@@ -57,7 +57,13 @@ Q_B_PLURAL = "Как бы тебе хотелось, чтобы было ина�
 
 
 def _q_b(gender: str | None) -> str:
-    return Q_B_PLURAL if gender == "pl" else Q_B
+    if gender == "pl":
+        return Q_B_PLURAL
+    if gender == "f":
+        return "Как бы тебе хотелось, чтобы было иначе — что она должна была сделать по-другому?"
+    if gender == "m":
+        return "Как бы тебе хотелось, чтобы было иначе — что он должен был сделать по-другому?"
+    return Q_B
 WRAP_TEXT = "Мы прошли уже много — давай подведём предварительный итог."
 # ТЗ-доп. №7, п.1/п.3/п.7: финал — ОДНО сообщение: отражение (или «ответ не находится») + ссылки + CTA.
 # «Ответ не находится» — только если на E/E_followup нет сдвига (llm.classify_e_has_shift).
@@ -826,7 +832,11 @@ async def _process_b_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if wrap_state is not None:
         return wrap_state
 
-    c_question = Q_C
+    # живой кейс 07.10: «Как ты реагируешь, когда так происходит?» сразу после сверки B читалось как
+    # «когда она учтива» — «когда как происходит?». Вопрос называет само событие из A.
+    row = db.get_relationship_session(session_id)
+    c_question = await llm.generate_c_question(row["a_event"], other=_other(row)) or Q_C
+    context.user_data["rel_c_question"] = c_question
     await _send(update, context, session_id, "C", c_question)
     return C_CONSEQUENCE
 
@@ -844,7 +854,7 @@ async def _process_c_consequence(update: Update, context: ContextTypes.DEFAULT_T
 
     status = await hostility.precheck(
         update, context, branch="relationships", step="C",
-        bot_question=Q_C,
+        bot_question=context.user_data.get("rel_c_question", Q_C),
         text_override=text,
     )
     if status == "crisis":
@@ -857,7 +867,7 @@ async def _process_c_consequence(update: Update, context: ContextTypes.DEFAULT_T
         return ConversationHandler.END
 
     count = await _bump_messages(session_id)
-    if await _maybe_meta_reask(update, context, session_id, "C", Q_C, text):
+    if await _maybe_meta_reask(update, context, session_id, "C", context.user_data.get("rel_c_question", Q_C), text):
         return C_CONSEQUENCE
     db.update_relationship_session(session_id, c_consequence=text)
 
