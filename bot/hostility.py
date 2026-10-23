@@ -217,6 +217,11 @@ async def _respond_hostile(update, context, branch: str, step: str, text: str, v
         hidden_need = result["hidden_need"]
         context.user_data["hostility_last_category"] = category
         await update.effective_message.reply_text(reply_text)
+        # 23.10: панчлайны раньше не попадали в «Диалоги» — разговор там выглядел так, будто бот молчал
+        await sheets_logger.append(
+            "Диалоги",
+            [db.now(), user.id, "", user.username or "", branch, "", step, "бот", reply_text[:2000], "панчлайн"],
+        )
 
         if streak == HOSTILITY_MAX_PUNCHLINES and ADMIN_CHAT_ID:
             try:

@@ -77,6 +77,14 @@ E_WANTS_CHANGE_TEXT = (
 DECLINE_D_TEXT = "Ок, как скажешь. Если захочешь вернуться — я здесь."
 
 PRIOR_EVENT_QUESTION = "А что было до этого — может, чуть раньше что-то уже задело?"
+TOOTH_QUESTION_RE = re.compile(r"зуб|\b[1-4][1-8]\b", re.IGNORECASE)
+TOOTH_QUESTION_IN_A_TEXT = (
+    "Любой зуб связан с ситуациями в общении, где тебе невыносимо тяжело психологически. С кем и с "
+    "какой ситуацией связан именно твой зуб, находят на диагностике — она бесплатная, записаться "
+    "можно у @psyteeth.\n\n"
+    "А здесь разбираем одну конкретную ситуацию. Опиши, что тебя бесит или задевает в поведении "
+    "другого человека."
+)
 OTHER_PERSON_QUESTION = "А кто это для тебя?"
 OTHER_PERSON_REASK = "Понял. А кто он(а) тебе — коллега, сосед(ка), родственник, знакомый, незнакомый человек?"
 OTHER_PERSON_REASK_PLURAL = "Понял. А кто они тебе — коллеги, соседи, родственники, знакомые, незнакомые люди?"
@@ -635,6 +643,13 @@ async def _process_a_event(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         return ConversationHandler.END
 
     await _bump_messages(session_id)
+
+    # 23.10 (krosman_k): вместо события — вопрос «За какие отношения отвечает 47 зуб?». Отвечаем по
+    # позиции автора, зовём на диагностику и возвращаем к вопросу A (не засчитываем как попытку дожима).
+    if "?" in text and TOOTH_QUESTION_RE.search(text):
+        await _send(update, context, session_id, "A", TOOTH_QUESTION_IN_A_TEXT, msg_type="уточнение")
+        return A_EVENT
+
     db.update_relationship_session(session_id, a_event=text)
 
     dozhim_state = await _check_dozhim(update, context, session_id, "A", text)
