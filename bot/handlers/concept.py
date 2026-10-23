@@ -541,6 +541,7 @@ async def _respond_deepen(
     similar_nums = await llm.pick_similar_author_answers(question, AUTHOR_ANSWERS)
     author_examples = [e for e in AUTHOR_ANSWERS if e["num"] in similar_nums]
     answer = await llm.answer_concept_question(question, context_text, author_examples, simple=False)
+    answer = _with_diagnostics_invite(raw_question, answer) if answer else answer
     if not answer:
         return await _respond_simple(update, context, raw_question, question, route, capped=False)
 
@@ -649,6 +650,21 @@ async def _respond_sources(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     return ASKING
 
 
+# 23.10, решение автора: на вопросы про кариес/разрушение/удаление/восстановление зуба бот всегда зовёт
+# на бесплатную диагностику (модель в простом режиме иногда съедала приглашение лимитом предложений).
+_TOOTH_FATE_RE = re.compile(
+    r"кариес|разруш|удал[яи]|сохранит|восстанов|отраст|ткан|имплант|корон|пломб|нерв|депульп|лечит|лечени",
+    re.IGNORECASE,
+)
+DIAGNOSTICS_INVITE_TEXT = "Приходи на бесплатную диагностику — записаться можно у @psyteeth."
+
+
+def _with_diagnostics_invite(question: str, answer: str) -> str:
+    if _TOOTH_FATE_RE.search(question) and "@psyteeth" not in answer:
+        return f"{answer}\n\n{DIAGNOSTICS_INVITE_TEXT}"
+    return answer
+
+
 async def _build_concept_context(question: str) -> str:
     """Нужный лист целиком + лучшие куски со всех листов + начало нарратива (в этом порядке —
     обрезка CONCEPT_CONTEXT_MAX_CHARS режет хвост, а не главное)."""
@@ -681,6 +697,7 @@ async def _respond_simple(
     similar_nums = await llm.pick_similar_author_answers(question, AUTHOR_ANSWERS)
     author_examples = [e for e in AUTHOR_ANSWERS if e["num"] in similar_nums]
     answer = await llm.answer_concept_question(question, context_text, author_examples, simple=True)
+    answer = _with_diagnostics_invite(raw_question, answer)
 
     if capped:
         readings = context.user_data.get("concept_last_readings", [])
