@@ -29,7 +29,7 @@ MODEL_SONNET = "claude-sonnet-5"
 MODEL_HAIKU = "claude-haiku-4-5-20251001"
 
 # --- Лимит сообщений внутри ОДНОГО разбора «Отношения» (не помесячный) ---
-LIMIT_RELATIONSHIP_MESSAGES = 40
+LIMIT_RELATIONSHIP_MESSAGES = 50  # 24.10: +стрела, тело, % веры, альтернатива
 
 # --- Ссылки и тексты ---
 DIAGNOSTICS_POST_URL = "https://t.me/psy_teeth_official/439"

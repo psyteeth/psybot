@@ -232,6 +232,35 @@ async def test_11_dozhim_wife():
     )
 
 
+async def test_12_abcde_additions():
+    """24.10, методичка ABCDE: стрела → C, тело → дискомфорт, % веры → D1, D6 → альтернатива → D7, карточка."""
+    SENT.clear()
+    sid = new_rel_session(other_person_label="жена", other_person_gender="f",
+                          a_event="бесит то, что она не считается с моими чувствами")
+    ctx = fake_context({"rel_session_id": sid})
+    s1 = await rel._process_arrow_worst(fake_update(), ctx, "что мои чувства ничего не значат")
+    s2 = await rel._process_arrow_self(fake_update(), ctx, "что я пустое место")
+    s3 = await rel._process_c_body(fake_update(), ctx, "сжимаю челюсть")
+    s4 = await rel._process_belief(fake_update(), ctx, "80", after=False)
+    row = db.get_relationship_session(sid)
+    await rel._ask_d(fake_update(), ctx, sid, "6")
+    await rel._process_d_answer(fake_update(), ctx, "от отца, у него было так")
+    step_after_6 = ctx.user_data["rel_d_step"]
+    await rel._process_d_answer(fake_update(), ctx, "может, она просто устала и не замечает")
+    step_after_alt = ctx.user_data["rel_d_step"]
+    db.update_relationship_session(sid, d8_semantic="становится спокойнее", e_summary="скажу ей прямо, что мне важно")
+    SENT.clear()
+    await rel._finish_e(fake_update(), ctx, sid, "insight", quote="желание сказать ей прямо, что мне важно")
+    final = SENT[-1]["text"] if SENT else ""
+    ok = (
+        s1 == rel.ARROW_SELF and s2 == rel.C_CONSEQUENCE and s3 == rel.C_DISCOMFORT and s4 == rel.D_QUESTION
+        and row["arrow_self"] == "что я пустое место" and row["c_body"] == "сжимаю челюсть" and row["belief_before"] == 80
+        and step_after_6 == "alt" and step_after_alt == "7a" and "Карточка на следующий раз" in final
+    )
+    check("12. Методичка ABCDE: стрела, тело, % веры, альтернатива, карточка", ok,
+          f"states={s1},{s2},{s3},{s4}; после D6→{step_after_6}, после alt→{step_after_alt}; карточка={'да' if 'Карточка' in final else 'нет'}")
+
+
 def test_3_one_question():
     bad = [m for m in SENT_ALL if m["text"].count("?") > 1]
     check("3. Ни одно сообщение бота не содержит больше одного «?»", not bad,
@@ -245,7 +274,7 @@ async def main():
     tests = [
         test_1_e_shift, test_2_e_empty, test_4_one_at_a_time, test_5_answer_to_previous,
         test_6_b_no_additions, test_7_single_final, test_8_teeth_his, test_9_two_teeth, test_10_no_duplicates,
-        test_11_dozhim_wife,
+        test_11_dozhim_wife, test_12_abcde_additions,
     ]
     for t in tests:
         try:

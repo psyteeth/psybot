@@ -64,7 +64,7 @@ RELATIONSHIP_STEP_TO_LABEL = {
     "D1": "D1", "D2": "D2", "D3": "D3", "D4": "D4",
     "D5": "D5", "D6": "D6", "D7": "D7", "D8": "D8",
     # ТЗ-доп. №7: подшаги D2b/D3b/D4b и D7 себе/другу — в строку своего шага
-    "D2b": "D2", "D3b": "D3", "D4b": "D4", "D7_self": "D7", "D7_friend": "D7",
+    "D2b": "D2", "D3b": "D3", "D4b": "D4", "D7_self": "D7", "D7_friend": "D7", "D_alt": "D6",
     "E_finish": "финал",
     "E_reflection": "отражение перед E",
     "E": "E",

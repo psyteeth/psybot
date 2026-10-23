@@ -183,6 +183,14 @@ MIGRATIONS = [
     "ALTER TABLE relationship_sessions ADD COLUMN d4b_cost TEXT",
     "ALTER TABLE relationship_sessions ADD COLUMN c_feeling TEXT",
     "ALTER TABLE relationship_sessions ADD COLUMN e_has_shift INTEGER",
+    # 24.10, методичка ABCDE: падающая стрела, тело, % веры, альтернативное объяснение, копинг-карточка
+    "ALTER TABLE relationship_sessions ADD COLUMN arrow_worst TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN arrow_self TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN c_body TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN belief_before INTEGER",
+    "ALTER TABLE relationship_sessions ADD COLUMN belief_after INTEGER",
+    "ALTER TABLE relationship_sessions ADD COLUMN d_alternative TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN coping_card TEXT",
 ]
 
 

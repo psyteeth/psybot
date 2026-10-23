@@ -44,7 +44,10 @@ logger = logging.getLogger(__name__)
     D5_QUESTION, D5_HUNDRED_FOLLOWUP, EXIT_INTENT_CLARIFY,
     INTRO_WAIT, POST_FLOW,
     D7_SELF, D7_FRIEND,
-) = range(22)
+    # 24.10, методичка ABCDE автора: «падающая стрела» после B, тело в C, % веры до/после D.
+    # Дописаны В КОНЕЦ — номера состояний persistent, существующие сдвигать нельзя.
+    ARROW_WORST, ARROW_SELF, C_BODY, BELIEF_BEFORE, BELIEF_AFTER,
+) = range(27)
 
 Q_A = (
     "Опиши событие или поведение другого человека, от которого тебе дискомфортно: "
@@ -65,6 +68,22 @@ def _q_b(gender: str | None) -> str:
         return "Как бы тебе хотелось, чтобы было иначе — что он должен был сделать по-другому?"
     return Q_B
 WRAP_TEXT = "Мы прошли уже много — давай подведём предварительный итог."
+# 24.10, методичка ABCDE: «падающая стрела» — от «должен» к тому, что это говорит о самом человеке
+# (это и есть триггер уебищности из модели); тело — мост «отношения → тело»; % веры — сдвиг точнее,
+# чем только дискомфорт.
+ARROW_WORST_Q = "Допустим, так и есть. Что в этом для тебя самое плохое?"
+ARROW_SELF_Q = "А что это говорит о тебе?"
+C_BODY_Q = "Где и как это ощущается в теле — например, в челюсти, в зубах, в груди, в животе?"
+BELIEF_RETRY_TEXT = "Напиши, пожалуйста, просто число от 0 до 100."
+_BELIEF_SUBJECT = {
+    "f": "она должна была", "m": "он должен был", "pl": "они должны были", "unknown": "этот человек должен был",
+}
+
+
+def _belief_question(row, after: bool = False) -> str:
+    subject = _BELIEF_SUBJECT.get(row["other_person_gender"] or "unknown", _BELIEF_SUBJECT["unknown"])
+    lead = "А сейчас насколько" if after else "Насколько"
+    return f"{lead} ты веришь, что {subject} поступить иначе, — от 0 до 100%?"
 # ТЗ-доп. №7, п.1/п.3/п.7: финал — ОДНО сообщение: отражение (или «ответ не находится») + ссылки + CTA.
 # «Ответ не находится» — только если на E/E_followup нет сдвига (llm.classify_e_has_shift).
 E_NO_INSIGHT_TEXT = "Похоже, сейчас ответ не находится — и это тоже нормально, не обязательно сразу."
@@ -292,6 +311,13 @@ def _row_for_sheets(row) -> list:
         row["d4b_cost"] or "",
         row["c_feeling"] or "",
         "" if row["e_has_shift"] is None else ("да" if row["e_has_shift"] else "нет"),
+        row["arrow_worst"] or "",
+        row["arrow_self"] or "",
+        row["c_body"] or "",
+        row["belief_before"] if row["belief_before"] is not None else "",
+        row["belief_after"] if row["belief_after"] is not None else "",
+        row["d_alternative"] or "",
+        row["coping_card"] or "",
     ]
 
 
@@ -598,6 +624,10 @@ async def _start_e_finale(update: Update, context: ContextTypes.DEFAULT_TYPE, se
     пара цитат выбиралась нестабильно и без рамки, иногда ухудшала состояние человека. Сразу
     переспрашивает дискомфорт (2.1), и только потом идёт Voss-резюме/подтверждение."""
     await analytics.log(context, update.effective_user.id, "step_D_done")
+    row = db.get_relationship_session(session_id)
+    if row["belief_before"] is not None:
+        await _send(update, context, session_id, "E_belief_after", _belief_question(row, after=True))
+        return BELIEF_AFTER
     await _send(update, context, session_id, "E_discomfort_after", DISCOMFORT_AFTER_Q)
     return E_DISCOMFORT_AFTER
 
@@ -847,6 +877,11 @@ async def _process_b_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if wrap_state is not None:
         return wrap_state
 
+    await _send(update, context, session_id, "B_arrow_worst", ARROW_WORST_Q)
+    return ARROW_WORST
+
+
+async def _ask_c(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> int:
     # живой кейс 07.10: «Как ты реагируешь, когда так происходит?» сразу после сверки B читалось как
     # «когда она учтива» — «когда как происходит?». Вопрос называет само событие из A.
     row = db.get_relationship_session(session_id)
@@ -854,6 +889,109 @@ async def _process_b_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
     context.user_data["rel_c_question"] = c_question
     await _send(update, context, session_id, "C", c_question)
     return C_CONSEQUENCE
+
+
+async def _text_step(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, *, step: str, question: str, state: int,
+) -> tuple[int, int | None]:
+    """Простой текстовый шаг: лог, кризис (выпады не проверяем — это материал разбора), счётчик,
+    «задавай по одному/не понял». Возвращает (session_id, состояние для раннего выхода или None)."""
+    session_id = context.user_data["rel_session_id"]
+    await _log_turn(session_id, update.effective_user, step, "человек", text)
+    status = await hostility.precheck(
+        update, context, branch="relationships", step=step, bot_question=question, text_override=text,
+        skip_hostility=True,
+    )
+    if status == "crisis":
+        await _close_after_hostility(update, context, session_id, "crisis")
+        return session_id, ConversationHandler.END
+    await _bump_messages(session_id)
+    if await _maybe_meta_reask(update, context, session_id, step, question, text):
+        return session_id, state
+    await _check_exit_intent(context, session_id, step, text)
+    return session_id, None
+
+
+async def arrow_worst(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_arrow_worst", conv_handler=conv_handler, state=ARROW_WORST,
+        process=lambda text: _process_arrow_worst(update, context, text),
+    )
+
+
+async def _process_arrow_worst(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    session_id, early = await _text_step(update, context, text, step="B_arrow_worst", question=ARROW_WORST_Q, state=ARROW_WORST)
+    if early is not None:
+        return early
+    db.update_relationship_session(session_id, arrow_worst=text)
+    await _send(update, context, session_id, "B_arrow_self", ARROW_SELF_Q)
+    return ARROW_SELF
+
+
+async def arrow_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_arrow_self", conv_handler=conv_handler, state=ARROW_SELF,
+        process=lambda text: _process_arrow_self(update, context, text),
+    )
+
+
+async def _process_arrow_self(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    session_id, early = await _text_step(update, context, text, step="B_arrow_self", question=ARROW_SELF_Q, state=ARROW_SELF)
+    if early is not None:
+        return early
+    db.update_relationship_session(session_id, arrow_self=text)
+    return await _ask_c(update, context, session_id)
+
+
+async def c_body(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_c_body", conv_handler=conv_handler, state=C_BODY,
+        process=lambda text: _process_c_body(update, context, text),
+    )
+
+
+async def _process_c_body(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    session_id, early = await _text_step(update, context, text, step="C_body", question=C_BODY_Q, state=C_BODY)
+    if early is not None:
+        return early
+    db.update_relationship_session(session_id, c_body=text)
+    await _send(update, context, session_id, "C_discomfort", DISCOMFORT_BEFORE_Q)
+    return C_DISCOMFORT
+
+
+async def _process_belief(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, *, after: bool) -> int:
+    state = BELIEF_AFTER if after else BELIEF_BEFORE
+    step = "E_belief_after" if after else "D_belief_before"
+    row = db.get_relationship_session(context.user_data["rel_session_id"])
+    session_id, early = await _text_step(update, context, text, step=step, question=_belief_question(row, after), state=state)
+    if early is not None:
+        return early
+    value = _parse_scale_100(text.replace("%", ""))
+    if value is None:
+        await _send(update, context, session_id, step, BELIEF_RETRY_TEXT, msg_type="уточнение")
+        return state
+    if after:
+        db.update_relationship_session(session_id, belief_after=value)
+        await _send(update, context, session_id, "E_discomfort_after", DISCOMFORT_AFTER_Q)
+        return E_DISCOMFORT_AFTER
+    db.update_relationship_session(session_id, belief_before=value)
+    for key in ("rel_d_step", "rel_d_cur_q", "rel_d_prev_q", "rel_d_prev_step", "rel_d_reasked", "rel_d8_reasked"):
+        context.user_data.pop(key, None)
+    return await _ask_d(update, context, session_id, "1")
+
+
+async def belief_before(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_belief_before", conv_handler=conv_handler, state=BELIEF_BEFORE,
+        process=lambda text: _process_belief(update, context, text, after=False),
+    )
+
+
+async def belief_after(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_belief_after", conv_handler=conv_handler, state=BELIEF_AFTER,
+        process=lambda text: _process_belief(update, context, text, after=True),
+    )
 
 
 async def c_consequence(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -936,8 +1074,8 @@ async def _process_c_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if wrap_state is not None:
         return wrap_state
 
-    await _send(update, context, session_id, "C_discomfort", DISCOMFORT_BEFORE_Q)
-    return C_DISCOMFORT
+    await _send(update, context, session_id, "C_body", C_BODY_Q)
+    return C_BODY
 
 
 async def c_discomfort(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1040,9 +1178,9 @@ async def _process_d_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
         context.user_data.pop("rel_session_id", None)
         return ConversationHandler.END
 
-    for key in ("rel_d_step", "rel_d_cur_q", "rel_d_prev_q", "rel_d_prev_step", "rel_d_reasked", "rel_d8_reasked"):
-        context.user_data.pop(key, None)
-    return await _ask_d(update, context, session_id, "1")
+    row = db.get_relationship_session(session_id)
+    await _send(update, context, session_id, "D_belief_before", _belief_question(row))
+    return BELIEF_BEFORE
 
 
 # B5 (ТЗ 01.10.2026): D8 — семантическая переформулировка «я бы предпочёл, чтобы...» — должна быть
@@ -1077,14 +1215,16 @@ async def _maybe_meta_reask(
 # разборов, начатых до деплоя). Ключ шага хранится в user_data["rel_d_step"].
 D_STEP_FIELDS = {
     "1": "d1_logical", "2": "d2_empirical", "2b": "d2_empirical", "3": "d3_pragmatic", "3b": "d3b_helps",
-    "4": "d4_hedonistic", "4b": "d4b_cost", "6": "d6_historical", "7a": "d7_self", "7b": "d7_friend",
+    "4": "d4_hedonistic", "4b": "d4b_cost", "6": "d6_historical", "alt": "d_alternative",
+    "7a": "d7_self", "7b": "d7_friend",
     "8": "d8_semantic",
 }
 D_STEP_LOG = {
     "1": "D1", "2": "D2", "2b": "D2b", "3": "D3", "3b": "D3b", "4": "D4", "4b": "D4b",
-    "6": "D6", "7a": "D7_self", "7b": "D7_friend", "8": "D8",
+    "6": "D6", "alt": "D_alt", "7a": "D7_self", "7b": "D7_friend", "8": "D8",
 }
-D_NEXT = {"1": "2", "2b": "3", "3": "3b", "3b": "4", "4": "4b", "4b": "5", "6": "7a", "7a": "7b", "7b": "8"}
+# 24.10, методичка ABCDE: диспут «альтернативное объяснение» — после D6
+D_NEXT = {"1": "2", "2b": "3", "3": "3b", "3b": "4", "4": "4b", "4b": "5", "6": "alt", "alt": "7a", "7a": "7b", "7b": "8"}
 D_ONE_AT_A_TIME_ACK = "Понял, по одному."
 D_NOT_UNDERSTOOD_ACK = "Скажу проще."
 D_PREVIOUS_ANSWER_ACK = "Похоже, это к прошлому вопросу — записал 👌 А теперь:"
@@ -1114,7 +1254,7 @@ async def _ask_d(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id:
     context.user_data["rel_d_prev_step"] = context.user_data.get("rel_d_step")
     context.user_data["rel_d_step"] = step
     context.user_data["rel_d_cur_q"] = question
-    context.user_data["rel_d_index"] = int(step[0])
+    context.user_data["rel_d_index"] = 6 if step == "alt" else int(step[0])
     context.user_data.pop("rel_d_reasked", None)
     await _send(update, context, session_id, D_STEP_LOG[step], question)
     return D_QUESTION
@@ -1391,11 +1531,22 @@ async def _complete_flow(update: Update, context: ContextTypes.DEFAULT_TYPE, ses
     return ConversationHandler.END
 
 
-def _build_final_text(outcome: str, quote: str | None, insertion: str | None) -> str:
+def _card_text(card: dict | None) -> str:
+    """24.10, методичка ABCDE: копинг-карточка «было → теперь → в следующий раз»."""
+    if not card:
+        return ""
+    lines = ["📌 <b>Карточка на следующий раз</b>", f"Было: {html.escape(card['was'])}", f"Теперь: {html.escape(card['now'])}"]
+    if card.get("next"):
+        lines.append(f"В следующий раз: {html.escape(card['next'])}")
+    return "\n".join(lines)
+
+
+def _build_final_text(outcome: str, quote: str | None, insertion: str | None, card: dict | None = None) -> str:
+    card_block = _card_text(card)
     if outcome == "insight":
         # quote нет, когда человек принял подсказку бота — тогда отражать нечего, только новая реакция
         parts = [FINAL_SHIFT_TEMPLATE.format(quote=html.escape(quote)) if quote else FINAL_HINT_ACCEPTED_TEXT]
-        if insertion:
+        if insertion and not (card and card.get("next")):
             parts.append(FINAL_NEXT_TIME_TEMPLATE.format(insertion=html.escape(insertion)))
     elif outcome == "observation":
         parts = [FINAL_OBSERVATION_TEMPLATE.format(quote=html.escape(quote or ""))]
@@ -1403,6 +1554,8 @@ def _build_final_text(outcome: str, quote: str | None, insertion: str | None) ->
         parts = [html.escape(E_WANTS_CHANGE_TEXT)]
     else:
         parts = [html.escape(E_NO_INSIGHT_TEXT)]
+    if card_block:
+        parts.append(card_block)
     return "\n\n".join(parts + [FINAL_LINKS_TEXT, html.escape(FINAL_CTA_TEXT)])
 
 
@@ -1423,7 +1576,18 @@ async def _finish_e(
     если сработала, — ДО финала, а финал — одно сообщение со ссылками и CTA."""
     db.finish_relationship_session(session_id, exit_step="E")
     db.update_relationship_session(session_id, e_outcome=outcome, e_has_shift=1 if outcome == "insight" else 0)
-    final_text = _build_final_text(outcome, quote, insertion)
+    card = None
+    if outcome != "no_change":
+        row = db.get_relationship_session(session_id)
+        card = await llm.build_coping_card(
+            row["b_narrative_confirmed"] or "", row["d8_semantic"] or "", row["e_summary"] or "",
+            quote or insertion or "",
+        )
+        if card:
+            db.update_relationship_session(
+                session_id, coping_card=" | ".join(f"{k}: {v}" for k, v in card.items() if v),
+            )
+    final_text = _build_final_text(outcome, quote, insertion, card)
 
     # «Избегание или интеграция» (ТЗ-доп. №5, раздел 2) — если хоть раз сработало на C-D8/E,
     # сначала ещё один обмен, финал уходит вместе с ответом на него. Лог в Sheets откладывается до
@@ -1508,12 +1672,20 @@ async def _process_exit_intent_clarify(update: Update, context: ContextTypes.DEF
 async def _send_summary_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> int:
     row = db.get_relationship_session(session_id)
     d_answers = {f"D{i}": row[D_FIELDS[i]] for i in D_FIELDS}
+    d_answers["D_alt"] = row["d_alternative"]
     d_answers["D3b"] = row["d3b_helps"]
     d_answers["D4b"] = row["d4b_cost"]
     d_answers["D7_себе"] = row["d7_self"]
     d_answers["D7_другу"] = row["d7_friend"]
+    consequence = row["c_consequence"] or ""
+    if row["c_body"]:
+        consequence += f"\nВ теле: {row['c_body']}"
+    if row["arrow_worst"]:
+        consequence += f"\nСамое плохое в этом: {row['arrow_worst']}"
+    if row["arrow_self"]:
+        consequence += f"\nЧто это говорит о нём самом: {row['arrow_self']}"
     summary = await llm.generate_session_summary(
-        row["a_event"], row["b_narrative_confirmed"], row["c_consequence"], d_answers,
+        row["a_event"], row["b_narrative_confirmed"], consequence, d_answers,
         discomfort_before=row["discomfort_before"], discomfort_after=row["discomfort_after"],
         other=_other(row),
     )
@@ -1769,6 +1941,11 @@ conv_handler = ConversationHandler(
         D5_HUNDRED_FOLLOWUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, d5_hundred_followup)],
         D7_SELF: [MessageHandler(filters.TEXT & ~filters.COMMAND, d7_self)],
         D7_FRIEND: [MessageHandler(filters.TEXT & ~filters.COMMAND, d7_friend)],
+        ARROW_WORST: [MessageHandler(filters.TEXT & ~filters.COMMAND, arrow_worst)],
+        ARROW_SELF: [MessageHandler(filters.TEXT & ~filters.COMMAND, arrow_self)],
+        C_BODY: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_body)],
+        BELIEF_BEFORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, belief_before)],
+        BELIEF_AFTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, belief_after)],
         E_DISCOMFORT_AFTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_discomfort_after)],
         E_SUMMARY_CONFIRM: [CallbackQueryHandler(e_summary_confirm, pattern="^e_confirm:")],
         E_SUMMARY_CORRECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_summary_correction)],
