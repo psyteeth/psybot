@@ -195,6 +195,7 @@ MIGRATIONS = [
     "ALTER TABLE relationship_sessions ADD COLUMN core_belief TEXT",
     "ALTER TABLE relationship_sessions ADD COLUMN core_category TEXT",
     "ALTER TABLE teeth_sessions ADD COLUMN core_category TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN a_fact TEXT",
 ]
 
 

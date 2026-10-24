@@ -47,7 +47,9 @@ logger = logging.getLogger(__name__)
     # 24.10, методичка ABCDE автора: «падающая стрела» после B, тело в C, % веры до/после D.
     # Дописаны В КОНЕЦ — номера состояний persistent, существующие сдвигать нельзя.
     ARROW_WORST, ARROW_SELF, C_BODY, BELIEF_BEFORE, BELIEF_AFTER,
-) = range(27)
+    # 24.10, карта СМЭР: «как сняла бы видеокамера» — отделить факт от интерпретации
+    A_FACT,
+) = range(28)
 
 Q_A = (
     "Опиши событие или поведение другого человека, от которого тебе дискомфортно: "
@@ -113,6 +115,10 @@ TOOTH_QUESTION_IN_A_TEXT = (
     "можно у @psyteeth.\n\n"
     "А здесь разбираем одну конкретную ситуацию. Опиши, что тебя бесит или задевает в поведении "
     "другого человека."
+)
+A_FACT_Q = (
+    "Понял. А что при этом происходило буквально — какие слова прозвучали, что было сделано? "
+    "Опиши так, как это сняла бы видеокамера."
 )
 OTHER_PERSON_QUESTION = "А кто это для тебя?"
 OTHER_PERSON_REASK = "Понял. А кто он(а) тебе — коллега, сосед(ка), родственник, знакомый, незнакомый человек?"
@@ -262,6 +268,14 @@ D_FIELDS = {
 }
 
 
+def _event_text(row) -> str:
+    """Событие A для генераций: формулировка человека + факт «как сняла бы камера», если уточняли."""
+    event = row["a_event"] or ""
+    if row["a_fact"]:
+        event += f"\nФакт (что буквально произошло): {row['a_fact']}"
+    return event
+
+
 def _other(row) -> str:
     """Кто другой и в каком роде о нём говорить — для всех генераций (вопросы D, резюме, E)."""
     return llm.other_person_note(row["other_person_label"], row["other_person_gender"])
@@ -330,6 +344,7 @@ def _row_for_sheets(row) -> list:
         row["coping_card"] or "",
         row["core_belief"] or "",
         row["core_category"] or "",
+        row["a_fact"] or "",
     ]
 
 
@@ -614,7 +629,7 @@ async def _check_dozhim(
 
 async def _ask_e_question(context: ContextTypes.DEFAULT_TYPE, session_id: int) -> str:
     row = db.get_relationship_session(session_id)
-    question = await llm.generate_e_question(row["a_event"], row["b_narrative_confirmed"], other=_other(row))
+    question = await llm.generate_e_question(_event_text(row), row["b_narrative_confirmed"], other=_other(row))
     context.user_data["rel_e_question"] = question
     return question
 
@@ -699,6 +714,16 @@ async def _process_a_event(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     if dozhim_state is not None:
         return dozhim_state
 
+    # 24.10, карта СМЭР: «Он придрался» — интерпретация, она уйдёт в мысли; само событие — то, что
+    # сняла бы камера. Один вопрос, любой ответ принимается.
+    if await llm.is_interpretation(text):
+        await _send(update, context, session_id, "A_fact", A_FACT_Q)
+        return A_FACT
+
+    return await _after_a(update, context, session_id, text)
+
+
+async def _after_a(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, text: str) -> int:
     await analytics.log(context, update.effective_user.id, "step_A_done", {"len": len(text)})
 
     if ENABLE_PRIOR_EVENT_QUESTION:
@@ -706,6 +731,21 @@ async def _process_a_event(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         return A_PRIOR_EVENT
 
     return await _classify_or_ask_other_person(update, context, session_id)
+
+
+async def a_fact(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_a_fact", conv_handler=conv_handler, state=A_FACT,
+        process=lambda text: _process_a_fact(update, context, text),
+    )
+
+
+async def _process_a_fact(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    session_id, early = await _text_step(update, context, text, step="A_fact", question=A_FACT_Q, state=A_FACT)
+    if early is not None:
+        return early
+    db.update_relationship_session(session_id, a_fact=text)
+    return await _after_a(update, context, session_id, db.get_relationship_session(session_id)["a_event"])
 
 
 async def _classify_or_ask_other_person(
@@ -839,7 +879,7 @@ async def _process_b_narrative(update: Update, context: ContextTypes.DEFAULT_TYP
     if other["gender"] in ("f", "m", "pl") and other["gender"] != row["other_person_gender"]:
         db.update_relationship_session(session_id, other_person_gender=other["gender"])
         row = db.get_relationship_session(session_id)
-    reformulated = await llm.reformulate_narrative(row["a_event"], text, other=_other(row))
+    reformulated = await llm.reformulate_narrative(_event_text(row), text, other=_other(row))
     context.user_data["rel_pending_narrative"] = reformulated
     await _send(update, context, session_id, "B_confirm", reformulated)
     return B_CONFIRM
@@ -876,7 +916,7 @@ async def _process_b_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if verdict == "correct":
         row = db.get_relationship_session(session_id)
         reformulated = await llm.reformulate_narrative(
-            row["a_event"], context.user_data["rel_raw_narrative"], correction=text, other=_other(row)
+            _event_text(row), context.user_data["rel_raw_narrative"], correction=text, other=_other(row)
         )
         context.user_data["rel_pending_narrative"] = reformulated
         await _send(update, context, session_id, "B_confirm", reformulated)
@@ -898,7 +938,7 @@ async def _ask_c(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id:
     # живой кейс 07.10: «Как ты реагируешь, когда так происходит?» сразу после сверки B читалось как
     # «когда она учтива» — «когда как происходит?». Вопрос называет само событие из A.
     row = db.get_relationship_session(session_id)
-    c_question = await llm.generate_c_question(row["a_event"], other=_other(row)) or Q_C
+    c_question = await llm.generate_c_question(_event_text(row), other=_other(row)) or Q_C
     context.user_data["rel_c_question"] = c_question
     await _send(update, context, session_id, "C", c_question)
     return C_CONSEQUENCE
@@ -1162,7 +1202,7 @@ async def _process_c_discomfort(update: Update, context: ContextTypes.DEFAULT_TY
 
     row = db.get_relationship_session(session_id)
     advice = await llm.generate_i_would_advice(
-        row["a_event"], row["b_narrative_confirmed"], row["c_consequence"], other=_other(row)
+        _event_text(row), row["b_narrative_confirmed"], row["c_consequence"], other=_other(row)
     )
     await _send(update, context, session_id, "D_confirm", advice)
     context.user_data["rel_d_offer_text"] = advice
@@ -1625,7 +1665,7 @@ async def _finish_e(
     if context.user_data.get("exit_intent_flagged"):
         context.user_data["rel_pending_final"] = final_text
         row = db.get_relationship_session(session_id)
-        behavior = await llm.extract_disowned_behavior(row["a_event"], row["b_narrative_confirmed"])
+        behavior = await llm.extract_disowned_behavior(_event_text(row), row["b_narrative_confirmed"])
         context.user_data["exit_intent_behavior"] = behavior
         question = EXIT_INTENT_STEP1_TEMPLATE.format(**behavior, **_pronouns(row))
         await _send(update, context, session_id, "exit_intent_check", question)
@@ -1715,7 +1755,7 @@ async def _send_summary_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     if row["arrow_self"]:
         consequence += f"\nЧто это говорит о нём самом: {row['arrow_self']}"
     summary = await llm.generate_session_summary(
-        row["a_event"], row["b_narrative_confirmed"], consequence, d_answers,
+        _event_text(row), row["b_narrative_confirmed"], consequence, d_answers,
         discomfort_before=row["discomfort_before"], discomfort_after=row["discomfort_after"],
         other=_other(row),
     )
@@ -1793,7 +1833,7 @@ async def _process_e_summary_correction(update: Update, context: ContextTypes.DE
     await _check_exit_intent(context, session_id, "E_correction", text)
 
     narrative_with_correction = f"{row['b_narrative_confirmed']}\n(поправка от пользователя: {text})"
-    e_question = await llm.generate_e_question(row["a_event"], narrative_with_correction, other=_other(row))
+    e_question = await llm.generate_e_question(_event_text(row), narrative_with_correction, other=_other(row))
     context.user_data["rel_e_question"] = e_question
     await _send(update, context, session_id, "E", e_question)
     return E_SUMMARY
@@ -1862,7 +1902,7 @@ async def _maybe_offer_hint(update: Update, context: ContextTypes.DEFAULT_TYPE, 
             ("D7 себе", "d7_self"), ("D7 другу", "d7_friend"), ("D8", "d8_semantic"),
         ) if row[field]
     )
-    hint = await llm.suggest_e_hint(row["a_event"], row["b_narrative_confirmed"], answers)
+    hint = await llm.suggest_e_hint(_event_text(row), row["b_narrative_confirmed"], answers)
     if not hint:
         return False
     context.user_data["rel_e_hint_offered"] = True
@@ -1877,7 +1917,7 @@ async def _finish_e_with_shift(
     update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, first_answer: str, latest: str
 ) -> int:
     row = db.get_relationship_session(session_id)
-    analysis = await llm.analyze_e_insight(row["a_event"], row["b_narrative_confirmed"], first_answer, latest)
+    analysis = await llm.analyze_e_insight(_event_text(row), row["b_narrative_confirmed"], first_answer, latest)
     if first_answer:
         quote = await llm.quote_e_shift(first_answer, latest)
     else:
@@ -1937,7 +1977,7 @@ async def _process_e_followup(update: Update, context: ContextTypes.DEFAULT_TYPE
     if observation:
         return await _finish_e(update, context, session_id, "observation", quote=observation)
     row = db.get_relationship_session(session_id)
-    analysis = await llm.analyze_e_insight(row["a_event"], row["b_narrative_confirmed"], first_answer, text)
+    analysis = await llm.analyze_e_insight(_event_text(row), row["b_narrative_confirmed"], first_answer, text)
     outcome = "wants_change" if analysis.get("wants_change") else "no_change"
     return await _finish_e(update, context, session_id, outcome)
 
@@ -1976,6 +2016,7 @@ conv_handler = ConversationHandler(
         C_BODY: [MessageHandler(filters.TEXT & ~filters.COMMAND, c_body)],
         BELIEF_BEFORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, belief_before)],
         BELIEF_AFTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, belief_after)],
+        A_FACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, a_fact)],
         E_DISCOMFORT_AFTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_discomfort_after)],
         E_SUMMARY_CONFIRM: [CallbackQueryHandler(e_summary_confirm, pattern="^e_confirm:")],
         E_SUMMARY_CORRECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_summary_correction)],
