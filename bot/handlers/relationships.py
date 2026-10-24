@@ -73,6 +73,16 @@ WRAP_TEXT = "Мы прошли уже много — давай подведём
 # чем только дискомфорт.
 ARROW_WORST_Q = "Допустим, так и есть. Что в этом для тебя самое плохое?"
 ARROW_SELF_Q = "А что это говорит о тебе?"
+# карта СМЭР: вопросы техники чередовать; остановка — когда прозвучало высказывание о себе в целом
+ARROW_MORE_QS = [
+    "Если это правда, характеризует ли это тебя как-то?",
+    "Делаешь ли ты в этот момент какие-то выводы о себе?",
+]
+VAGUE_FEELING_RE = re.compile(
+    r"^\s*(плохо|очень плохо|никак|нормально|хреново|херово|паршиво|фигово|так себе|не очень|не знаю|хз)\W*$",
+    re.IGNORECASE,
+)
+VAGUE_FEELING_Q = "Если одним словом — это больше тревога, гнев, стыд, обида, печаль или вина?"
 C_BODY_Q = "Где и как это ощущается в теле — например, в челюсти, в зубах, в груди, в животе?"
 BELIEF_RETRY_TEXT = "Напиши, пожалуйста, просто число от 0 до 100."
 _BELIEF_SUBJECT = {
@@ -318,6 +328,8 @@ def _row_for_sheets(row) -> list:
         row["belief_after"] if row["belief_after"] is not None else "",
         row["d_alternative"] or "",
         row["coping_card"] or "",
+        row["core_belief"] or "",
+        row["core_category"] or "",
     ]
 
 
@@ -424,7 +436,8 @@ async def _start_session(
     session_id = db.create_relationship_session(user.id, user.username)
     context.user_data["rel_session_id"] = session_id
     _reset_dozhim_state(context)
-    for key in ("rel_e_hint_offered", "rel_e_hint", "rel_pending_final", "rel_other_reasked"):
+    for key in ("rel_e_hint_offered", "rel_e_hint", "rel_pending_final", "rel_other_reasked", "rel_arrow_n",
+                "rel_feeling_named"):
         context.user_data.pop(key, None)
     hostility.reset_session(context)
     # Живой кейс: на вопросе A нет способа выйти кроме /start — несколько раз подряд человек
@@ -936,10 +949,21 @@ async def arrow_self(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _process_arrow_self(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
-    session_id, early = await _text_step(update, context, text, step="B_arrow_self", question=ARROW_SELF_Q, state=ARROW_SELF)
+    n = context.user_data.get("rel_arrow_n", 0)
+    question = ARROW_SELF_Q if n == 0 else ARROW_MORE_QS[min(n - 1, len(ARROW_MORE_QS) - 1)]
+    session_id, early = await _text_step(update, context, text, step="B_arrow_self", question=question, state=ARROW_SELF)
     if early is not None:
         return early
-    db.update_relationship_session(session_id, arrow_self=text)
+    row = db.get_relationship_session(session_id)
+    chain = f"{row['arrow_self']} → {text}" if row["arrow_self"] else text
+    db.update_relationship_session(session_id, arrow_self=chain)
+    if n < len(ARROW_MORE_QS) and not await llm.is_self_statement(text):
+        context.user_data["rel_arrow_n"] = n + 1
+        await _send(update, context, session_id, "B_arrow_self", ARROW_MORE_QS[n])
+        return ARROW_SELF
+    context.user_data.pop("rel_arrow_n", None)
+    core = await llm.classify_core_belief(f"Самое плохое: {row['arrow_worst']}\nО себе: {chain}")
+    db.update_relationship_session(session_id, core_belief=core["belief"], core_category=core["category"])
     return await _ask_c(update, context, session_id)
 
 
@@ -1064,6 +1088,12 @@ async def _process_c_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE,
     count = await _bump_messages(session_id)
     if await _maybe_meta_reask(update, context, session_id, "C_feeling", feeling_question, text):
         return C_FEELING
+    # карта СМЭР: «плохо», «никак» — не эмоция; один раз предлагаем назвать одним словом
+    if VAGUE_FEELING_RE.match(text) and not context.user_data.get("rel_feeling_named"):
+        context.user_data["rel_feeling_named"] = True
+        await _send(update, context, session_id, "C_feeling", VAGUE_FEELING_Q, msg_type="уточнение")
+        return C_FEELING
+    context.user_data.pop("rel_feeling_named", None)
     row = db.get_relationship_session(session_id)
     combined_consequence = f"{row['c_consequence']}\nЧувство: {text}"
     db.update_relationship_session(session_id, c_consequence=combined_consequence, c_feeling=text)

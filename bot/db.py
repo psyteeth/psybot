@@ -191,6 +191,10 @@ MIGRATIONS = [
     "ALTER TABLE relationship_sessions ADD COLUMN belief_after INTEGER",
     "ALTER TABLE relationship_sessions ADD COLUMN d_alternative TEXT",
     "ALTER TABLE relationship_sessions ADD COLUMN coping_card TEXT",
+    # 24.10, рабочая карта СМЭР: центральное убеждение и его категория (гипотеза, клиенту не показывается)
+    "ALTER TABLE relationship_sessions ADD COLUMN core_belief TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN core_category TEXT",
+    "ALTER TABLE teeth_sessions ADD COLUMN core_category TEXT",
 ]
 
 

@@ -204,6 +204,7 @@ def _fetch_teeth_row(session_id: int) -> list:
         "да" if row["acute_symptoms"] else "нет",
         "да" if row["completed"] else "нет",
         _dialogue_session_id(row),
+        row["core_category"] or "",
     ]
 
 
@@ -529,6 +530,9 @@ async def finish_with_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not answers or answers[-1] != text:
         answers.append(text)  # ответ пришёл не через ask_feeling (из «Концепции»)
     db.update_teeth_session(session_id, feeling_word=" / ".join(answers))
+    # 24.10, карта СМЭР: «Я…» в «Зубах» — по сути центральное убеждение; категория — для аналитики
+    core = await llm.classify_core_belief("О себе: " + " / ".join(answers))
+    db.update_teeth_session(session_id, core_category=core["category"])
     db.finish_teeth_session(session_id, completed=True)
     await sheets_logger.append("Зубы", _fetch_teeth_row(session_id))
     insert = await llm.normalize_feeling_insert(answers)
