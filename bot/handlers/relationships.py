@@ -78,7 +78,7 @@ WRAP_TEXT = "Мы прошли уже много — давай подведём
 # 24.10, методичка ABCDE: «падающая стрела» — от «должен» к тому, что это говорит о самом человеке
 # (это и есть триггер уебищности из модели); тело — мост «отношения → тело»; % веры — сдвиг точнее,
 # чем только дискомфорт.
-ARROW_WORST_Q = "Допустим, так и есть. Что в этом для тебя самое плохое?"
+ARROW_WORST_Q = "Допустим, это так и останется. Что в этом для тебя самое плохое?"
 ARROW_SELF_Q = "А что это говорит о тебе?"
 # карта СМЭР: вопросы техники чередовать; остановка — когда прозвучало высказывание о себе в целом
 ARROW_MORE_QS = [
@@ -1086,7 +1086,10 @@ async def _process_b_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if wrap_state is not None:
         return wrap_state
 
-    await _send(update, context, session_id, "B_arrow_worst", ARROW_WORST_Q)
+    row = db.get_relationship_session(session_id)
+    arrow_q = await llm.generate_arrow_question(_event_text(row), other=_other(row)) or ARROW_WORST_Q
+    context.user_data["rel_arrow_worst_q"] = arrow_q
+    await _send(update, context, session_id, "B_arrow_worst", arrow_q)
     return ARROW_WORST
 
 
@@ -1129,7 +1132,8 @@ async def arrow_worst(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _process_arrow_worst(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
-    session_id, early = await _text_step(update, context, text, step="B_arrow_worst", question=ARROW_WORST_Q, state=ARROW_WORST)
+    question = context.user_data.get("rel_arrow_worst_q", ARROW_WORST_Q)
+    session_id, early = await _text_step(update, context, text, step="B_arrow_worst", question=question, state=ARROW_WORST)
     if early is not None:
         return early
     db.update_relationship_session(session_id, arrow_worst=text)
