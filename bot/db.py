@@ -196,6 +196,9 @@ MIGRATIONS = [
     "ALTER TABLE relationship_sessions ADD COLUMN core_category TEXT",
     "ALTER TABLE teeth_sessions ADD COLUMN core_category TEXT",
     "ALTER TABLE relationship_sessions ADD COLUMN a_fact TEXT",
+    # 25.10: единый разбор — объект «зуб» или «человек»
+    "ALTER TABLE relationship_sessions ADD COLUMN object_type TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN tooth_number INTEGER",
 ]
 
 
@@ -270,7 +273,11 @@ def count_relationship_sessions(user_id: int) -> int:
 
 
 def count_relationship_sessions_this_month(user_id: int) -> int:
-    query = "SELECT COUNT(*) AS c FROM relationship_sessions WHERE user_id=? AND started_at>=?"
+    # 25.10: разбор зуба в общем движке считается в лимит «Зубы», а не «Отношения»
+    query = (
+        "SELECT COUNT(*) AS c FROM relationship_sessions WHERE user_id=? AND started_at>=? "
+        "AND (object_type IS NULL OR object_type != 'tooth')"
+    )
     params: list = [user_id, _month_start_iso()]
     if not COUNT_SELF_REFUSED_TOWARD_LIMIT:
         # разбор, закрытый отказом («запрос на себя», ТЗ-доп. №3) по сути не начался —
@@ -365,7 +372,12 @@ def count_teeth_sessions_this_month(user_id: int) -> int:
             "SELECT COUNT(*) AS c FROM teeth_sessions WHERE user_id=? AND started_at>=?",
             (user_id, _month_start_iso()),
         ).fetchone()
-        return row["c"]
+        unified = conn.execute(
+            "SELECT COUNT(*) AS c FROM relationship_sessions WHERE user_id=? AND started_at>=? "
+            "AND object_type='tooth'",
+            (user_id, _month_start_iso()),
+        ).fetchone()
+        return row["c"] + unified["c"]
 
 
 def create_teeth_session(user_id: int, username: Optional[str]) -> int:

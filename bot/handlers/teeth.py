@@ -563,7 +563,9 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 conv_handler = ConversationHandler(
-    entry_points=[CallbackQueryHandler(entry, pattern="^menu:teeth$")],
+    # 25.10: новые разборы зуба идут через общий движок (relationships.py, menu:teeth/menu:analysis);
+    # здесь остаются только состояния для разборов, начатых до этого.
+    entry_points=[],
     states={
         ASK_TOOTH: [
             CallbackQueryHandler(tooth_pick, pattern="^tooth_pick:"),

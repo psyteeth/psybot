@@ -23,7 +23,10 @@ from bot.config import (
     LIMIT_RELATIONSHIP_MESSAGES,
     RELATIONSHIP_LIMIT_TEXT,
     ROADMAP_URL,
+    TEETH_CHART_PATH,
     TESTS_URL,
+    VALID_TEETH_NUMBERS,
+    limit_exhausted_text,
 )
 from bot.keyboards import back_to_menu_keyboard, menu_and_teeth_keyboard
 from bot.sheets import sheets_logger
@@ -49,7 +52,9 @@ logger = logging.getLogger(__name__)
     ARROW_WORST, ARROW_SELF, C_BODY, BELIEF_BEFORE, BELIEF_AFTER,
     # 24.10, карта СМЭР: «как сняла бы видеокамера» — отделить факт от интерпретации
     A_FACT,
-) = range(28)
+    # 25.10: единый разбор — «С чем работаем?» → зуб (номер, подтверждение) или человек («с кем?»)
+    OBJECT_CHOICE, TOOTH_ASK, TOOTH_CONFIRM, WHO_FIRST,
+) = range(32)
 
 Q_A = (
     "Опиши событие или поведение другого человека, от которого тебе дискомфортно: "
@@ -93,8 +98,10 @@ _BELIEF_SUBJECT = {
 
 
 def _belief_question(row, after: bool = False) -> str:
-    subject = _BELIEF_SUBJECT.get(row["other_person_gender"] or "unknown", _BELIEF_SUBJECT["unknown"])
     lead = "А сейчас насколько" if after else "Насколько"
+    if (row["object_type"] or "") == "tooth":
+        return f"{lead} ты веришь, что зуб должен быть другим, — от 0 до 100%?"
+    subject = _BELIEF_SUBJECT.get(row["other_person_gender"] or "unknown", _BELIEF_SUBJECT["unknown"])
     return f"{lead} ты веришь, что {subject} поступить иначе, — от 0 до 100%?"
 # ТЗ-доп. №7, п.1/п.3/п.7: финал — ОДНО сообщение: отражение (или «ответ не находится») + ссылки + CTA.
 # «Ответ не находится» — только если на E/E_followup нет сдвига (llm.classify_e_has_shift).
@@ -120,6 +127,23 @@ A_FACT_Q = (
     "Понял. А что при этом происходило буквально — какие слова прозвучали, что было сделано? "
     "Опиши так, как это сняла бы видеокамера."
 )
+OBJECT_CHOICE_TEXT = (
+    "Неважно, с чего начать — с зуба или с отношений: разбор идёт по одному алгоритму. "
+    "С чем работаем?"
+)
+Q_TOOTH = "Какой зуб? Напиши номер по схеме."
+Q_A_TOOTH = "Что с ним не так — болит, крошится, кривой, что-то ещё?"
+Q_B_TOOTH = "А каким бы тебе хотелось, чтобы он был — каким он должен быть?"
+Q_WHO = "С кем разбираем — кто этот человек для тебя?"
+Q_A_AFTER_WHO = (
+    "Опиши, что в его или её поведении тебе дискомфортно: триггерит, бесит, раздражает, обламывает, достаёт."
+)
+TOOTH_DIAGNOSTICS_TEXT = (
+    "Чтобы получить ещё больше информации по своему зубу и знать о нём всё необходимое — приходи "
+    "на бесплатную диагностику, записаться можно у @psyteeth."
+)
+# для зуба пропускаем шаги, которые на него не ложатся
+TOOTH_SKIP_D = {"alt", "7a", "7b"}
 OTHER_PERSON_QUESTION = "А кто это для тебя?"
 OTHER_PERSON_REASK = "Понял. А кто он(а) тебе — коллега, сосед(ка), родственник, знакомый, незнакомый человек?"
 OTHER_PERSON_REASK_PLURAL = "Понял. А кто они тебе — коллеги, соседи, родственники, знакомые, незнакомые люди?"
@@ -215,6 +239,8 @@ async def _check_exit_intent(context: ContextTypes.DEFAULT_TYPE, session_id: int
     дальше не тратим лишние вызовы классификатора."""
     if context.user_data.get("exit_intent_flagged"):
         return
+    if _is_tooth(db.get_relationship_session(session_id)):
+        return  # «избегание или интеграция» — про уход от человека, на зуб не ложится
     verdict = await llm.classify_exit_intent(text)
     if verdict["exit_intent"] and verdict["confidence"] >= EXIT_INTENT_CONFIDENCE_THRESHOLD:
         context.user_data["exit_intent_flagged"] = True
@@ -268,6 +294,10 @@ D_FIELDS = {
 }
 
 
+def _is_tooth(row) -> bool:
+    return (row["object_type"] or "") == "tooth"
+
+
 def _event_text(row) -> str:
     """Событие A для генераций: формулировка человека + факт «как сняла бы камера», если уточняли."""
     event = row["a_event"] or ""
@@ -278,6 +308,15 @@ def _event_text(row) -> str:
 
 def _other(row) -> str:
     """Кто другой и в каком роде о нём говорить — для всех генераций (вопросы D, резюме, E)."""
+    if _is_tooth(row):
+        from bot.handlers.teeth import describe_tooth
+        return (
+            f"Объект разбора — не человек, а зуб {row['tooth_number']} ({describe_tooth(row['tooth_number'])}) "
+            "самого пользователя: о нём «он», «его», «должен был». Это претензия к своему зубу — "
+            "«каким он должен быть». Если в задании есть пункт «По классике я бы посоветовал…» — "
+            "пропусти его целиком, к врачу не отправляй. Пол самого пользователя неизвестен — без "
+            "родовых форм о нём."
+        )
     return llm.other_person_note(row["other_person_label"], row["other_person_gender"])
 
 
@@ -345,6 +384,8 @@ def _row_for_sheets(row) -> list:
         row["core_belief"] or "",
         row["core_category"] or "",
         row["a_fact"] or "",
+        "зуб" if row["object_type"] == "tooth" else ("человек" if row["object_type"] else ""),
+        row["tooth_number"] if row["tooth_number"] is not None else "",
     ]
 
 
@@ -408,7 +449,21 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             return None
 
     await query.answer()
-    return await _start_session(update, context, via_query=True)
+    if query.data == "menu:analysis":
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("С зубом", callback_data="obj:tooth"),
+            InlineKeyboardButton("С отношениями", callback_data="obj:person"),
+        ]])
+        await query.edit_message_text(OBJECT_CHOICE_TEXT, reply_markup=keyboard)
+        return OBJECT_CHOICE
+    obj = "tooth" if query.data == "menu:teeth" else "person"
+    return await _start_session(update, context, via_query=True, obj=obj)
+
+
+async def object_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    return await _start_session(update, context, via_query=True, obj=query.data.split(":", 1)[1])
 
 
 INTRO_SCREEN_TEXT = (
@@ -419,19 +474,20 @@ INTRO_SCREEN_TEXT = (
 
 
 async def _start_session(
-    update: Update, context: ContextTypes.DEFAULT_TYPE, via_query: bool, skip_ab: bool = False
+    update: Update, context: ContextTypes.DEFAULT_TYPE, via_query: bool, skip_ab: bool = False, obj: str = "person",
 ) -> int:
     user = update.effective_user
     send = update.callback_query.edit_message_text if via_query else update.effective_message.reply_text
 
-    if db.count_relationship_sessions_this_month(user.id) >= await limits.get_limit(
-        context.bot, user.id, "relationships"
-    ):
-        db.log_limit_hit(user.id, "relationships")
+    branch = "teeth" if obj == "tooth" else "relationships"
+    used = db.count_teeth_sessions_this_month(user.id) if obj == "tooth" else db.count_relationship_sessions_this_month(user.id)
+    if used >= await limits.get_limit(context.bot, user.id, branch):
+        db.log_limit_hit(user.id, branch)
+        label = "Зубы" if obj == "tooth" else "Отношения"
         await sheets_logger.append(
-            "Лимиты", [db.now(), user.id, user.username or "", "Отношения", "упёрся в лимит"]
+            "Лимиты", [db.now(), user.id, user.username or "", label, "упёрся в лимит"]
         )
-        await send(RELATIONSHIP_LIMIT_TEXT, reply_markup=back_to_menu_keyboard())
+        await send(limit_exhausted_text(label), reply_markup=back_to_menu_keyboard())
         return ConversationHandler.END
 
     # Аналитика воронки рекламы (ТЗ 30.09): до создания сессии — считались бы «начатые» разборы
@@ -455,14 +511,21 @@ async def _start_session(
                 "rel_feeling_named"):
         context.user_data.pop(key, None)
     hostility.reset_session(context)
-    # Живой кейс: на вопросе A нет способа выйти кроме /start — несколько раз подряд человек
-    # открывал разбор, не отвечал и уходил (см. SeliverstovaMarina, 3 пустых cancelled-сессии
-    # подряд). Кнопка «В меню» даёт лёгкий путь назад без команды.
-    await send(Q_A, reply_markup=back_to_menu_keyboard())
-    await _log_turn(session_id, user, "A", "бот", Q_A)
+    db.update_relationship_session(session_id, object_type=obj)
     variant = db.get_or_assign_ab_variant(user.id) if AB_TESTING_ENABLED else "direct"
-    await analytics.log(context, user.id, "flow_started", {"ab_variant": variant})
-    return A_EVENT
+    await analytics.log(context, user.id, "flow_started", {"ab_variant": variant, "object": obj})
+    # Живой кейс: на первом вопросе нет способа выйти кроме /start — несколько раз подряд человек
+    # открывал разбор, не отвечал и уходил (см. SeliverstovaMarina). Кнопка «В меню» — лёгкий путь назад.
+    if obj == "tooth":
+        await send("Работаем с зубом.")
+        with open(TEETH_CHART_PATH, "rb") as photo:
+            await update.effective_chat.send_photo(photo)
+        await update.effective_chat.send_message(Q_TOOTH, reply_markup=back_to_menu_keyboard())
+        await _log_turn(session_id, user, "tooth", "бот", Q_TOOTH)
+        return TOOTH_ASK
+    await send(Q_WHO, reply_markup=back_to_menu_keyboard())
+    await _log_turn(session_id, user, "A_other", "бот", Q_WHO)
+    return WHO_FIRST
 
 
 async def rel_intro_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -669,6 +732,87 @@ async def _maybe_wrap_to_summary(
     return None
 
 
+async def who_first(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_who_first", conv_handler=conv_handler, state=WHO_FIRST,
+        process=lambda text: _process_who_first(update, context, text),
+    )
+
+
+async def _process_who_first(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    """«С кем разбираем?» — до события (25.10). Оценка вместо роли — один переспрос, как на A_other."""
+    session_id, early = await _text_step(update, context, text, step="A_other", question=Q_WHO, state=WHO_FIRST)
+    if early is not None:
+        return early
+    other = await llm.classify_other_person_full(text)
+    if other["is_evaluation"] and not context.user_data.get("rel_other_reasked"):
+        context.user_data["rel_other_reasked"] = True
+        question = OTHER_PERSON_REASK_PLURAL if other["gender"] == "pl" else OTHER_PERSON_REASK
+        await _send(update, context, session_id, "A_other", question, msg_type="уточнение")
+        return WHO_FIRST
+    context.user_data.pop("rel_other_reasked", None)
+    db.update_relationship_session(
+        session_id, other_person=other["category"] or "другое",
+        other_person_label=None if other["is_evaluation"] else (other["label"] or text.strip()[:60]),
+        other_person_gender=other["gender"],
+    )
+    possessive = {"f": "её", "m": "его", "pl": "их"}.get(other["gender"], "его или её")
+    await _send(update, context, session_id, "A", Q_A_AFTER_WHO.replace("его или её", possessive))
+    return A_EVENT
+
+
+async def tooth_ask(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_tooth_ask", conv_handler=conv_handler, state=TOOTH_ASK,
+        process=lambda text: _process_tooth_ask(update, context, text),
+    )
+
+
+async def _process_tooth_ask(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    session_id, early = await _text_step(update, context, text, step="tooth", question=Q_TOOTH, state=TOOTH_ASK)
+    if early is not None:
+        return early
+    several = list(dict.fromkeys(int(n) for n in re.findall(r"(?<!\d)\d{2}(?!\d)", text) if int(n) in VALID_TEETH_NUMBERS))
+    if len(several) >= 2:
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton(str(n), callback_data=f"rel_tooth:{n}") for n in several[:6]]])
+        await _send(
+            update, context, session_id, "tooth",
+            "Давай по одному. Какой из них беспокоит больше всего? Остальные можно разобрать следующими сессиями.",
+            msg_type="уточнение", reply_markup=keyboard,
+        )
+        return TOOTH_ASK
+    number = several[0] if several else await llm.parse_tooth_number(text)
+    if not number or number not in VALID_TEETH_NUMBERS:
+        await _send(update, context, session_id, "tooth", "Не понял, какой это зуб. Посмотри на схему и напиши номер цифрами.", msg_type="уточнение")
+        return TOOTH_ASK
+    from bot.handlers.teeth import describe_tooth
+    keyboard = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Да", callback_data=f"rel_tooth:{number}"),
+        InlineKeyboardButton("Нет", callback_data="rel_tooth:no"),
+    ]])
+    await _send(update, context, session_id, "tooth", f"Правильно понимаю: {describe_tooth(number)}, зуб {number}?", reply_markup=keyboard)
+    return TOOTH_CONFIRM
+
+
+async def tooth_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    from bot.handlers.teeth import describe_tooth
+    query = update.callback_query
+    session_id = context.user_data["rel_session_id"]
+    await query.answer()
+    await _log_turn(session_id, update.effective_user, "tooth", "человек", query.data, msg_type="кнопка")
+    choice = query.data.split(":", 1)[1]
+    if choice == "no":
+        await query.edit_message_text("Хорошо, напиши номер по схеме ещё раз.")
+        return TOOTH_ASK
+    number = int(choice)
+    db.update_relationship_session(
+        session_id, tooth_number=number, other_person="зуб", other_person_label=f"зуб {number}", other_person_gender="m",
+    )
+    await query.edit_message_text(f"Принято — {describe_tooth(number)} (зуб {number}).")
+    await _send(update, context, session_id, "A", Q_A_TOOTH)
+    return A_EVENT
+
+
 async def a_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return await debounce.collect(
         update, context, step_id="rel_a", conv_handler=conv_handler, state=A_EVENT,
@@ -701,6 +845,11 @@ async def _process_a_event(update: Update, context: ContextTypes.DEFAULT_TYPE, t
         return ConversationHandler.END
 
     await _bump_messages(session_id)
+
+    if _is_tooth(db.get_relationship_session(session_id)):
+        # претензия к своему зубу: «болит», «кривой» — проверки про поведение другого не нужны
+        db.update_relationship_session(session_id, a_event=text)
+        return await _after_a(update, context, session_id, text)
 
     # 23.10 (krosman_k): вместо события — вопрос «За какие отношения отвечает 47 зуб?». Отвечаем по
     # позиции автора, зовём на диагностику и возвращаем к вопросу A (не засчитываем как попытку дожима).
@@ -752,6 +901,10 @@ async def _classify_or_ask_other_person(
     update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int
 ) -> int:
     row = db.get_relationship_session(session_id)
+    if row["other_person"]:
+        # уже знаем, с кем (вопрос «С кем разбираем?» в начале, 25.10) или это зуб
+        await _send(update, context, session_id, "B", Q_B_TOOTH if _is_tooth(row) else _q_b(row["other_person_gender"]))
+        return B_NARRATIVE
     other = await llm.classify_other_person_full(row["a_event"])
     if other["category"]:
         db.update_relationship_session(
@@ -868,14 +1021,17 @@ async def _process_b_narrative(update: Update, context: ContextTypes.DEFAULT_TYP
     db.update_relationship_session(session_id, b_narrative_raw=text)
     context.user_data["rel_raw_narrative"] = text
 
-    dozhim_state = await _check_dozhim(update, context, session_id, "B", text)
-    if dozhim_state is not None:
-        return dozhim_state
+    if not _is_tooth(db.get_relationship_session(session_id)):
+        dozhim_state = await _check_dozhim(update, context, session_id, "B", text)
+        if dozhim_state is not None:
+            return dozhim_state
 
     # живой кейс 06.10 (Voves): род другого взят из шаблонного «Меня в нём бесит…», а в B человек
     # своими словами пишет «быть более внимательной ко мне». Если в B род виден явно — он главнее.
     row = db.get_relationship_session(session_id)
-    other = await llm.classify_other_person_full(text)  # только B: явные формы в своих словах
+    other = (
+        {"gender": None} if _is_tooth(row) else await llm.classify_other_person_full(text)
+    )  # только B: явные формы в своих словах
     if other["gender"] in ("f", "m", "pl") and other["gender"] != row["other_person_gender"]:
         db.update_relationship_session(session_id, other_person_gender=other["gender"])
         row = db.get_relationship_session(session_id)
@@ -1386,7 +1542,10 @@ async def _process_d_answer(
             simpler = await llm.simplify_question(current_q)
             await _send(update, context, session_id, D_STEP_LOG[step], f"{ack} {simpler}", msg_type="уточнение")
             return D_QUESTION
-        if check["self_reaction"] and context.user_data.get("rel_d_self_reminded_step") != step:
+        if (
+            check["self_reaction"] and context.user_data.get("rel_d_self_reminded_step") != step
+            and not _is_tooth(db.get_relationship_session(session_id))
+        ):
             context.user_data["rel_d_self_reminded_step"] = step
             event = (db.get_relationship_session(session_id)["a_event"] or "").strip().rstrip(".!…")
             if len(event) > 160:
@@ -1438,6 +1597,9 @@ async def _process_d_answer(
         next_step = "2b" if await llm.classify_yes_no(text) else "3"
     else:
         next_step = D_NEXT[step]
+    if _is_tooth(db.get_relationship_session(session_id)):
+        while next_step in TOOTH_SKIP_D:  # «себе/другу», «альтернатива» на зуб не ложатся
+            next_step = D_NEXT[next_step]
     return await _ask_d(update, context, session_id, next_step)
 
 
@@ -1611,7 +1773,9 @@ def _card_text(card: dict | None) -> str:
     return "\n".join(lines)
 
 
-def _build_final_text(outcome: str, quote: str | None, insertion: str | None, card: dict | None = None) -> str:
+def _build_final_text(
+    outcome: str, quote: str | None, insertion: str | None, card: dict | None = None, tooth: bool = False,
+) -> str:
     card_block = _card_text(card)
     if outcome == "insight":
         # quote нет, когда человек принял подсказку бота — тогда отражать нечего, только новая реакция
@@ -1626,6 +1790,8 @@ def _build_final_text(outcome: str, quote: str | None, insertion: str | None, ca
         parts = [html.escape(E_NO_INSIGHT_TEXT)]
     if card_block:
         parts.append(card_block)
+    if tooth:
+        parts.append(html.escape(TOOTH_DIAGNOSTICS_TEXT))
     return "\n\n".join(parts + [FINAL_LINKS_TEXT, html.escape(FINAL_CTA_TEXT)])
 
 
@@ -1657,7 +1823,7 @@ async def _finish_e(
             db.update_relationship_session(
                 session_id, coping_card=" | ".join(f"{k}: {v}" for k, v in card.items() if v),
             )
-    final_text = _build_final_text(outcome, quote, insertion, card)
+    final_text = _build_final_text(outcome, quote, insertion, card, tooth=_is_tooth(db.get_relationship_session(session_id)))
 
     # «Избегание или интеграция» (ТЗ-доп. №5, раздел 2) — если хоть раз сработало на C-D8/E,
     # сначала ещё один обмен, финал уходит вместе с ответом на него. Лог в Sheets откладывается до
@@ -1995,7 +2161,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 conv_handler = ConversationHandler(
-    entry_points=[CallbackQueryHandler(entry, pattern="^menu:relationships$")],
+    entry_points=[CallbackQueryHandler(entry, pattern="^menu:(relationships|teeth|analysis)$")],
     states={
         A_EVENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, a_event)],
         A_PRIOR_EVENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, a_prior_event)],
@@ -2017,6 +2183,16 @@ conv_handler = ConversationHandler(
         BELIEF_BEFORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, belief_before)],
         BELIEF_AFTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, belief_after)],
         A_FACT: [MessageHandler(filters.TEXT & ~filters.COMMAND, a_fact)],
+        OBJECT_CHOICE: [CallbackQueryHandler(object_choice, pattern="^obj:")],
+        TOOTH_ASK: [
+            CallbackQueryHandler(tooth_confirm, pattern="^rel_tooth:"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, tooth_ask),
+        ],
+        TOOTH_CONFIRM: [
+            CallbackQueryHandler(tooth_confirm, pattern="^rel_tooth:"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, tooth_ask),
+        ],
+        WHO_FIRST: [MessageHandler(filters.TEXT & ~filters.COMMAND, who_first)],
         E_DISCOMFORT_AFTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_discomfort_after)],
         E_SUMMARY_CONFIRM: [CallbackQueryHandler(e_summary_confirm, pattern="^e_confirm:")],
         E_SUMMARY_CORRECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_summary_correction)],

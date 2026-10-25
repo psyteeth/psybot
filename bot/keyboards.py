@@ -11,9 +11,12 @@ async def main_menu_keyboard(bot: Bot, user_id: int) -> InlineKeyboardMarkup:
     rel_left = await limits.remaining(bot, user_id, "relationships")
     teeth_left = await limits.remaining(bot, user_id, "teeth")
     concept_left = await limits.remaining(bot, user_id, "concept")
+    # 25.10: один разбор — зуб или отношения, первый вопрос «С чем работаем?»
     rows = [
-        [InlineKeyboardButton(f"Отношения (осталось {_fmt(rel_left)})", callback_data="menu:relationships")],
-        [InlineKeyboardButton(f"Зубы (осталось {_fmt(teeth_left)})", callback_data="menu:teeth")],
+        [InlineKeyboardButton(
+            f"Разбор: зубы и отношения (осталось {_fmt(teeth_left)} / {_fmt(rel_left)})",
+            callback_data="menu:analysis",
+        )],
         [InlineKeyboardButton(f"Концепция (осталось {_fmt(concept_left)})", callback_data="menu:concept")],
     ]
     return InlineKeyboardMarkup(rows)
