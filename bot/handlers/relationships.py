@@ -82,8 +82,8 @@ ARROW_WORST_Q = "Допустим, это так и останется. Что �
 ARROW_SELF_Q = "А что это говорит о тебе?"
 # карта СМЭР: вопросы техники чередовать; остановка — когда прозвучало высказывание о себе в целом
 ARROW_MORE_QS = [
-    "Если это правда, характеризует ли это тебя как-то?",
-    "Делаешь ли ты в этот момент какие-то выводы о себе?",
+    "И какой вывод ты из этого делаешь о себе?",
+    "Если одной фразой: какой ты тогда, по-твоему?",
 ]
 VAGUE_FEELING_RE = re.compile(
     r"^\s*(плохо|очень плохо|никак|нормально|хреново|херово|паршиво|фигово|так себе|не очень|не знаю|хз)\W*$",
@@ -1137,6 +1137,11 @@ async def _process_arrow_worst(update: Update, context: ContextTypes.DEFAULT_TYP
     if early is not None:
         return early
     db.update_relationship_session(session_id, arrow_worst=text)
+    if await llm.is_self_statement(text):
+        # вывод о себе уже прозвучал («я чмо позорное») — переспрашивать «что это говорит о тебе» незачем
+        core = await llm.classify_core_belief(f"Самое плохое: {text}")
+        db.update_relationship_session(session_id, core_belief=core["belief"], core_category=core["category"])
+        return await _ask_c(update, context, session_id)
     await _send(update, context, session_id, "B_arrow_self", ARROW_SELF_Q)
     return ARROW_SELF
 
