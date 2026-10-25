@@ -1,6 +1,7 @@
 import logging
 
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
 
@@ -13,8 +14,8 @@ from bot.sheets import sheets_logger
 logger = logging.getLogger(__name__)
 
 WELCOME_TEXT = (
-    "Привет! Я могу разобрать вопрос по отношениям или по зубам. "
-    "Ещё могу рассказать о концепции психостоматологии."
+    'Привет, я бот проекта <a href="https://t.me/psy_teeth_official">Психостоматология №1</a>. '
+    "Помогаю разбирать вопросы по зубам и отношениям, а также отвечаю на вопросы о концепции проекта."
 )
 
 BRANCH_HINT = {
@@ -37,11 +38,13 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, text: st
         return
 
     keyboard = await main_menu_keyboard(context.bot, user.id)
+    # HTML — ради ссылки на канал в приветствии; превью ссылки не нужно
+    kwargs = {"reply_markup": keyboard, "parse_mode": ParseMode.HTML, "disable_web_page_preview": True}
     if update.callback_query:
         await update.callback_query.answer()
-        await update.callback_query.edit_message_text(text, reply_markup=keyboard)
+        await update.callback_query.edit_message_text(text, **kwargs)
     else:
-        await update.effective_message.reply_text(text, reply_markup=keyboard)
+        await update.effective_message.reply_text(text, **kwargs)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
