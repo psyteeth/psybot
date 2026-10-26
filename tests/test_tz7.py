@@ -261,6 +261,50 @@ async def test_12_abcde_additions():
           f"states={s1},{s2},{s3},{s4}; после D6→{step_after_6}, после alt→{step_after_alt}; карточка={'да' if 'Карточка' in final else 'нет'}")
 
 
+async def test_13_tooth_bridge():
+    """26.10, решение автора: зуб после C ведёт в отношения — «где с людьми так же», переход в разбор с человеком."""
+    from bot import limits
+
+    async def _lim(*a, **k):
+        return 99
+    limits.get_limit = _lim
+    SENT.clear()
+    sid = new_rel_session(
+        object_type="tooth", tooth_number=46, other_person="зуб", other_person_label="зуб 46", other_person_gender="m",
+        a_event="воспаление гнойное на десне, сломан",
+        b_narrative_confirmed="Правильно понимаю: зуб 46 должен был бы оставаться крепким, с укреплённой здоровой десной вокруг, и тогда всё было бы хорошо?",
+        c_consequence="я в ахуе: говорю ему, эй ты че делаешь? Потом бесит воспаление, а потом боль и обида",
+        c_feeling="блять ну почему это происходит со мной",
+        arrow_worst="тогда я проиграл, я чмо позорное, закрываю глаза, чтобы не показать как мне",
+        core_belief="я чмо позорное, слабак",
+    )
+    ctx = fake_context({"rel_session_id": sid})
+    s1 = await rel._process_c_body(fake_update(), ctx, "глаза закрываются и звучит внутреннее «ну пиздец»")
+    bridge_q = SENT[-1]["text"] if SENT else ""
+    s2 = await rel._process_tooth_bridge(fake_update(), ctx, "с отцом так же, вечно подводит")
+    s3 = await rel.tooth_bridge_text(types.SimpleNamespace(
+        effective_user=USER, effective_message=types.SimpleNamespace(text="да", reply_text=FakeMessage().reply_text),
+        callback_query=None, effective_chat=types.SimpleNamespace(id=USER.id),
+    ), ctx)
+    new_sid = ctx.user_data.get("rel_session_id")
+    new_row = db.get_relationship_session(new_sid) if new_sid else None
+    ok = (
+        s1 == rel.TOOTH_BRIDGE and "чмо позорное" in bridge_q and s2 == rel.TOOTH_BRIDGE_CHOICE
+        and s3 == rel.A_EVENT and new_row is not None and new_row["from_tooth_session"] == sid
+        and (new_row["object_type"] or "") == "person"
+    )
+    check("13. Зуб → мост «где с людьми так же» → разбор с человеком", ok,
+          f"states={s1},{s2},{s3}; мост={bridge_q[:120]!r}; новый={new_row['other_person_label'] if new_row else None}")
+
+    SENT.clear()
+    sid2 = new_rel_session(object_type="tooth", tooth_number=46, other_person_label="зуб 46", arrow_worst="я слабак")
+    ctx2 = fake_context({"rel_session_id": sid2, "rel_bridge_q": rel.TOOTH_BRIDGE_FALLBACK_Q})
+    s4 = await rel._process_tooth_bridge(fake_update(), ctx2, "не знаю, ни с кем вроде")
+    final = SENT[-1]["text"] if SENT else ""
+    check("14. Мост: «не знаю» → без дожима, финал с диагностикой", s4 == rel.ConversationHandler.END and "диагностик" in final,
+          final[:100].replace("\n", " "))
+
+
 def test_3_one_question():
     bad = [m for m in SENT_ALL if m["text"].count("?") > 1]
     check("3. Ни одно сообщение бота не содержит больше одного «?»", not bad,
@@ -274,7 +318,7 @@ async def main():
     tests = [
         test_1_e_shift, test_2_e_empty, test_4_one_at_a_time, test_5_answer_to_previous,
         test_6_b_no_additions, test_7_single_final, test_8_teeth_his, test_9_two_teeth, test_10_no_duplicates,
-        test_11_dozhim_wife, test_12_abcde_additions,
+        test_11_dozhim_wife, test_12_abcde_additions, test_13_tooth_bridge,
     ]
     for t in tests:
         try:

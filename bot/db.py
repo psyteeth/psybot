@@ -199,6 +199,9 @@ MIGRATIONS = [
     # 25.10: единый разбор — объект «зуб» или «человек»
     "ALTER TABLE relationship_sessions ADD COLUMN object_type TEXT",
     "ALTER TABLE relationship_sessions ADD COLUMN tooth_number INTEGER",
+    # 26.10: зуб — вход в отношения: «где с людьми так же» и связь с разбором, начатым из зуба
+    "ALTER TABLE relationship_sessions ADD COLUMN tooth_bridge TEXT",
+    "ALTER TABLE relationship_sessions ADD COLUMN from_tooth_session INTEGER",
 ]
 
 

@@ -54,7 +54,8 @@ logger = logging.getLogger(__name__)
     A_FACT,
     # 25.10: единый разбор — «С чем работаем?» → зуб (номер, подтверждение) или человек («с кем?»)
     OBJECT_CHOICE, TOOTH_ASK, TOOTH_CONFIRM, WHO_FIRST,
-) = range(32)
+    TOOTH_BRIDGE, TOOTH_BRIDGE_CHOICE,
+) = range(34)
 
 Q_A = (
     "Опиши событие или поведение другого человека, от которого тебе дискомфортно: "
@@ -144,6 +145,22 @@ TOOTH_DIAGNOSTICS_TEXT = (
 )
 # для зуба пропускаем шаги, которые на него не ложатся
 TOOTH_SKIP_D = {"alt", "7a", "7b"}
+# 26.10, решение автора: оспаривания и E про сам зуб не работали (вера 100→100, «а как ещё на него
+# реагировать?»). После C зуб ведёт в отношения: где с людьми происходит то же самое.
+TOOTH_BRIDGE_FALLBACK_Q = (
+    "По концепции зуб связан не с самим зубом, а с ситуациями в общении, где тебе бывает невыносимо "
+    "тяжело. Вспомни, где с людьми у тебя происходит то же самое — то же ожидание, те же чувства, те "
+    "же мысли о себе. С кем так бывает?"
+)
+TOOTH_BRIDGE_OFFER = (
+    "Похоже, это про: {who}. Давай разберём эту ситуацию — так станет понятнее, что на самом деле "
+    "стоит за зубом. Разбираем?"
+)
+TOOTH_BRIDGE_NONE_TEXT = (
+    "Сразу это видно не всегда — и это нормально. Понаблюдай: где в общении всплывут те же чувства и "
+    "те же мысли о себе — там и стоит копать. Когда найдёшь, приходи: разберём эту ситуацию здесь же."
+)
+TOOTH_BRIDGE_LATER_TEXT = "Хорошо. Когда захочешь — разбор с этим человеком есть в меню."
 OTHER_PERSON_QUESTION = "А кто это для тебя?"
 OTHER_PERSON_REASK = "Понял. А кто он(а) тебе — коллега, сосед(ка), родственник, знакомый, незнакомый человек?"
 OTHER_PERSON_REASK_PLURAL = "Понял. А кто они тебе — коллеги, соседи, родственники, знакомые, незнакомые люди?"
@@ -386,6 +403,8 @@ def _row_for_sheets(row) -> list:
         row["a_fact"] or "",
         "зуб" if row["object_type"] == "tooth" else ("человек" if row["object_type"] else ""),
         row["tooth_number"] if row["tooth_number"] is not None else "",
+        row["tooth_bridge"] or "",
+        row["from_tooth_session"] if row["from_tooth_session"] is not None else "",
     ]
 
 
@@ -475,6 +494,7 @@ INTRO_SCREEN_TEXT = (
 
 async def _start_session(
     update: Update, context: ContextTypes.DEFAULT_TYPE, via_query: bool, skip_ab: bool = False, obj: str = "person",
+    prefill_who: str = "", from_tooth: int | None = None,
 ) -> int:
     user = update.effective_user
     send = update.callback_query.edit_message_text if via_query else update.effective_message.reply_text
@@ -508,7 +528,7 @@ async def _start_session(
     context.user_data["rel_session_id"] = session_id
     _reset_dozhim_state(context)
     for key in ("rel_e_hint_offered", "rel_e_hint", "rel_pending_final", "rel_other_reasked", "rel_arrow_n",
-                "rel_feeling_named"):
+                "rel_feeling_named", "rel_bridge_q", "rel_bridge_who", "rel_meta_reasked"):
         context.user_data.pop(key, None)
     hostility.reset_session(context)
     db.update_relationship_session(session_id, object_type=obj)
@@ -523,6 +543,18 @@ async def _start_session(
         await update.effective_chat.send_message(Q_TOOTH, reply_markup=back_to_menu_keyboard())
         await _log_turn(session_id, user, "tooth", "бот", Q_TOOTH)
         return TOOTH_ASK
+    if prefill_who:
+        # 26.10: разбор, начатый из зуба, — «с кем» уже названо на мосте
+        other = await llm.classify_other_person_full(prefill_who)
+        db.update_relationship_session(
+            session_id, from_tooth_session=from_tooth, other_person=other["category"] or "другое",
+            other_person_label=other["label"] or prefill_who, other_person_gender=other["gender"],
+        )
+        possessive = {"f": "её", "m": "его", "pl": "их"}.get(other["gender"], "его или её")
+        question = f"Разбираем: {prefill_who}.\n\n" + Q_A_AFTER_WHO.replace("его или её", possessive)
+        await send(question, reply_markup=back_to_menu_keyboard())
+        await _log_turn(session_id, user, "A", "бот", question)
+        return A_EVENT
     await send(Q_WHO, reply_markup=back_to_menu_keyboard())
     await _log_turn(session_id, user, "A_other", "бот", Q_WHO)
     return WHO_FIRST
@@ -1184,8 +1216,98 @@ async def _process_c_body(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     if early is not None:
         return early
     db.update_relationship_session(session_id, c_body=text)
+    if _is_tooth(db.get_relationship_session(session_id)):
+        return await _ask_tooth_bridge(update, context, session_id)
     await _send(update, context, session_id, "C_discomfort", DISCOMFORT_BEFORE_Q)
     return C_DISCOMFORT
+
+
+async def _ask_tooth_bridge(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int) -> int:
+    row = db.get_relationship_session(session_id)
+    material = "\n".join(
+        f"{label}: {row[field]}" for label, field in (
+            ("Что с зубом", "a_event"), ("Каким должен быть", "b_narrative_confirmed"),
+            ("Реакция", "c_consequence"), ("Чувство", "c_feeling"), ("Тело / что делает", "c_body"),
+            ("Самое плохое", "arrow_worst"), ("Что это говорит о себе", "arrow_self"),
+            ("Убеждение о себе", "core_belief"),
+        ) if row[field]
+    )
+    question = await llm.generate_tooth_bridge_question(material) or TOOTH_BRIDGE_FALLBACK_Q
+    context.user_data["rel_bridge_q"] = question
+    await _send(update, context, session_id, "tooth_bridge", question)
+    return TOOTH_BRIDGE
+
+
+async def tooth_bridge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return await debounce.collect(
+        update, context, step_id="rel_tooth_bridge", conv_handler=conv_handler, state=TOOTH_BRIDGE,
+        process=lambda text: _process_tooth_bridge(update, context, text),
+    )
+
+
+async def _process_tooth_bridge(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> int:
+    question = context.user_data.get("rel_bridge_q", TOOTH_BRIDGE_FALLBACK_Q)
+    session_id, early = await _text_step(update, context, text, step="tooth_bridge", question=question, state=TOOTH_BRIDGE)
+    if early is not None:
+        return early
+    row = db.get_relationship_session(session_id)
+    bridge = f"{row['tooth_bridge']}\n{text}" if row["tooth_bridge"] else text
+    db.update_relationship_session(session_id, tooth_bridge=bridge)
+    answer = await llm.classify_tooth_bridge_answer(question, text)
+    if not answer["found"]:
+        return await _finish_tooth(update, context, session_id, "bridge_none", TOOTH_BRIDGE_NONE_TEXT)
+    context.user_data["rel_bridge_who"] = answer["who"]
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("Да, разбираем", callback_data="rel_bridge:yes")],
+        [InlineKeyboardButton("Не сейчас", callback_data="rel_bridge:no")],
+    ])
+    await _send(update, context, session_id, "tooth_bridge_offer", TOOTH_BRIDGE_OFFER.format(who=answer["who"]),
+                reply_markup=keyboard)
+    return TOOTH_BRIDGE_CHOICE
+
+
+async def tooth_bridge_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    session_id = context.user_data.get("rel_session_id")
+    if not session_id:
+        return ConversationHandler.END
+    who = context.user_data.pop("rel_bridge_who", "")
+    if query.data == "rel_bridge:no":
+        return await _finish_tooth(update, context, session_id, "bridge_later", TOOTH_BRIDGE_LATER_TEXT)
+    await _log_turn(session_id, update.effective_user, "tooth_bridge_offer", "человек", "Да, разбираем")
+    db.update_relationship_session(session_id, e_outcome="bridge_to_person")
+    db.finish_relationship_session(session_id, exit_step="bridge")
+    await _complete_flow(update, context, session_id)
+    return await _start_session(update, context, via_query=False, skip_ab=True, obj="person",
+                                prefill_who=who, from_tooth=session_id)
+
+
+async def tooth_bridge_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Текст вместо кнопки на предложении разобрать — «да»/«нет» словами."""
+    session_id = context.user_data.get("rel_session_id")
+    text = update.effective_message.text or ""
+    if session_id and await llm.classify_yes_no(text):
+        who = context.user_data.pop("rel_bridge_who", "")
+        db.update_relationship_session(session_id, e_outcome="bridge_to_person")
+        db.finish_relationship_session(session_id, exit_step="bridge")
+        await _complete_flow(update, context, session_id)
+        return await _start_session(update, context, via_query=False, skip_ab=True, obj="person",
+                                    prefill_who=who, from_tooth=session_id)
+    if session_id:
+        context.user_data.pop("rel_bridge_who", None)
+        return await _finish_tooth(update, context, session_id, "bridge_later", TOOTH_BRIDGE_LATER_TEXT)
+    return ConversationHandler.END
+
+
+async def _finish_tooth(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, session_id: int, outcome: str, lead: str,
+) -> int:
+    db.update_relationship_session(session_id, e_outcome=outcome)
+    db.finish_relationship_session(session_id, exit_step="bridge")
+    text = "\n\n".join([html.escape(lead), html.escape(TOOTH_DIAGNOSTICS_TEXT), FINAL_LINKS_TEXT, html.escape(FINAL_CTA_TEXT)])
+    await _send_final(update, context, session_id, text)
+    return await _complete_flow(update, context, session_id)
 
 
 async def _process_belief(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, *, after: bool) -> int:
@@ -1294,7 +1416,7 @@ async def _process_c_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if await _maybe_meta_reask(update, context, session_id, "C_feeling", feeling_question, text):
         return C_FEELING
     # карта СМЭР: «плохо», «никак» — не эмоция; один раз предлагаем назвать одним словом
-    if VAGUE_FEELING_RE.match(text) and not context.user_data.get("rel_feeling_named"):
+    if VAGUE_FEELING_RE.match(text) and not context.user_data.get("rel_feeling_named", "rel_bridge_q", "rel_bridge_who", "rel_meta_reasked"):
         context.user_data["rel_feeling_named"] = True
         await _send(update, context, session_id, "C_feeling", VAGUE_FEELING_Q, msg_type="уточнение")
         return C_FEELING
@@ -1435,9 +1557,14 @@ async def _maybe_meta_reask(
     соглашаемся и задаём текущий вопрос заново, проще. True — переспросили, шаг не двигаем."""
     if not question:
         return False
+    # 26.10, живой кейс: «какую блять ситуацию?» — второй раз тот же «Скажу проще…». Переспрашиваем
+    # один раз на вопрос; дальше ответ принимаем как есть.
+    if context.user_data.get("rel_meta_reasked") == question:
+        return False
     meta = await llm.classify_meta_request(text, question)
     if meta == "none":
         return False
+    context.user_data["rel_meta_reasked"] = question
     ack = D_ONE_AT_A_TIME_ACK if meta == "one_at_a_time" else D_NOT_UNDERSTOOD_ACK
     simpler = await llm.simplify_question(question)
     await _send(update, context, session_id, step, f"{ack} {simpler}", msg_type="уточнение")
@@ -2204,6 +2331,11 @@ conv_handler = ConversationHandler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, tooth_ask),
         ],
         WHO_FIRST: [MessageHandler(filters.TEXT & ~filters.COMMAND, who_first)],
+        TOOTH_BRIDGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, tooth_bridge)],
+        TOOTH_BRIDGE_CHOICE: [
+            CallbackQueryHandler(tooth_bridge_choice, pattern="^rel_bridge:"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, tooth_bridge_text),
+        ],
         E_DISCOMFORT_AFTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_discomfort_after)],
         E_SUMMARY_CONFIRM: [CallbackQueryHandler(e_summary_confirm, pattern="^e_confirm:")],
         E_SUMMARY_CORRECTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, e_summary_correction)],
