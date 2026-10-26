@@ -1484,7 +1484,8 @@ async def _ask_d(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id:
         question = D5_QUESTION_TEMPLATE.format(situation=row["a_event"])
         await _send(update, context, session_id, "D5", question)
         return D5_QUESTION
-    question = await llm.adapt_dispute_question(_d_base_key(step), row["b_narrative_confirmed"], other=_other(row))
+    key = "4_tooth" if step == "4" and _is_tooth(row) else _d_base_key(step)
+    question = await llm.adapt_dispute_question(key, row["b_narrative_confirmed"], other=_other(row))
     context.user_data["rel_d_prev_q"] = context.user_data.get("rel_d_cur_q", "")
     context.user_data["rel_d_prev_step"] = context.user_data.get("rel_d_step")
     context.user_data["rel_d_step"] = step
@@ -1924,7 +1925,7 @@ async def _send_summary_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     d_answers["D7_другу"] = row["d7_friend"]
     consequence = row["c_consequence"] or ""
     if row["c_body"]:
-        consequence += f"\nВ теле: {row['c_body']}"
+        consequence += f"\nВ теле / что делает: {row['c_body']}"
     if row["arrow_worst"]:
         consequence += f"\nСамое плохое в этом: {row['arrow_worst']}"
     if row["arrow_self"]:
@@ -1932,7 +1933,8 @@ async def _send_summary_confirm(update: Update, context: ContextTypes.DEFAULT_TY
     summary = await llm.generate_session_summary(
         _event_text(row), row["b_narrative_confirmed"], consequence, d_answers,
         discomfort_before=row["discomfort_before"], discomfort_after=row["discomfort_after"],
-        other=_other(row),
+        other=_other(row), tooth=_is_tooth(row),
+        belief_before=row["belief_before"], belief_after=row["belief_after"],
     )
     context.user_data["rel_summary"] = summary
     keyboard = InlineKeyboardMarkup(
