@@ -159,6 +159,15 @@ class SheetsLogger:
             if title not in existing:
                 ws = sh.add_worksheet(title=title, rows=1000, cols=len(header) + 2)
                 ws.append_row(header)
+                continue
+            # 02.11: колонки добавили в код, а заголовок листа остался старым — строка стала шире
+            # таблицы, Google начал дописывать строки «лесенкой» вправо, а сводка падала на
+            # «header row is not unique». Новый заголовок — продолжение старого, дописываем его.
+            ws = sh.worksheet(title)
+            current = ws.row_values(1)
+            if current != header and header[: len(current) - 1] == current[:-1]:
+                ws.update(range_name="A1", values=[header], value_input_option="RAW")
+                logger.info("Заголовок листа %s обновлён: %d → %d колонок", title, len(current), len(header))
         self._ready = True
 
     def _append_sync(self, tab: str, row: list) -> None:
@@ -171,7 +180,8 @@ class SheetsLogger:
                 self._ensure_tabs()
                 sh = self._client.open_by_key(LOG_SPREADSHEET_ID)
                 ws = sh.worksheet(tab)
-                ws.append_row(row, value_input_option="USER_ENTERED")
+                # table_range="A1": строка всегда с колонки A, даже если Google «увидел» таблицу шире
+                ws.append_row(row, value_input_option="USER_ENTERED", table_range="A1")
                 return
             except Exception as e:  # noqa: BLE001
                 last_err = e

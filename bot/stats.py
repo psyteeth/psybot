@@ -18,6 +18,26 @@ D_COLUMNS = [
 ]
 
 
+def _records(ws) -> list[dict]:
+    """get_all_records без падения на пустых/повторяющихся заголовках (02.11). Флаг теста —
+    последняя заполненная ячейка строки: его всегда дописывает sheets_logger.append, а у строк до
+    очередного расширения заголовка колонка «тест» стоит левее."""
+    values = ws.get_all_values()
+    if not values:
+        return []
+    header = values[0]
+    out = []
+    for row in values[1:]:
+        if not any(row):
+            continue
+        rec = {h: row[i] if i < len(row) else "" for i, h in enumerate(header) if h}
+        filled = [c for c in row if str(c).strip()]
+        if filled and filled[-1].strip().lower() in ("да", "нет"):
+            rec["тест"] = filled[-1].strip().lower()
+        out.append(rec)
+    return out
+
+
 def _real_rows(records: list[dict]) -> list[dict]:
     return [r for r in records if str(r.get("тест", "")).strip().lower() != "да"]
 
@@ -52,9 +72,9 @@ def _compute_sync() -> str:
         return "Sheets не настроен — сводка недоступна."
     sh = client.open_by_key(LOG_SPREADSHEET_ID)
 
-    rel = _real_rows(sh.worksheet("Отношения").get_all_records())
-    limit_rows = _real_rows(sh.worksheet("Лимиты").get_all_records())
-    hostility_rows = _real_rows(sh.worksheet("Выпады").get_all_records())
+    rel = _real_rows(_records(sh.worksheet("Отношения")))
+    limit_rows = _real_rows(_records(sh.worksheet("Лимиты")))
+    hostility_rows = _real_rows(_records(sh.worksheet("Выпады")))
 
     lines = []
 

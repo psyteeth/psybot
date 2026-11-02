@@ -290,7 +290,12 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, t
     is_first = not context.user_data.get("concept_raw_question")
     bot_question = None if is_first else context.user_data.get("concept_last_bot_question", "")
     prior_topic = context.user_data.get("concept_last_topic") or context.user_data.get("concept_raw_question")
-    sources_request = await llm.is_sources_request(text, prior_topic)
+    # 02.11, живой кейс: «Да» на «Хочешь, покажу на простом примере?» ушло в источники — тема
+    # «эволюционное давление» звучит научно. Согласие на крючок проверяем раньше источников.
+    last_answer = context.user_data.get("concept_last_answer")
+    hook_yes = bool(last_answer) and len(text) <= 60 and await llm.is_hook_acceptance(last_answer, text)
+    context.user_data["concept_hook_yes"] = hook_yes
+    sources_request = not hook_yes and await llm.is_sources_request(text, prior_topic)
 
     status = await hostility.precheck(
         update, context, branch="concept", step="ask" if is_first else "clarify",
@@ -374,10 +379,15 @@ async def _process_concept_text(
 
         prior_topic = context.user_data.get("concept_last_topic")
         last_answer = context.user_data.pop("concept_last_answer", None)
-        if last_answer and len(text) <= 60 and await llm.is_hook_acceptance(last_answer, text):
+        hook_yes = context.user_data.pop("concept_hook_yes", None)
+        if hook_yes is None:
+            hook_yes = bool(last_answer) and len(text) <= 60 and await llm.is_hook_acceptance(last_answer, text)
+        if last_answer and hook_yes:
             # согласие на крючок прошлого ответа — продолжаем ту же тему, а не новый вопрос
             if pending_marker:
                 await sheets_logger.update_concept_reaction(pending_marker, user.id, "углубился")
+            if _EXAMPLE_HOOK_RE.search(_last_sentence(last_answer)):
+                return await _respond_story(update, context, prior_topic or text, last_answer, text)
             followup = (
                 f"{prior_topic}\n(бот ответил: {last_answer})\n(клиент ответил «{text}» — согласен на "
                 "предложение в конце ответа бота; выполни именно это предложение, не повторяя уже сказанное)"
@@ -569,6 +579,45 @@ async def _respond_deepen(
 
     _reset_concept_topic_state(context)
     await hostility.maybe_send_self_harm_note(update, context)
+    return ASKING
+
+
+_EXAMPLE_HOOK_RE = re.compile(r"пример|покаж|истори|ситуаци", re.IGNORECASE)
+
+
+def _last_sentence(text: str) -> str:
+    parts = [p for p in re.split(r"(?<=[.!?])\s+", text.strip()) if p]
+    return parts[-1] if parts else ""
+
+
+async def _respond_story(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, topic: str, last_answer: str, text: str
+) -> int:
+    """02.11, решение автора: «Хочешь, покажу на примере?» → «да» — сочинённая бытовая история,
+    в конце «Основано на работах: …» из таблицы."""
+    user = update.effective_user
+    await concept_store.ensure_fresh()
+    context_text = await _build_concept_context(topic)
+    story = await llm.tell_concept_story(topic, last_answer, context_text, _select_citations(topic))
+    if not story:
+        context.user_data["concept_raw_question"] = text
+        context.user_data["concept_combined_question"] = (
+            f"{topic}\n(бот ответил: {last_answer})\n(клиент ответил «{text}» — согласен на предложение)"
+        )
+        context.user_data["concept_hook_followup"] = True
+        return await _route_and_respond(update, context)
+    for part in _split_for_telegram(story):
+        await _send(update, context, "story", part, reply_markup=back_to_menu_keyboard())
+    await sheets_logger.append(
+        "Концепция",
+        [
+            db.now(), user.id, user.username or "", text, story, "нет", "нет", topic,
+            "story", 1.0, 0, "нет", "нет", "",
+        ],
+    )
+    context.user_data["concept_last_topic"] = topic
+    context.user_data["concept_last_answer"] = story
+    _reset_concept_topic_state(context)
     return ASKING
 
 
