@@ -131,6 +131,7 @@ TOOTH_QUESTION_IN_A_TEXT = (
     "А здесь разбираем одну конкретную ситуацию. Опиши, что тебя бесит или задевает в поведении "
     "другого человека."
 )
+A_FACT_MAX_WORDS = 30
 A_FACT_Q = (
     "Понял. А что при этом происходило буквально — какие слова прозвучали, что было сделано? "
     "Опиши так, как это сняла бы видеокамера."
@@ -204,10 +205,12 @@ SCALE_100_RETRY_TEXT = "Напиши, пожалуйста, просто чис�
 
 
 def _parse_scale_100(text: str) -> int | None:
-    m = re.fullmatch(r"\s*(\d{1,3})\s*[.!]?\s*", text)
-    if not m:
+    # 12.11, живой кейс: «На текущий момент это 10, тк мы живы здоровы» → «напиши просто число».
+    # Одно число в тексте принимаем; два («0-50») — переспрашиваем.
+    numbers = re.findall(r"(?<!\d)\d{1,3}(?!\d)", text)
+    if len(numbers) != 1:
         return None
-    n = int(m.group(1))
+    n = int(numbers[0])
     return n if 0 <= n <= 100 else None
 
 
@@ -488,6 +491,13 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def object_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
+    # 12.11, живой кейс: двойной тап «С зубом» — два разбора и два «Какой зуб?» подряд
+    existing_id = context.user_data.get("rel_session_id")
+    if existing_id is not None:
+        existing_row = db.get_relationship_session(existing_id)
+        if existing_row is not None and existing_row["ended_at"] is None:
+            await query.answer("Разбор уже идёт — отвечай в чате выше 👆")
+            return None
     await query.answer()
     return await _start_session(update, context, via_query=True, obj=query.data.split(":", 1)[1])
 
@@ -904,7 +914,9 @@ async def _process_a_event(update: Update, context: ContextTypes.DEFAULT_TYPE, t
 
     # 24.10, карта СМЭР: «Он придрался» — интерпретация, она уйдёт в мысли; само событие — то, что
     # сняла бы камера. Один вопрос, любой ответ принимается.
-    if await llm.is_interpretation(text):
+    # 12.11, живой кейс: после подробного A с конкретикой «как видеокамера» звучало как «не услышал»
+    # («Так я и описала»). Подробный ответ уже содержит факты — не переспрашиваем.
+    if len(text.split()) < A_FACT_MAX_WORDS and await llm.is_interpretation(text):
         await _send(update, context, session_id, "A_fact", A_FACT_Q)
         return A_FACT
 
@@ -1616,11 +1628,14 @@ async def _ask_d(update: Update, context: ContextTypes.DEFAULT_TYPE, session_id:
     row = db.get_relationship_session(session_id)
     if step == "5":
         context.user_data["rel_d_index"] = 5
-        question = D5_QUESTION_TEMPLATE.format(situation=row["a_event"])
+        situation = await llm.neutral_situation(_event_text(row), _other(row)) or row["a_event"]
+        question = D5_QUESTION_TEMPLATE.format(situation=situation)
         await _send(update, context, session_id, "D5", question)
         return D5_QUESTION
     key = "4_tooth" if step == "4" and _is_tooth(row) else _d_base_key(step)
-    question = await llm.adapt_dispute_question(key, row["b_narrative_confirmed"], other=_other(row))
+    question = await llm.adapt_dispute_question(
+        key, row["b_narrative_confirmed"], other=_other(row), event=_event_text(row) if step == "alt" else "",
+    )
     context.user_data["rel_d_prev_q"] = context.user_data.get("rel_d_cur_q", "")
     context.user_data["rel_d_prev_step"] = context.user_data.get("rel_d_step")
     context.user_data["rel_d_step"] = step

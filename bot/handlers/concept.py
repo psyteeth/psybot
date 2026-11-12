@@ -416,6 +416,13 @@ async def _process_concept_text(
         await _maybe_rant_opener(update, text)
         context.user_data["concept_raw_question"] = text
         context.user_data["concept_combined_question"] = text
+        # 12.11, живой кейс: «Что такое „к“ в твоём ответе?» — бот не видел своего ответа и назвал
+        # собственное слово опечаткой. Вопрос про прошлый ответ получает этот ответ в контекст.
+        if last_answer and _REFERS_TO_LAST_RE.search(text):
+            context.user_data["concept_combined_question"] = (
+                f"{text}\n(человек спрашивает про твой предыдущий ответ — объясни своё же слово/мысль "
+                f"оттуда простыми словами, не отрекайся от него: {last_answer})"
+            )
         context.user_data["concept_clarify_count"] = 0
         context.user_data["concept_irritated"] = False
         context.user_data["_concept_pending_marker_to_resolve"] = pending_marker
@@ -582,6 +589,11 @@ async def _respond_deepen(
     return ASKING
 
 
+_REFERS_TO_LAST_RE = re.compile(
+    r"в\s+(тво[её]м|этом|прошлом)\s+ответе|ты\s+(написал|пишешь|сказал)|что\s+(такое|значит|за)\s+[«\"']|"
+    r"не\s+понял[аи]?\b|не\s+поняла",
+    re.IGNORECASE,
+)
 _EXAMPLE_HOOK_RE = re.compile(r"пример|покаж|истори|ситуаци", re.IGNORECASE)
 
 
