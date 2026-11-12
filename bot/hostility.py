@@ -158,6 +158,8 @@ async def precheck(
         return await _resolve_self_harm_confirm(update, context, text)
 
     self_harm_level = await llm.classify_self_harm(text)
+    # 12.11: уровень последнего сообщения — E не должен отражать «хочется сдохнуть» как сдвиг
+    context.user_data["self_harm_last"] = self_harm_level
     if self_harm_level == "acute":
         context.user_data["self_harm_awaiting_confirm"] = True
         context.user_data["self_harm_pending_question"] = bot_question or ""

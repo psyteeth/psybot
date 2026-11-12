@@ -107,6 +107,13 @@ def _belief_question(row, after: bool = False) -> str:
 # ТЗ-доп. №7, п.1/п.3/п.7: финал — ОДНО сообщение: отражение (или «ответ не находится») + ссылки + CTA.
 # «Ответ не находится» — только если на E/E_followup нет сдвига (llm.classify_e_has_shift).
 E_NO_INSIGHT_TEXT = "Похоже, сейчас ответ не находится — и это тоже нормально, не обязательно сразу."
+# 12.11, живой кейс: «хочется либо расстаться, либо сдохнуть от безысходности» финал отразил как
+# «Похоже, у тебя появилось: …». Отчаяние не сдвиг и не повод для «избегание или интеграция».
+E_DESPAIR_TEXT = (
+    "Слышу, как ты вымотан(а) и как сейчас кажется, что выхода нет. Это не то, что вытягивается "
+    "одним разбором, — и не надо вытягивать в одиночку. С такой усталостью важнее живой человек рядом, "
+    "чем ещё один вопрос от бота."
+)
 # B7 (ТЗ 01.10.2026): отдельный текст для исхода «хочу иначе, но не умею» — человек уже сам заметил
 # желание реагировать по-другому (живой пример: «хочется по-другому, но я не умею», сессия 05:16:46).
 E_WANTS_CHANGE_TEXT = (
@@ -1416,7 +1423,7 @@ async def _process_c_feeling(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if await _maybe_meta_reask(update, context, session_id, "C_feeling", feeling_question, text):
         return C_FEELING
     # карта СМЭР: «плохо», «никак» — не эмоция; один раз предлагаем назвать одним словом
-    if VAGUE_FEELING_RE.match(text) and not context.user_data.get("rel_feeling_named", "rel_bridge_q", "rel_bridge_who", "rel_meta_reasked"):
+    if VAGUE_FEELING_RE.match(text) and not context.user_data.get("rel_feeling_named"):
         context.user_data["rel_feeling_named"] = True
         await _send(update, context, session_id, "C_feeling", VAGUE_FEELING_Q, msg_type="уточнение")
         return C_FEELING
@@ -1921,6 +1928,8 @@ def _build_final_text(
             parts.append(FINAL_NEXT_TIME_TEMPLATE.format(insertion=html.escape(insertion)))
     elif outcome == "observation":
         parts = [FINAL_OBSERVATION_TEMPLATE.format(quote=html.escape(quote or ""))]
+    elif outcome == "despair":
+        parts = [html.escape(E_DESPAIR_TEXT)]
     elif outcome == "wants_change":
         parts = [html.escape(E_WANTS_CHANGE_TEXT)]
     else:
@@ -1950,7 +1959,9 @@ async def _finish_e(
     db.finish_relationship_session(session_id, exit_step="E")
     db.update_relationship_session(session_id, e_outcome=outcome, e_has_shift=1 if outcome == "insight" else 0)
     card = None
-    if outcome != "no_change":
+    if outcome == "despair":
+        context.user_data.pop("exit_intent_flagged", None)
+    if outcome not in ("no_change", "despair"):
         row = db.get_relationship_session(session_id)
         card = await llm.build_coping_card(
             row["b_narrative_confirmed"] or "", row["d8_semantic"] or "", row["e_summary"] or "",
@@ -2172,6 +2183,8 @@ async def _process_e_summary(update: Update, context: ContextTypes.DEFAULT_TYPE,
     if await _maybe_meta_reask(update, context, session_id, "E", e_question, text):
         return E_SUMMARY
     db.update_relationship_session(session_id, e_summary=text)
+    if context.user_data.get("self_harm_last") == "mild":
+        return await _finish_e(update, context, session_id, "despair")
 
     await _check_exit_intent(context, session_id, "E", text)
 
@@ -2259,6 +2272,8 @@ async def _process_e_followup(update: Update, context: ContextTypes.DEFAULT_TYPE
         return E_FOLLOWUP
     first_answer = context.user_data.get("rel_e_first_answer", "")
     db.update_relationship_session(session_id, e_summary=f"{first_answer}\n{text}")
+    if context.user_data.get("self_harm_last") == "mild":
+        return await _finish_e(update, context, session_id, "despair")
 
     await _check_exit_intent(context, session_id, "E_followup", text)
 

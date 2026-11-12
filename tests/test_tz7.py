@@ -305,6 +305,29 @@ async def test_13_tooth_bridge():
           final[:100].replace("\n", " "))
 
 
+async def test_15_vague_feeling_and_despair():
+    """12.11: «Хреново» на C_feeling падало с TypeError (бот молчал); «хочется сдохнуть от
+    безысходности» на E финал отразил как сдвиг."""
+    SENT.clear()
+    sid = new_rel_session()
+    ctx = fake_context({"rel_session_id": sid})
+    s1 = await rel._process_c_feeling(fake_update(), ctx, "Хреново")
+    asked = SENT[-1]["text"] if SENT else ""
+    check("15. «Хреново» на чувство → переспрос одним словом, без падения",
+          s1 == rel.C_FEELING and asked == rel.VAGUE_FEELING_Q, f"state={s1}, бот={asked[:60]!r}")
+
+    SENT.clear()
+    sid = new_rel_session(d8_semantic="давление")
+    ctx = fake_context({"rel_session_id": sid, "rel_e_question": "Как тебе теперь хочется на это реагировать?",
+                        "exit_intent_flagged": True})
+    await rel._process_e_summary(fake_update(), ctx, "никак, ничего не работает, хочется либо расстаться, либо сдохнуть уже от безысходности")
+    final = [m for m in SENT if m["step"] == "E_finish"]
+    text = final[-1]["text"] if final else ""
+    check("16. Отчаяние на E → без «появилось», без карточки и «избегание/интеграция»",
+          bool(final) and "появилось" not in text and "Карточка" not in text
+          and not any(m["step"] == "exit_intent_check" for m in SENT), text[:100].replace("\n", " "))
+
+
 def test_3_one_question():
     bad = [m for m in SENT_ALL if m["text"].count("?") > 1]
     check("3. Ни одно сообщение бота не содержит больше одного «?»", not bad,
@@ -319,6 +342,7 @@ async def main():
         test_1_e_shift, test_2_e_empty, test_4_one_at_a_time, test_5_answer_to_previous,
         test_6_b_no_additions, test_7_single_final, test_8_teeth_his, test_9_two_teeth, test_10_no_duplicates,
         test_11_dozhim_wife, test_12_abcde_additions, test_13_tooth_bridge,
+        test_15_vague_feeling_and_despair,
     ]
     for t in tests:
         try:
