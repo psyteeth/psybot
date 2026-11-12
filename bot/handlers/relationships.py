@@ -1599,6 +1599,7 @@ D_NOT_UNDERSTOOD_ACK = "Скажу проще."
 D_PREVIOUS_ANSWER_ACK = "Похоже, это к прошлому вопросу — записал 👌 А теперь:"
 # 06.10, решение автора: когда человек уводит разбор к «я от себя хочу другой реакции», бот не
 # перестраивает разбор, а возвращает к исходной точке — к тому, что задело в другом.
+D_SELF_OK_STEPS = {"alt", "7a", "7b", "8"}
 D_SELF_REACTION_TEMPLATE = (
     "Слышу: хочется от себя другой реакции. Но работа с отношениями в Психостоматологии №1 "
     "начинается с признания, что мне в другом что-то не нравится. Ты начал(а) с этого: «{event}». "
@@ -1686,8 +1687,12 @@ async def _process_d_answer(
             simpler = await llm.simplify_question(current_q)
             await _send(update, context, session_id, D_STEP_LOG[step], f"{ack} {simpler}", msg_type="уточнение")
             return D_QUESTION
+        # 12.11, живой кейс: «может, я придаю этому много важности» на D_alt, «похоже, мне самой пора
+        # решать такое» и разбор «должен/хотелось бы» на D8 — это ответы, а напоминание повторяло вопрос.
+        # На alt/7a/7b/8 говорить о себе — и есть ответ; на остальных — только если ответа нет.
         if (
-            check["self_reaction"] and context.user_data.get("rel_d_self_reminded_step") != step
+            check["self_reaction"] and not check["answers_current"] and step not in D_SELF_OK_STEPS
+            and context.user_data.get("rel_d_self_reminded_step") != step
             and not _is_tooth(db.get_relationship_session(session_id))
         ):
             context.user_data["rel_d_self_reminded_step"] = step
@@ -2141,6 +2146,10 @@ async def _process_e_summary_correction(update: Update, context: ContextTypes.DE
             hidden_need=edit_analysis["hidden_need"], punchline=edit_analysis["punchline"]
         )
         await _send(update, context, session_id, "E_summary_correction", paranoid_text)
+    else:
+        ack = await llm.ack_summary_correction(summary, text)
+        if ack:
+            await _send(update, context, session_id, "E_summary_correction", ack)
 
     row = db.get_relationship_session(session_id)
     db.update_relationship_session(session_id, e_summary=f"Поправка к резюме: {text}")

@@ -328,6 +328,21 @@ async def test_15_vague_feeling_and_despair():
           and not any(m["step"] == "exit_intent_check" for m in SENT), text[:100].replace("\n", " "))
 
 
+async def test_17_d8_self_answer():
+    """12.11: «Похоже, мне самой пора решать такое» на D8 — ответ, а не повод для напоминания."""
+    SENT.clear()
+    sid = new_rel_session()
+    ctx = fake_context({"rel_session_id": sid})
+    await rel._ask_d(fake_update(), ctx, sid, "8")
+    SENT.clear()
+    await rel._process_d_answer(fake_update(), ctx, "Похоже, мне самой пора решать такое")
+    reminded = any("Слышу: хочется от себя другой реакции" in m["text"] for m in SENT)
+    row = db.get_relationship_session(sid)
+    # переспрос D8 проще допустим (ответ по контексту теста слабый) — проверяем только, что нет напоминания
+    check("17. Ответ о себе на D8 → без напоминания «хочется от себя другой реакции»", not reminded,
+          f"напоминание={'да' if reminded else 'нет'}, d8={row['d8_semantic']!r}, бот={[m['text'][:60] for m in SENT]}")
+
+
 def test_3_one_question():
     bad = [m for m in SENT_ALL if m["text"].count("?") > 1]
     check("3. Ни одно сообщение бота не содержит больше одного «?»", not bad,
@@ -342,7 +357,7 @@ async def main():
         test_1_e_shift, test_2_e_empty, test_4_one_at_a_time, test_5_answer_to_previous,
         test_6_b_no_additions, test_7_single_final, test_8_teeth_his, test_9_two_teeth, test_10_no_duplicates,
         test_11_dozhim_wife, test_12_abcde_additions, test_13_tooth_bridge,
-        test_15_vague_feeling_and_despair,
+        test_15_vague_feeling_and_despair, test_17_d8_self_answer,
     ]
     for t in tests:
         try:
