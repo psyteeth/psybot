@@ -14,6 +14,7 @@ from bot import db, llm
 from bot.config import (
     ADMIN_CHAT_ID,
     ADMIN_USERNAME,
+    CONCEPT_CHAT_USERNAME,
     HOSTILITY_CONFIDENCE_THRESHOLD,
     HOSTILITY_MAX_PUNCHLINES,
     LOG_SPREADSHEET_ID,
@@ -47,6 +48,12 @@ SELF_HARM_SOFT_NOTE = (
     "эмоции. Но если вдруг это не так и тебе правда тяжело — пожалуйста, не держи это в себе: "
     "8-800-2000-122 (бесплатно, круглосуточно, по России) или пиши напрямую "
     f"{ADMIN_USERNAME}. Забочусь."
+)
+
+CONCEPT_BOT_COMPLAINT_TEXT = (
+    "Похоже, я тут написал ерунду — извини. Такие вопросы лучше задать в чате психостоматологии "
+    f"{CONCEPT_CHAT_USERNAME}: там ответят живые люди. Если тебя туда пока не добавили — напиши "
+    f"администратору {ADMIN_USERNAME}, добавят."
 )
 
 FINAL_MESSAGE = (
@@ -195,6 +202,17 @@ async def precheck(
         and verdict["target"] != "other"
     ):
         return "none"
+
+    if branch == "concept" and verdict["target"] == "bot":
+        # 13.11, решение автора (живой кейс girlofjulie: «ты туп туп. и Мария не отвечает» после
+        # ерунды бота про школу): претензия к боту в «Концепции» — не выпад, а повод отправить в чат
+        await update.effective_message.reply_text(CONCEPT_BOT_COMPLAINT_TEXT, reply_markup=back_to_menu_keyboard())
+        await sheets_logger.append(
+            "Выпады",
+            [db.now(), update.effective_user.id, update.effective_user.username or "", branch, step, text,
+             verdict["target"], verdict["confidence"], "", "к боту → в чат", CONCEPT_BOT_COMPLAINT_TEXT, "", "", "нет"],
+        )
+        return "hostile"
 
     return await _respond_hostile(update, context, branch, step, text, verdict)
 
