@@ -15,6 +15,8 @@ CONCEPT_SPREADSHEET_ID = os.environ.get(
     "CONCEPT_SPREADSHEET_ID", "1rKTcsHrcMygqBqwT89uPzSIJ5TPOYpVvuNSf9gc2Xlc"
 )
 ADMIN_CHAT_ID = os.environ.get("ADMIN_CHAT_ID", "")
+# ТЗ-доп. №8: куда уходят вопросы «уточню у автора» (Telegram ID Антона). Не задан — в ADMIN_CHAT_ID.
+AUTHOR_CHAT_ID = os.environ.get("AUTHOR_CHAT_ID", "") or ADMIN_CHAT_ID
 
 DATA_DIR = BASE_DIR / "data"
 DATA_DIR.mkdir(exist_ok=True)

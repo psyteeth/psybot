@@ -343,6 +343,64 @@ async def test_17_d8_self_answer():
           f"напоминание={'да' if reminded else 'нет'}, d8={row['d8_semantic']!r}, бот={[m['text'][:60] for m in SENT]}")
 
 
+async def test_18_author_question_and_concept_prefill():
+    """ТЗ-доп. №8: «Да, уточни» → вопрос автору; реплай автора → пользователю и в базу ответов;
+    «Разобрать» из «Концепции» → A предзаполнен, «Так?», после «с кем» — сразу B."""
+    from telegram.ext import ApplicationHandlerStop
+    from bot import author_questions as aq
+    from bot.author_answers import all_entries
+
+    sent = []
+
+    class Bot:
+        async def send_message(self, chat_id, text, **kwargs):
+            sent.append((chat_id, text))
+            return types.SimpleNamespace(message_id=4242)
+
+    ctx = types.SimpleNamespace(user_data={}, bot=Bot())
+    aq.remember(ctx, "Почему в чате Вася так ответил Пете?", "человек: …")
+    aq.AUTHOR_CHAT_ID = "1"
+    query = types.SimpleNamespace(data="ask_author:yes", message=FakeMessage(), answer=_noop, edit_message_reply_markup=_noop)
+    try:
+        await aq.choice(types.SimpleNamespace(effective_user=USER, callback_query=query), ctx)
+    except ApplicationHandlerStop:
+        pass
+    reply = FakeMessage()
+    reply.text = "Спроси в чате сама."
+    reply.reply_to_message = types.SimpleNamespace(message_id=4242)
+    try:
+        await aq.author_reply(types.SimpleNamespace(effective_message=reply), ctx)
+    except ApplicationHandlerStop:
+        pass
+    ok_author = (
+        sent[0][0] == "1" and "Вася" in sent[0][1]
+        and sent[-1] == (USER.id, "Ответ автора:\n\nСпроси в чате сама.")
+        and all_entries()[-1]["answer"] == "Спроси в чате сама."
+    )
+    check("18. «Да, уточни» → автору; реплай → пользователю с «Ответ автора:» и в базу", ok_author, repr(sent[-1]))
+
+    from bot import limits
+
+    async def _lim(*a, **k):
+        return 99
+    limits.get_limit = _lim
+    SENT.clear()
+    ctx = fake_context({"concept_rel_prefill": "в чате подкалывают друг друга и вешают ярлыки"})
+    upd = types.SimpleNamespace(
+        effective_user=USER, effective_message=FakeMessage(), effective_chat=types.SimpleNamespace(id=USER.id),
+        callback_query=types.SimpleNamespace(data="concept_rel", answer=_noop, message=FakeMessage(),
+                                             edit_message_reply_markup=_noop),
+    )
+    s1 = await rel.entry(upd, ctx)
+    upd.callback_query.data = "rel_prefill:yes"
+    s2 = await rel.prefill_confirm(upd, ctx)
+    s3 = await rel._process_who_first(fake_update(), ctx, "участники чата")
+    row = db.get_relationship_session(ctx.user_data["rel_session_id"])
+    check("19. «Разобрать» из «Концепции» → «Так?» → с кем → сразу B",
+          s1 == rel.PREFILL_CONFIRM and s2 == rel.WHO_FIRST and s3 == rel.B_NARRATIVE
+          and row["a_event"] == "в чате подкалывают друг друга и вешают ярлыки", f"states={s1},{s2},{s3}")
+
+
 def test_3_one_question():
     bad = [m for m in SENT_ALL if m["text"].count("?") > 1]
     check("3. Ни одно сообщение бота не содержит больше одного «?»", not bad,
@@ -358,6 +416,7 @@ async def main():
         test_6_b_no_additions, test_7_single_final, test_8_teeth_his, test_9_two_teeth, test_10_no_duplicates,
         test_11_dozhim_wife, test_12_abcde_additions, test_13_tooth_bridge,
         test_15_vague_feeling_and_despair, test_17_d8_self_answer,
+        test_18_author_question_and_concept_prefill,
     ]
     for t in tests:
         try:

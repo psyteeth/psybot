@@ -54,8 +54,8 @@ logger = logging.getLogger(__name__)
     A_FACT,
     # 25.10: единый разбор — «С чем работаем?» → зуб (номер, подтверждение) или человек («с кем?»)
     OBJECT_CHOICE, TOOTH_ASK, TOOTH_CONFIRM, WHO_FIRST,
-    TOOTH_BRIDGE, TOOTH_BRIDGE_CHOICE,
-) = range(34)
+    TOOTH_BRIDGE, TOOTH_BRIDGE_CHOICE, PREFILL_CONFIRM,
+) = range(35)
 
 Q_A = (
     "Опиши событие или поведение другого человека, от которого тебе дискомфортно: "
@@ -485,8 +485,51 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         ]])
         await query.edit_message_text(OBJECT_CHOICE_TEXT, reply_markup=keyboard)
         return OBJECT_CHOICE
+    if query.data == "concept_rel":
+        return await _start_from_concept(update, context)
     obj = "tooth" if query.data == "menu:teeth" else "person"
     return await _start_session(update, context, via_query=True, obj=obj)
+
+
+PREFILL_CONFIRM_TEMPLATE = "Разбираем вот это: «{event}». Так?"
+PREFILL_EDIT_Q = "Напиши своими словами, что именно в поведении людей тебе дискомфортно."
+
+
+async def _start_from_concept(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """ТЗ-доп. №8, разд. 5: из «Концепции» — дискомфорт от поведения людей. A предзаполнен из
+    разговора, бот показывает его и спрашивает «Так?». Разговор «Концепции» закрываем."""
+    from bot.handlers import concept
+
+    chat, user = update.effective_chat, update.effective_user
+    concept.conv_handler._update_state(ConversationHandler.END, (chat.id, user.id))  # noqa: SLF001
+    prefill = context.user_data.pop("concept_rel_prefill", "")
+    state = await _start_session(update, context, via_query=False, skip_ab=True, obj="person", prefill_a=prefill)
+    return state
+
+
+async def prefill_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    session_id = context.user_data.get("rel_session_id")
+    if not session_id:
+        return ConversationHandler.END
+    if update.callback_query:
+        query = update.callback_query
+        await query.answer()
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:  # noqa: BLE001
+            pass
+        await _log_turn(session_id, update.effective_user, "A_prefill", "человек", query.data)
+        if query.data == "rel_prefill:edit":
+            db.update_relationship_session(session_id, a_event=None)
+            await _send(update, context, session_id, "A_prefill", PREFILL_EDIT_Q)
+            return PREFILL_CONFIRM
+    else:
+        # поправил текстом — это и есть A
+        text = update.effective_message.text or ""
+        await _log_turn(session_id, update.effective_user, "A_prefill", "человек", text)
+        db.update_relationship_session(session_id, a_event=text)
+    await _send(update, context, session_id, "A_other", Q_WHO)
+    return WHO_FIRST
 
 
 async def object_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -511,7 +554,7 @@ INTRO_SCREEN_TEXT = (
 
 async def _start_session(
     update: Update, context: ContextTypes.DEFAULT_TYPE, via_query: bool, skip_ab: bool = False, obj: str = "person",
-    prefill_who: str = "", from_tooth: int | None = None,
+    prefill_who: str = "", from_tooth: int | None = None, prefill_a: str = "",
 ) -> int:
     user = update.effective_user
     send = update.callback_query.edit_message_text if via_query else update.effective_message.reply_text
@@ -560,6 +603,16 @@ async def _start_session(
         await update.effective_chat.send_message(Q_TOOTH, reply_markup=back_to_menu_keyboard())
         await _log_turn(session_id, user, "tooth", "бот", Q_TOOTH)
         return TOOTH_ASK
+    if prefill_a:
+        db.update_relationship_session(session_id, a_event=prefill_a)
+        keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("Да", callback_data="rel_prefill:yes"),
+            InlineKeyboardButton("Поправлю", callback_data="rel_prefill:edit"),
+        ]])
+        question = PREFILL_CONFIRM_TEMPLATE.format(event=prefill_a)
+        await send(question, reply_markup=keyboard)
+        await _log_turn(session_id, user, "A_prefill", "бот", question)
+        return PREFILL_CONFIRM
     if prefill_who:
         # 26.10: разбор, начатый из зуба, — «с кем» уже названо на мосте
         other = await llm.classify_other_person_full(prefill_who)
@@ -805,6 +858,10 @@ async def _process_who_first(update: Update, context: ContextTypes.DEFAULT_TYPE,
         other_person_label=None if other["is_evaluation"] else (other["label"] or text.strip()[:60]),
         other_person_gender=other["gender"],
     )
+    prefilled_a = db.get_relationship_session(session_id)["a_event"]
+    if prefilled_a:
+        # ТЗ-доп. №8, разд. 5: A пришёл из «Концепции» и подтверждён — сразу дальше
+        return await _after_a(update, context, session_id, prefilled_a)
     possessive = {"f": "её", "m": "его", "pl": "их"}.get(other["gender"], "его или её")
     await _send(update, context, session_id, "A", Q_A_AFTER_WHO.replace("его или её", possessive))
     return A_EVENT
@@ -2338,7 +2395,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 conv_handler = ConversationHandler(
-    entry_points=[CallbackQueryHandler(entry, pattern="^menu:(relationships|teeth|analysis)$")],
+    entry_points=[CallbackQueryHandler(entry, pattern="^(menu:(relationships|teeth|analysis)|concept_rel)$")],
     states={
         A_EVENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, a_event)],
         A_PRIOR_EVENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, a_prior_event)],
@@ -2371,6 +2428,10 @@ conv_handler = ConversationHandler(
         ],
         WHO_FIRST: [MessageHandler(filters.TEXT & ~filters.COMMAND, who_first)],
         TOOTH_BRIDGE: [MessageHandler(filters.TEXT & ~filters.COMMAND, tooth_bridge)],
+        PREFILL_CONFIRM: [
+            CallbackQueryHandler(prefill_confirm, pattern="^rel_prefill:"),
+            MessageHandler(filters.TEXT & ~filters.COMMAND, prefill_confirm),
+        ],
         TOOTH_BRIDGE_CHOICE: [
             CallbackQueryHandler(tooth_bridge_choice, pattern="^rel_bridge:"),
             MessageHandler(filters.TEXT & ~filters.COMMAND, tooth_bridge_text),

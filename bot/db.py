@@ -113,6 +113,22 @@ CREATE TABLE IF NOT EXISTS events (
     event TEXT NOT NULL,
     meta TEXT
 );
+
+-- ТЗ-доп. №8: «не знаю → уточню у автора». author_msg_id — id сообщения у автора, на которое он
+-- отвечает реплаем.
+CREATE TABLE IF NOT EXISTS author_questions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    asked_at TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    username TEXT,
+    branch TEXT NOT NULL,
+    question TEXT NOT NULL,
+    context TEXT,
+    author_msg_id INTEGER,
+    answered_at TEXT,
+    answer TEXT,
+    delivered INTEGER
+);
 """
 
 
@@ -457,6 +473,46 @@ def log_limit_hit(user_id: int, branch: str) -> None:
 
 
 # --- «Секреты из таблицы» (мини-ТЗ 29.09) ---
+
+def create_author_question(user_id: int, username: Optional[str], branch: str, question: str, context: str) -> tuple[int, str]:
+    asked_at = now()
+    with get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO author_questions (asked_at, user_id, username, branch, question, context) VALUES (?, ?, ?, ?, ?, ?)",
+            (asked_at, user_id, username, branch, question, context),
+        )
+        return cur.lastrowid, asked_at
+
+
+def set_author_question_msg(question_id: int, author_msg_id: int) -> None:
+    with get_conn() as conn:
+        conn.execute("UPDATE author_questions SET author_msg_id=? WHERE id=?", (author_msg_id, question_id))
+
+
+def get_author_question_by_msg(author_msg_id: int) -> Optional[sqlite3.Row]:
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT * FROM author_questions WHERE author_msg_id=? ORDER BY id DESC LIMIT 1", (author_msg_id,)
+        ).fetchone()
+
+
+def answer_author_question(question_id: int, answer: str, delivered: bool) -> str:
+    answered_at = now()
+    with get_conn() as conn:
+        conn.execute(
+            "UPDATE author_questions SET answered_at=?, answer=?, delivered=? WHERE id=?",
+            (answered_at, answer, 1 if delivered else 0, question_id),
+        )
+    return answered_at
+
+
+def answered_author_questions() -> list[sqlite3.Row]:
+    """Ответы автора на вопросы пользователей — пополняют базу «Ответы автора» для ветки «Концепция»."""
+    with get_conn() as conn:
+        return conn.execute(
+            "SELECT id, question, answer FROM author_questions WHERE answer IS NOT NULL ORDER BY id"
+        ).fetchall()
+
 
 def get_seen_secret_ids(user_id: int) -> set[str]:
     with get_conn() as conn:

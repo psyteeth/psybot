@@ -10,7 +10,7 @@ from telegram.ext import (
     filters,
 )
 
-from bot import db
+from bot import author_questions, db
 from bot.config import (
     PERSISTENCE_PATH,
     STATS_WEEKLY_HOUR_UTC,
@@ -43,6 +43,10 @@ def build_application():
     # Порядок важен: ветки должны идти до общих /start и текстового фолбэка,
     # чтобы их собственные fallback-обработчики (/cancel, /start, menu:back)
     # успевали перехватить апдейт, пока разговор активен.
+    # ТЗ-доп. №8: кнопки «уточню у автора» и реплай автора — раньше веток, в любом состоянии разговора
+    for handler in author_questions.handlers():
+        application.add_handler(handler, group=-1)
+
     application.add_handler(relationships.conv_handler)
     application.add_handler(teeth.conv_handler)
     application.add_handler(concept.conv_handler)

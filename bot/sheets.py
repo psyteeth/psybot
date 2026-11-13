@@ -110,6 +110,15 @@ LIMIT_OVERRIDES_TAB = "Лимиты (ручные)"
 RELATIVES_HEADER = ["user_id", "комментарий"]
 RELATIVES_TAB = "Родственники"
 
+# ТЗ-доп. №8: «не знаю → уточню у автора»
+AUTHOR_QUESTIONS_TAB = "Вопросы автору"
+AUTHOR_QUESTIONS_HEADER = [
+    "timestamp_вопроса", "user_id", "username", "ветка", "вопрос", "контекст",
+    "timestamp_ответа", "ответ_автора", "доставлено", "тест",
+]
+AUTHOR_ANSWERS_TAB = "Ответы автора"
+AUTHOR_ANSWERS_HEADER = ["timestamp", "user_id", "username", "категория", "вопрос", "ответ", "тест"]
+
 SHEET_TABS = {
     "Отношения": RELATIONSHIP_HEADER,
     "Зубы": TEETH_HEADER,
@@ -121,6 +130,8 @@ SHEET_TABS = {
     SECRETS_TAB: SECRETS_HEADER,
     LIMIT_OVERRIDES_TAB: LIMIT_OVERRIDES_HEADER,
     RELATIVES_TAB: RELATIVES_HEADER,
+    AUTHOR_QUESTIONS_TAB: AUTHOR_QUESTIONS_HEADER,
+    AUTHOR_ANSWERS_TAB: AUTHOR_ANSWERS_HEADER,
 }
 
 
@@ -225,6 +236,26 @@ class SheetsLogger:
             await asyncio.to_thread(self._update_secret_reaction_sync, chunk_id, user_id, reaction)
         except Exception:  # noqa: BLE001
             logger.exception("update_secret_reaction() упал")
+
+    def _update_author_question_sync(self, asked_at: str, user_id: int, answered_at: str, answer: str, delivered: bool) -> None:
+        if not self._client or not LOG_SPREADSHEET_ID:
+            return
+        try:
+            ws = self._client.open_by_key(LOG_SPREADSHEET_ID).worksheet(AUTHOR_QUESTIONS_TAB)
+            values = ws.get_all_values()
+            for i in range(len(values) - 1, 0, -1):
+                row = values[i]
+                if len(row) > 1 and row[0] == asked_at and row[1] == str(user_id):
+                    ws.update(range_name=f"G{i + 1}:I{i + 1}", values=[[answered_at, answer, "да" if delivered else "нет"]])
+                    return
+        except Exception:  # noqa: BLE001
+            logger.exception("Не удалось обновить строку «Вопросы автору» (ts=%s)", asked_at)
+
+    async def update_author_question(self, asked_at: str, user_id: int, answered_at: str, answer: str, delivered: bool) -> None:
+        try:
+            await asyncio.to_thread(self._update_author_question_sync, asked_at, user_id, answered_at, answer, delivered)
+        except Exception:  # noqa: BLE001
+            logger.exception("update_author_question() упал")
 
     def _update_concept_reaction_sync(self, timestamp: str, user_id: int, reaction: str) -> None:
         if not self._client or not LOG_SPREADSHEET_ID:

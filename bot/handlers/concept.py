@@ -15,7 +15,8 @@ from telegram.ext import (
 
 from bot import db, debounce, hostility, limits, llm
 from bot.handlers import teeth
-from bot.author_answers import ENTRIES as AUTHOR_ANSWERS
+from bot import author_questions
+from bot.author_answers import all_entries as author_entries
 from bot.config import (
     ADMIN_CHAT_ID,
     ADMIN_USERNAME,
@@ -39,10 +40,6 @@ ASKING, CLARIFY = range(2)
 
 INTRO_TEXT = "Спрашивай что угодно о концепции психостоматологии — отвечу по нашим материалам."
 LIMIT_TEXT = limit_exhausted_text("Концепция")
-NOT_CONVERGED_TEXT = (
-    "Кажется, мы с тобой смотрим на это по-разному, и словами тут вряд ли договоримся. "
-    f"Если хочешь обсудить дальше — пиши {ADMIN_USERNAME}."
-)
 OFFTOPIC_TEXT = (
     f"Это не про концепцию психостоматологии — такое лучше обсудить в чате психостоматологии, "
     f"{CONCEPT_CHAT_USERNAME}. Чтобы получить туда доступ, напиши {ADMIN_USERNAME} — добавят."
@@ -78,7 +75,57 @@ async def _send(update: Update, context: ContextTypes.DEFAULT_TYPE, step: str, t
     target = update.callback_query.message if update.callback_query else update.effective_message
     result = await target.reply_text(text, **kwargs)
     await _log_turn(context, update.effective_user, step, "бот", text, msg_type)
+    if step in HISTORY_STEPS:
+        history = context.user_data.get("concept_bot_history", [])
+        context.user_data["concept_bot_history"] = (history + [text])[-HISTORY_SIZE:]
     return result
+
+
+# ТЗ-доп. №8, разд. 7: последние ответы бота целиком — в контекст каждого ответа
+HISTORY_STEPS = {"answer", "deepen", "story", "secret", "secret_detail", "sources", "clarify"}
+HISTORY_SIZE = 4
+
+
+def _history(context: ContextTypes.DEFAULT_TYPE) -> str:
+    return "\n\n---\n\n".join(context.user_data.get("concept_bot_history", []))
+
+
+def _needs_author(answer: str | None) -> bool:
+    return bool(answer) and llm.NEED_AUTHOR_MARKER in answer
+
+
+async def _offer_author(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_question: str) -> int:
+    """ТЗ-доп. №8, разд. 2: ответа нет в материалах — не придумываем, предлагаем спросить автора."""
+    history = context.user_data.get("concept_bot_history", [])[-2:]
+    ctx_lines = [f"бот: {h[:500]}" for h in history] + [f"человек: {raw_question}"]
+    author_questions.remember(context, raw_question, "\n".join(ctx_lines))
+    await _send(update, context, "need_author", author_questions.UNKNOWN_TEXT, reply_markup=author_questions.keyboard())
+    _reset_concept_topic_state(context)
+    return ASKING
+
+
+_DISCOMFORT_HINT_RE = re.compile(
+    r"беси|раздража|атаку|агресс|неприятн|задева|напряга|хам|груб|ярлык|подъ[её]б|подкал|наезжа|обидн|"
+    r"токсичн|жёстк|жестк|в\s+чате",
+    re.IGNORECASE,
+)
+REL_OFFER_TEXT = (
+    "Похоже, тебя это задевает. Можно разобрать это в «Отношениях»: что тебе хотелось бы, как люди "
+    "общались, а как они общаются на самом деле. Разберём?"
+)
+
+
+async def _maybe_offer_relationships(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_question: str) -> None:
+    """ТЗ-доп. №8, разд. 5: дискомфорт от поведения людей → кнопка «Разобрать» с предзаполненным A."""
+    if context.user_data.get("concept_rel_offered") or not _DISCOMFORT_HINT_RE.search(raw_question):
+        return
+    found = await llm.detect_people_discomfort(raw_question)
+    if not found["discomfort"]:
+        return
+    context.user_data["concept_rel_offered"] = True
+    context.user_data["concept_rel_prefill"] = found["event"]
+    keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("Разобрать", callback_data="concept_rel")]])
+    await _send(update, context, "rel_offer", REL_OFFER_TEXT, reply_markup=keyboard)
 
 
 RANT_OPENERS = [
@@ -555,14 +602,22 @@ async def _respond_deepen(
 
     # 05.10: «подробно» — полноценный разбор по материалам всей таблицы, а не «секрет» из 1-3 кусков
     context_text = await _build_concept_context(question)
-    similar_nums = await llm.pick_similar_author_answers(question, AUTHOR_ANSWERS)
-    author_examples = [e for e in AUTHOR_ANSWERS if e["num"] in similar_nums]
-    answer = await llm.answer_concept_question(question, context_text, author_examples, simple=False)
+    if await llm.is_cant_see_question(raw_question):
+        return await _offer_author(update, context, raw_question)
+    entries = author_entries()
+    similar_nums = await llm.pick_similar_author_answers(question, entries)
+    author_examples = [e for e in entries if e["num"] in similar_nums]
+    answer = await llm.answer_concept_question(
+        question, context_text, author_examples, simple=False, history=_history(context),
+    )
+    if _needs_author(answer):
+        return await _offer_author(update, context, raw_question)
     answer = _with_diagnostics_invite(raw_question, answer) if answer else answer
     if not answer:
         return await _respond_simple(update, context, raw_question, question, route, capped=False)
 
     await _send(update, context, "deepen", answer, reply_markup=back_to_menu_keyboard())
+    await _maybe_offer_relationships(update, context, raw_question)
     context.user_data["concept_last_topic"] = question
     context.user_data["concept_last_answer"] = answer
 
@@ -755,9 +810,16 @@ async def _respond_simple(
     context_text = await _build_concept_context(question)
 
     dispute = await llm.is_dispute(raw_question)
-    similar_nums = await llm.pick_similar_author_answers(question, AUTHOR_ANSWERS)
-    author_examples = [e for e in AUTHOR_ANSWERS if e["num"] in similar_nums]
-    answer = await llm.answer_concept_question(question, context_text, author_examples, simple=True)
+    if await llm.is_cant_see_question(raw_question):
+        return await _offer_author(update, context, raw_question)
+    entries = author_entries()
+    similar_nums = await llm.pick_similar_author_answers(question, entries)
+    author_examples = [e for e in entries if e["num"] in similar_nums]
+    answer = await llm.answer_concept_question(
+        question, context_text, author_examples, simple=True, history=_history(context),
+    )
+    if _needs_author(answer):
+        return await _offer_author(update, context, raw_question)
     answer = _with_diagnostics_invite(raw_question, answer)
 
     if capped:
@@ -765,14 +827,12 @@ async def _respond_simple(
         assumption = readings[0] if readings else route.get("missing") or question
         answer = f"Я понял так: {assumption}.\n\n{answer}\n\nЕсли про другое, напиши одним предложением."
 
-    streak = context.user_data.get("concept_dispute_streak", 0)
-    streak = streak + 1 if dispute else 0
-    context.user_data["concept_dispute_streak"] = streak
-    escalated = streak >= DISPUTE_STREAK_THRESHOLD
-    if escalated:
-        answer = f"{answer}\n\n{NOT_CONVERGED_TEXT}"
+    # ТЗ-доп. №8: «словами вряд ли договоримся, пиши @psyteeth» после спора убрано — бот отвечает
+    # по материалам, а чего не знает — предлагает уточнить у автора
+    escalated = False
 
     await _send(update, context, "answer", answer, reply_markup=back_to_menu_keyboard())
+    await _maybe_offer_relationships(update, context, raw_question)
     context.user_data["concept_last_topic"] = question
     context.user_data["concept_last_answer"] = answer
 
@@ -823,6 +883,8 @@ async def entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     db.upsert_user(user.id, user.username)
 
+    context.user_data.pop("concept_rel_offered", None)
+    context.user_data.pop("concept_bot_history", None)
     if await _check_limit(update, context, user, via_query=True):
         return ConversationHandler.END
 
