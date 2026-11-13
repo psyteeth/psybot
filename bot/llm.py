@@ -2694,3 +2694,24 @@ async def is_cant_see_question(text: str) -> bool:
     except Exception:  # noqa: BLE001
         logger.exception("is_cant_see_question упал")
         return False
+
+
+# 13.11, решение автора (живой кейс girlofjulie): вопросы про школу исцеления отношений, зубное
+# кунг-фу, как там идёт работа — бот наговорил «никакой школы и тренера нет», про пломбы и т.п.
+# Единственный ответ — спросить участников в чате психостоматологии.
+PROGRAM_QUESTION_SYSTEM = (
+    "Ветка «Концепция» психостоматологического бота. Спрашивает ли человек про программы и форматы "
+    "работы проекта — школа исцеления отношений, зубное кунг-фу (ЗК), тренер, задания участников, "
+    "как идёт работа, когда пришёл в школу, чем отличаются программы, что внутри, сколько длится, как "
+    "устроено обучение? Вопрос про саму концепцию (связь зубов и отношений, психологические идеи) — no. "
+    "Ответь ровно одним словом: yes или no."
+)
+
+
+async def is_program_question(text: str, last_answer: str = "") -> bool:
+    user_text = f"Прошлый ответ бота: {last_answer}\nСообщение: {text}" if last_answer else text
+    try:
+        return "yes" in (await _ask(PROGRAM_QUESTION_SYSTEM, user_text, MODEL_SONNET, max_tokens=10)).lower()
+    except Exception:  # noqa: BLE001
+        logger.exception("is_program_question упал")
+        return False

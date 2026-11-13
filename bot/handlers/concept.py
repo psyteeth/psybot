@@ -104,6 +104,22 @@ async def _offer_author(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_
     return ASKING
 
 
+PROGRAM_QUESTION_TEXT = (
+    "Про то, как устроены школа исцеления отношений и зубное кунг-фу и как там идёт работа, лучше всего "
+    f"расскажут те, кто уже внутри. Спроси в чате психостоматологии {CONCEPT_CHAT_USERNAME} — прямо так и "
+    "пиши: «Дорогие участники исцеления отношений и зубного кунг-фу, расскажите, что и как происходит». "
+    f"Если тебя туда пока не добавили — напиши администратору {ADMIN_USERNAME}, добавят."
+)
+
+
+async def _respond_program_question(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_question: str) -> int:
+    """13.11, решение автора: про программы и формат работы — только к участникам в чат."""
+    await _send(update, context, "program_question", PROGRAM_QUESTION_TEXT, reply_markup=back_to_menu_keyboard())
+    context.user_data["concept_last_answer"] = PROGRAM_QUESTION_TEXT
+    _reset_concept_topic_state(context)
+    return ASKING
+
+
 _DISCOMFORT_HINT_RE = re.compile(
     r"беси|раздража|атаку|агресс|неприятн|задева|напряга|хам|груб|ярлык|подъ[её]б|подкал|наезжа|обидн|"
     r"токсичн|жёстк|жестк|в\s+чате",
@@ -516,6 +532,10 @@ async def _route_and_respond(update: Update, context: ContextTypes.DEFAULT_TYPE)
     raw_question = context.user_data.get("concept_raw_question", question)
     clarify_count = context.user_data.get("concept_clarify_count", 0)
     irritated = context.user_data.get("concept_irritated", False)
+
+    # 13.11: про программы и формат работы — до роутера, иначе он сперва переспрашивает
+    if await llm.is_program_question(question, context.user_data.get("concept_last_answer") or ""):
+        return await _respond_program_question(update, context, raw_question)
 
     await secrets_index.ensure_fresh()
     scored = secrets_index.search_scored(question, top_k=5) if secrets_index.is_loaded() else []
