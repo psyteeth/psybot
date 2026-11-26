@@ -10,7 +10,7 @@ from telegram.ext import (
     filters,
 )
 
-from bot import author_questions, db
+from bot import author_questions, db, secretary_bot
 from bot.config import (
     PERSISTENCE_PATH,
     STATS_WEEKLY_HOUR_UTC,
@@ -46,6 +46,9 @@ def build_application():
     # ТЗ-доп. №8: кнопки «уточню у автора» и реплай автора — раньше веток, в любом состоянии разговора
     for handler in author_questions.handlers():
         application.add_handler(handler, group=-1)
+    # «Секретарь созвонов»: ежедневная задача 09:00 UTC, кнопки и реплаи Антона (группы -3…-5),
+    # посты тренеров из «Исцеления отношений». Выключен без SECRETARY_ENABLED=1.
+    secretary_bot.register(application)
 
     application.add_handler(relationships.conv_handler)
     application.add_handler(teeth.conv_handler)

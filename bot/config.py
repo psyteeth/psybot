@@ -169,6 +169,29 @@ STATS_WEEKLY_HOUR_UTC = 3
 STATS_WEEKLY_MINUTE_UTC = 0
 
 
+# --- «Секретарь созвонов» (docs/ТЗ_секретарь_созвонов.md, bot/secretary*.py) ---
+# Выключен, пока владелец не скажет «включай» (SECRETARY_ENABLED=1 в .env на сервере).
+SECRETARY_ENABLED = os.environ.get("SECRETARY_ENABLED", "").strip().lower() in ("1", "true", "yes", "да")
+# 16:00 по Таиланду = 09:00 UTC — через час после последних созвонов
+SECRETARY_HOUR_UTC = int(os.environ.get("SECRETARY_HOUR_UTC", "9"))
+SECRETARY_MINUTE_UTC = int(os.environ.get("SECRETARY_MINUTE_UTC", "0"))
+SECRETARY_REMIND_HOURS = 3  # одно напоминание, если по ❓ так ничего и не пришло
+SECRETARY_MORNING_HOUR_UTC = int(os.environ.get("SECRETARY_MORNING_HOUR_UTC", "3"))  # 10:00 по Таиланду
+# Чьи созвоны собирать: первое слово блока в колонке B таблицы эфиров («АНТОН ❤️ ОРАКУЛ…»). Пусто — все.
+SECRETARY_TRAINER = os.environ.get("SECRETARY_TRAINER", "АНТОН").strip().upper()
+# Чьи посты в «Исцелении отношений» считать постами тренеров (Telegram user_id через запятую)
+SECRETARY_TRAINER_IDS = {
+    int(x) for x in (os.environ.get("SECRETARY_TRAINER_IDS", "") or ADMIN_CHAT_ID).replace(" ", "").split(",")
+    if x.lstrip("-").isdigit()
+}
+EFIRY_SPREADSHEET_ID = os.environ.get("EFIRY_SPREADSHEET_ID", "1p-Qw2ibqJLJUzZBRIbcHU7xgKyjQ0vpL2xHJqHVCi-M")
+PARTICIPANTS_SPREADSHEET_ID = os.environ.get(
+    "PARTICIPANTS_SPREADSHEET_ID", "1ZVLStap4vQI3R3B_kpKohpFsW65mGA6CxK4rGMVFIWY"
+)
+# Таблица «Расшифровки созвонов» в папке «Созвоны — расшифровки» (создана владельцем 26.11).
+TRANSCRIPTS_SPREADSHEET_ID = os.environ.get("TRANSCRIPTS_SPREADSHEET_ID", "1aPaKLHeiMP-fUe0nl7eJAMeGasgbUAxDxDd_pCfISTI")
+
+
 def limit_exhausted_text(branch_label: str) -> str:
     return (
         f"Лимит по «{branch_label}» на этот месяц закончился. Обновится в начале следующего "
