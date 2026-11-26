@@ -210,6 +210,9 @@ async def refresh_day(day: dt.date, until_msk: dt.time | None) -> tuple[list, li
         if final and row["status"] not in sdb.FINAL_STATUSES:
             sdb.update_slot(sid, status=final)
 
+    # Слот, которого больше нет в таблице эфиров (ячейку поправили — «Яна, Ксения» стали двумя слотами),
+    # пустой и не разобранный — убираем, чтобы не висел ❓ в списках и напоминаниях.
+    sdb.drop_stale_slots(dkey, keep=set(ids))
     rows = [sdb.get_slot(i) for i in ids]
     by_index = {i: r for i, r in enumerate(rows)}
 

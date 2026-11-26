@@ -136,6 +136,24 @@ def slots_of_day(day: str) -> list:
         return conn.execute("SELECT * FROM sec_slots WHERE day = ? ORDER BY time_msk, id", (day,)).fetchall()
 
 
+def drop_stale_slots(day: str, keep: set[int]) -> int:
+    """Удаляет слоты дня не из keep, если у них нет материала, черновиков и вопросов."""
+    n = 0
+    with get_conn() as conn:
+        for r in conn.execute("SELECT id FROM sec_slots WHERE day = ? AND status = 'pending'", (day,)).fetchall():
+            sid = r["id"]
+            if sid in keep:
+                continue
+            busy = any(
+                conn.execute(f"SELECT 1 FROM {t} WHERE slot_id = ? LIMIT 1", (sid,)).fetchone()
+                for t in ("sec_materials", "sec_drafts", "sec_questions")
+            )
+            if not busy:
+                conn.execute("DELETE FROM sec_slots WHERE id = ?", (sid,))
+                n += 1
+    return n
+
+
 def update_slot(slot_id: int, **fields) -> None:
     if not fields:
         return

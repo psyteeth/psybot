@@ -591,3 +591,14 @@ class NickTranslitTests(unittest.TestCase):
         p = S.Participant(3, {"ник_tg": "@glafira_g", "имя": "Глафира"})
         self.assertTrue(S.mentions("@glafira_g\n🔴 стараться", "Глафира", p))
         self.assertFalse(S.mentions("@glafira_other про маму", "Глафира", p))
+
+
+class StaleSlotTests(unittest.TestCase):
+    def test_drop_only_empty_pending(self):
+        keep = sdb.upsert_slot("2026-12-01", "08:00", "Зоя", "АНТОН")
+        stale = sdb.upsert_slot("2026-12-01", "08:15", "Зоя, Фекла", "АНТОН")
+        busy = sdb.upsert_slot("2026-12-01", "08:30", "Старое", "АНТОН")
+        sdb.add_material(busy, "личка", "x", "заметка")
+        self.assertEqual(sdb.drop_stale_slots("2026-12-01", {keep}), 1)
+        self.assertEqual({s["id"] for s in sdb.slots_of_day("2026-12-01")}, {keep, busy})
+        self.assertIsNone(sdb.get_slot(stale))
