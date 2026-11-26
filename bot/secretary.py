@@ -184,9 +184,16 @@ def parse_efiry_grid(values: list[list[str]], tab_year: int, tab_month: int) -> 
                     break
             if day is None:
                 continue
-            slots.append(Slot(day=day, time_msk=t, name=" ".join(name.split()), trainer=trainer_by_row.get(r, "")))
+            # «Яна, Ксения» — двое в одном слоте: у каждого своя строка
+            for one in split_slot_names(name):
+                slots.append(Slot(day=day, time_msk=t, name=one, trainer=trainer_by_row.get(r, "")))
     slots.sort(key=lambda s: (s.day, s.time_msk))
     return slots
+
+
+def split_slot_names(cell: str) -> list[str]:
+    parts = re.split(r"\s*(?:[,;/+&]|\s\bи\b\s)\s*", " ".join(cell.split()))
+    return [p.strip() for p in parts if p.strip()]
 
 
 def slots_for_day(slots: list[Slot], day: date, trainer: str = "", until_msk: time | None = None) -> list[Slot]:
@@ -485,21 +492,37 @@ class TranscriptPiece:
     shared_with: list[Slot]  # другие слоты, попавшие в ту же запись
 
 
-def assign_transcripts(slots: list[Slot], transcripts: list[Transcript], tolerance_min: int = 5) -> dict[int, list[TranscriptPiece]]:
-    """Индекс слота → куски расшифровок. Переименованный файл с именем участника идёт к нему целиком;
-    иначе — по пересечению времени записи со слотом (15 минут ± допуск). Если одна запись покрывает
-    несколько слотов подряд, каждому достаётся отрезок от начала своего слота до начала следующего
-    (с запасом), а в shared_with — соседи: Claude делит по смыслу и спрашивает при сомнении."""
+def assign_transcripts(
+    slots: list[Slot], transcripts: list[Transcript], tolerance_min: int = 5, drift_min: int = 30
+) -> dict[int, list[TranscriptPiece]]:
+    """Индекс слота → куски расшифровок. Три прохода:
+    1) переименованный файл («Янка Хэппиэндово», «Гульгназ боль») — к участнику по имени в названии
+       (уменьшительные, падежи, одна опечатка);
+    2) остальные — по пересечению времени записи с 15 минутами слота; если одна запись покрывает
+       несколько слотов, каждому достаётся отрезок до начала следующего, а в shared_with — соседи
+       (Claude делит по смыслу и спрашивает при сомнении);
+    3) запись, которая не попала ни в один слот (созвоны съезжают по времени), — к ближайшему по
+       началу свободному слоту не дальше drift_min минут, если такой один.
+    Слот, получивший запись по имени, во 2–3 проходах уже не участвует."""
     tol = timedelta(minutes=tolerance_min)
     out: dict[int, list[TranscriptPiece]] = {}
+    rest = []
     for tr in transcripts:
         label = tr.label
-        if label:
-            by_name = [i for i, s in enumerate(slots) if s.day == tr.start_th.date() and _label_mentions(label, s.name)]
-            if len(by_name) == 1:
-                out.setdefault(by_name[0], []).append(TranscriptPiece(tr, tr.text, []))
-                continue
-        covered = [i for i, s in enumerate(slots) if _covers(tr, s, tol)]
+        by_name = [
+            i for i, s in enumerate(slots) if label and s.day == tr.start_th.date() and _label_mentions(label, s.name)
+        ] if label else []
+        if len(by_name) == 1:
+            out.setdefault(by_name[0], []).append(TranscriptPiece(tr, tr.text, []))
+        else:
+            rest.append(tr)
+    claimed = set(out)
+    leftovers = []
+    for tr in rest:
+        covered = [i for i, s in enumerate(slots) if i not in claimed and _covers(tr, s, tol)]
+        if not covered:
+            leftovers.append(tr)
+            continue
         for k, i in enumerate(covered):
             s = slots[i]
             if len(covered) == 1:
@@ -511,6 +534,15 @@ def assign_transcripts(slots: list[Slot], transcripts: list[Transcript], toleran
             others = [slots[j] for j in covered if j != i]
             if piece.strip():
                 out.setdefault(i, []).append(TranscriptPiece(tr, piece, others))
+    drift = timedelta(minutes=drift_min)
+    for tr in leftovers:
+        free = [
+            (abs(tr.start_th - s.start_th), i) for i, s in enumerate(slots)
+            if i not in out and s.day == tr.start_th.date() and abs(tr.start_th - s.start_th) <= drift
+        ]
+        free.sort()
+        if free and (len(free) == 1 or free[0][0] != free[1][0]):
+            out[free[0][1]] = [TranscriptPiece(tr, tr.text, [])]
     return out
 
 
@@ -522,11 +554,34 @@ def _covers(tr: Transcript, s: Slot, tol: timedelta, min_overlap: timedelta = ti
     return overlap >= min_overlap or abs(tr.start_th - s.start_th) <= tol
 
 
+def _edit1(a: str, b: str) -> bool:
+    """Не больше одной вставки/удаления/замены — опечатка в имени файла («Гульгназ»)."""
+    if abs(len(a) - len(b)) > 1:
+        return False
+    i = 0
+    while i < min(len(a), len(b)) and a[i] == b[i]:
+        i += 1
+    return a[i + 1:] == b[i + 1:] or a[i:] == b[i + 1:] or a[i + 1:] == b[i:]
+
+
+def name_like(word: str, name: str) -> bool:
+    """Слово из названия файла или поста похоже на имя: то же имя, уменьшительное, падеж/-ка
+    («Янка» → «Яна»), одна опечатка у длинных имён."""
+    word, name = norm(word).lstrip("@"), norm(name).lstrip("@")
+    if len(name) < 3 or len(word) < 3:
+        return False
+    if same_name(word, name) or _stem_eq(word, name):
+        return True
+    if name[-1] in "ая" and any(word.startswith(name[:-1] + suf) for suf in ("к", "ч", "ш", "х", "ень", "йк")):
+        return True  # Яна → Янка, Ира → Ирочка/Ирка
+    return len(name) >= 5 and _edit1(word, name)
+
+
 def _label_mentions(label: str, name: str) -> bool:
     toks = _tokens(name)
     if not toks:
         return False
-    return any(same_name(t, toks[0]) for t in _tokens(label))
+    return any(name_like(t, toks[0]) for t in _tokens(label))
 
 
 # ---------------------------------------------------------------- посты в чате

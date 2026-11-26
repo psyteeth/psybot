@@ -535,3 +535,46 @@ class TranscriberUploadTests(unittest.TestCase):
         self.assertEqual(tt.upload(tmp, meta, ws), 0)  # повторно не грузит
         [tr] = S.transcripts_from_values([[str(c) for c in r] for r in ws.get_all_values()])
         self.assertEqual(tr.start_th, datetime(2026, 11, 26, 12, 0))
+
+
+class DriftAndLabelTests(unittest.TestCase):
+    """Как 26.11: файлы переименованы с опечатками и уменьшительными, созвоны съезжают по времени,
+    в одном слоте двое."""
+    D = date(2026, 11, 26)
+
+    def test_split_names(self):
+        self.assertEqual(S.split_slot_names("Дуся, Фекла"), ["Дуся", "Фекла"])
+        self.assertEqual(S.split_slot_names("Марфа и Глаша"), ["Марфа", "Глаша"])
+        self.assertEqual(S.split_slot_names("Дуся Х."), ["Дуся Х."])
+        rows = efiry_grid()
+        rows[3][7] = "Дуся, Фекла"
+        names = [s.name for s in S.parse_efiry_grid(rows, 2026, 11) if s.hhmm == "08:30"]
+        self.assertEqual(names, ["Дуся", "Фекла"])
+
+    def test_name_like(self):
+        self.assertTrue(S.name_like("Зойка", "Зоя"))
+        self.assertTrue(S.name_like("Глафирра", "Глафира"))  # опечатка
+        self.assertTrue(S.name_like("Глаша", "Глафира"))  # уменьшительное
+        self.assertFalse(S.name_like("Зойка", "Зоряна"))
+        self.assertFalse(S.name_like("лево", "Лера"))
+
+    def test_drift_label_and_shared_slot(self):
+        d = self.D
+        slots = [S.Slot(d, time(10, 30), "Глафира"), S.Slot(d, time(10, 45), "Зоя"), S.Slot(d, time(10, 45), "Фекла")]
+        def tr(name, h, m, dur):
+            st = datetime(2026, 11, 26, h, m)
+            return S.Transcript(name, st, dur * 60, "\n".join(f"[{h:02d}:{(m + k) % 60:02d}:00] x" for k in range(dur)))
+        got = S.assign_transcripts(slots, [
+            tr("Глафирра боль.webm", 14, 35, 12),   # опечатка, началось на 5 мин позже
+            tr("Зойка счастье.webm", 14, 48, 16),   # уменьшительное
+            tr("Без имени.webm", 15, 4, 16),         # ни по имени, ни по времени — ближайший свободный слот
+        ])
+        self.assertEqual(got[0][0].transcript.file, "Глафирра боль.webm")
+        self.assertEqual(got[1][0].transcript.file, "Зойка счастье.webm")
+        self.assertEqual(got[2][0].transcript.file, "Без имени.webm")
+        self.assertTrue(all(not p.shared_with for ps in got.values() for p in ps))
+
+    def test_far_recording_not_assigned(self):
+        slots = [S.Slot(self.D, time(8, 0), "Глафира")]
+        tr = S.Transcript("x.webm", datetime(2026, 11, 26, 13, 30), 600, "[13:30:00] x")
+        self.assertEqual(S.assign_transcripts(slots, [tr]), {})
