@@ -83,9 +83,25 @@ CREATE TABLE IF NOT EXISTS sec_aliases (
 FINAL_STATUSES = ("added", "declined", "no_call", "skipped")
 
 
+MIGRATIONS = [
+    "ALTER TABLE sec_slots ADD COLUMN report_msg_id INTEGER",  # сообщение-история по участнику
+]
+
+
 def init() -> None:
+    import sqlite3
     with get_conn() as conn:
         conn.executescript(SCHEMA)
+        for stmt in MIGRATIONS:
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError:
+                pass  # колонка уже есть
+
+
+def slot_by_report_msg(msg_id: int):
+    with get_conn() as conn:
+        return conn.execute("SELECT * FROM sec_slots WHERE report_msg_id = ?", (msg_id,)).fetchone()
 
 
 # --- дни ---
@@ -288,6 +304,14 @@ def replace_questions(slot_id: int, questions: list[str]) -> list[int]:
                 "INSERT INTO sec_questions (slot_id, text, created_at) VALUES (?, ?, ?)", (slot_id, q, now())
             ).lastrowid)
         return ids
+
+
+def add_answer(slot_id: int, question: str, answer: str) -> None:
+    with get_conn() as conn:
+        conn.execute(
+            "INSERT INTO sec_questions (slot_id, text, answer, created_at) VALUES (?, ?, ?, ?)",
+            (slot_id, question, answer, now()),
+        )
 
 
 def questions_of_slot(slot_id: int, open_only: bool = False) -> list:

@@ -734,6 +734,7 @@ def finalize_calibration(row: dict, day: date, nick: str, default_source: str) -
 
 def finalize_communication(row: dict, day: date, nick: str, default_source: str) -> tuple[dict, list[str]]:
     r = {c: sanitize_cell(row.get(c, "")) for c in COMMUNICATION_COLUMNS}
+    r["адресат_слово"] = sanitize_cell(row.get("адресат_слово", ""))  # только для отчёта Антону, в лист не пишется
     questions = []
     r["id"] = ""  # проставляется при записи: следующий номер после последнего в листе
     r["дата"] = r["дата"].strip() or fmt_date(day)
@@ -741,6 +742,12 @@ def finalize_communication(row: dict, day: date, nick: str, default_source: str)
         r["ник_tg"] = nick
     r["источник"] = r["источник"].strip() or default_source
     r["портал"] = _yes_no(r["портал"])
+    chain = [x.strip() for x in re.split(r"\s*/\s*", r["продолжение_Б"]) if x.strip()]
+    if any(not re.search(r"[A-Za-zА-Яа-яЁё]", x) for x in chain):  # «?» вместо реплики — не выдумываем, обрезаем
+        chain = chain[: next(i for i, x in enumerate(chain) if not re.search(r"[A-Za-zА-Яа-яЁё]", x))]
+        r["продолжение_Б"] = " / ".join(chain)
+    if chain and norm(r["реакция_после_Б"]) == norm(chain[0]):
+        r["реакция_после_Б"] = ""  # первая реплика перепалки уже в продолжении — не показывать дважды
     # ТЗ: на сайт — только коммуникация с обоими путями (ответ из А и ответ из Б)
     r["на_сайт"] = "да" if has_both_paths(r) else "нет"
     questions += _foreign_handles(r, nick)
@@ -885,29 +892,141 @@ def plural(n: int, one: str, few: str, many: str) -> str:
 SOURCE_LABELS = {"запись": "запись", "чат": "пост в чате", "личка": "твои заметки", "блок": "блок из Claude-чата"}
 
 
-def day_list_text(day: date, items: list[tuple[str, str, list[str], str]]) -> str:
-    """items: (имя, ЧЧ:ММ, источники, статус) → сообщение шага 3 ТЗ."""
-    lines = [f"Созвоны {day:%d.%m}: {len(items)}"]
-    missing = 0
-    for name, hhmm, sources, status in items:
-        if status == "no_call":
-            lines.append(f"➖ {name} {hhmm} — не было")
-        elif status == "skipped":
-            lines.append(f"⏭ {name} {hhmm} — пропущено сегодня")
-        elif status in ("added", "declined") and not sources:
-            lines.append(f"✔️ {name} {hhmm} — уже разобрано")
-        elif sources:
-            labels = [SOURCE_LABELS.get(s, s) for s in sources]
-            lines.append(f"✅ {name} {hhmm} — {' + '.join(dict.fromkeys(labels))}")
-        else:
-            missing += 1
-            lines.append(f"❓ {name} {hhmm} — ничего нет")
-    if missing:
-        lines.append(
-            "\nПришли по тем, где ❓: заметки текстом, ответ Claude-чата или «не было» — "
-            "ответом (reply) на сообщение с именем ниже или пересылкой мне."
-        )
+MARK_OK, MARK_WARN, MARK_NONE = "✅", "⚠️", "▫️"
+DAY_LEGEND = "🎙 запись · 💬 заметка · 📖 история"
+
+
+@dataclass
+class DayItem:
+    name: str
+    hhmm: str
+    rec: str = ""      # "" нет / "ok" совпала с расписанием / "other" похоже, там другой человек
+    note: bool = False  # заметка в «Исцелении отношений» или присланная Антоном
+    story: str = ""    # "" нет / "full" триггер + А + Б / "partial" одного пути нет
+    status: str = "pending"
+
+
+def day_list_text(day: date, items: list[DayItem]) -> str:
+    """Список дня: у каждого три отметки — запись, заметка, история (триггер + реакции из А и Б)."""
+    lines = [f"Созвоны {day:%d.%m}: {len(items)}   ({DAY_LEGEND})"]
+    empty = 0
+    for it in items:
+        if it.status == "no_call":
+            lines.append(f"➖ {it.name} {it.hhmm} — не было")
+            continue
+        if it.status == "skipped":
+            lines.append(f"⏭ {it.name} {it.hhmm} — пропущено")
+            continue
+        rec = {"ok": MARK_OK, "other": MARK_WARN}.get(it.rec, MARK_NONE)
+        story = {"full": MARK_OK, "partial": MARK_WARN}.get(it.story, MARK_NONE)
+        done = " · в таблице" if it.status == "added" else ""
+        lines.append(f"{it.name} {it.hhmm}   🎙{rec} 💬{MARK_OK if it.note else MARK_NONE} 📖{story}{done}")
+        if not it.rec and not it.note and not it.story:
+            empty += 1
+    if any(it.rec == "other" for it in items):
+        lines.append("\n🎙⚠️ — в записи, похоже, другой человек: проверь.")
+    if empty:
+        lines.append("\nГде пусто — ответь на сообщение с именем ниже: заметка или «не было».")
     return "\n".join(lines)
+
+
+def count_mentions(text: str, efiry_name: str, participant: "Participant | None") -> int:
+    """Сколько раз в тексте звучит имя (уменьшительные, падежи) или @ник участника."""
+    names = set()
+    if participant and participant.name:
+        names.add(_tokens(participant.name)[0])
+    en = _tokens(efiry_name)
+    if en:
+        names.add(en[0].lstrip("@"))
+    nick = norm(participant.nick).lstrip("@") if participant and participant.nick else ""
+    n = 0
+    for t in _tokens(text):
+        if nick and t.lstrip("@") == nick:
+            n += 1
+        elif any(len(x) >= 3 and (same_name(t, x) or _stem_eq(t, x)) for x in names):
+            n += 1
+    return n
+
+
+def recording_state(own: int, others: dict[str, int], by_label: bool) -> str:
+    """ok — запись совпала с расписанием (по имени в названии, в тексте или по времени);
+    other — своего имени в тексте нет, а чужое звучит не меньше двух раз."""
+    if by_label or own:
+        return "ok"
+    if others and max(others.values()) >= 2:
+        return "other"
+    return "ok"
+
+
+def story_state(communications: list[dict]) -> str:
+    if any(has_both_paths(c) and (c.get("фраза_адресата") or c.get("адресат_роль")) for c in communications):
+        return "full"
+    return "partial" if communications else ""
+
+
+def dative(name: str, gender: str = "") -> str:
+    """«по Сереге», «по Ксении», «по Ане Х»: дательный падеж первого слова, остальное как есть."""
+    parts = name.split(" ", 1)
+    w = parts[0]
+    low = w.lower()
+    if low.endswith("ия"):
+        w = w[:-1] + "и"
+    elif low.endswith(("а", "я")):
+        w = w[:-1] + "е"
+    elif low.endswith("ь"):
+        w = w[:-1] + "и"
+    elif gender.lower().startswith("м") and low and low[-1] in "бвгджзклмнпрстфхцчшщ" and not w.startswith("@"):
+        w = w + "у"
+    return " ".join([w] + parts[1:])
+
+
+PERSON_EMOJI = {"ж": "👧", "м": "👦"}
+TRIGGER_EMOJI = "🐲"
+TOOTH_EMOJI = "🦷"
+
+
+def story_text(name: str, gender: str, communications: list[dict], calibrations: int = 0, questions: list[str] | None = None) -> str:
+    """Отчёт по участнику, как Антон пишет сам («ПО СЕРЕГЕ»): 🐲 ТРИГГЕР и его действие, участник из
+    точки А, потом участник из точки Б (🦷) и цепочка реакций триггера. Продолжение_Б — по очереди
+    триггер, участник, триггер… (так же читает сайт)."""
+    me = PERSON_EMOJI.get((gender or "").strip().lower()[:1], "🧑")
+    out = [f"ПО {dative(name, gender).upper()}"]
+    for k, c in enumerate(communications):
+        if k:
+            out.append("— — —")
+        who = (c.get("адресат_слово") or c.get("адресат_роль") or "триггер").strip().upper()
+        tooth = (c.get("зуб") or "").strip()
+        head = f"{TRIGGER_EMOJI} {who} {c.get('фраза_адресата', '').strip()}".rstrip()
+        out.append(head + (f"   ({TOOTH_EMOJI}{tooth})" if tooth else ""))
+        a = (c.get("ответ_А") or "").strip()
+        out.append(f"{me} {a}" if a else f"{me} точка А — ❓ нет")
+        if (c.get("реакция_после_А") or "").strip():
+            out.append(f"{TRIGGER_EMOJI} {who} {c['реакция_после_А'].strip()}")
+        aa = (c.get("ответ_АА") or "").strip()
+        if aa:
+            out.append(f"{me}😩 {aa}")
+        out.append("")
+        b = (c.get("ответ_Б") or "").strip()
+        out.append(f"{me}{TOOTH_EMOJI} {b}" if b else f"{me}{TOOTH_EMOJI} точка Б — ❓ нет")
+        if (c.get("реакция_после_Б") or "").strip():
+            out.append(f"{TRIGGER_EMOJI} {who} {c['реакция_после_Б'].strip()}")
+        chain = [x.strip() for x in re.split(r"\s*/\s*|\n+", c.get("продолжение_Б") or "") if x.strip()]
+        for i, beat in enumerate(chain):
+            if i % 2 == 0:
+                out.append(f"{TRIGGER_EMOJI} {who} {beat}")
+            else:
+                out.append("")
+                out.append(f"{me}{TOOTH_EMOJI} {beat}")
+    if not communications:
+        out.append("Истории (триггер + реакции из А и Б) не нашёл.")
+    if calibrations:
+        out.append(f"\n＋ {calibrations} {plural(calibrations, 'калибровка', 'калибровки', 'калибровок')}")
+    qs = [_q(q, 160) for q in (questions or []) if q][:3]
+    if qs:
+        out.append("")
+        out += [f"❓ {q}" for q in qs]
+        out.append("Ответь на это сообщение — поправлю.")
+    return "\n".join(out)
 
 
 def _q(s: str, limit: int = 60) -> str:

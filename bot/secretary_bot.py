@@ -273,12 +273,24 @@ SYSTEM_PROMPT = """Ты — секретарь школы психостомат
 9. Если материал не про этого участника или созвона не было — пустые списки и вопрос.
 10. Строку «Участники» давай, только если участника нет в таблице.
 
+Главное — ИСТОРИЯ (лист «Коммуникации»): триггер — человек или группа, которые давят (папа, батя, начальник, мама), что он делает или говорит; реакции участника из точки А (деструктивные: подстроиться, уменьшиться, замереть, молчать, извиняться) и из точки Б (конструктивные: «стараться нельзя, триггерить» — кричать, называть, наступать, радоваться); и как триггер на это отвечает. Каждая отдельная история с триггером — отдельная строка «Коммуникации».
+- адресат_роль — роль из списка; адресат_слово — как участник сам его зовёт («батя», «мамка»), это слово бот покажет Антону крупно;
+- фраза_адресата — что триггер говорит или делает («приходит домой», «умничает»);
+- ответ_А — реакция участника из точки А его словами; реакция_после_А — что триггер делает в ответ (если есть);
+- ответ_Б — первая реакция из точки Б;
+- продолжение_Б — дальнейшая перепалка после ответа из Б через « / », СТРОГО по очереди: триггер / участник / триггер / участник… Начинай с реакции триггера на ответ из Б («злится, краснеет, машет кулаком / подбегает: КИЯ — и по яйцам / в шоке, ему больно, но уже не злится / с криком «победа» бежит строить вигвам»). Если перепалка есть, реакция_после_Б оставь пустой — она уже первой репликой в продолжении; если перепалки нет — реакцию триггера пиши в реакция_после_Б.
+- В продолжение_Б идут ТОЛЬКО реакции участника из точки Б (🟢, «(сн,т)») и ответы триггера на них. Реакции из точки А на поздних шагах («(с,нт)»: забиваюсь в угол, извиняюсь) в историю не идут — их можно дать калибровкой.
+- История — одна строка «Коммуникации» на одного триггера: вся перепалка в продолжение_Б, не дроби её на несколько строк.
+- Пиши коротко и живо, словами участника, в настоящем времени, как сценку: каждая реплика — одно действие или фраза.
+
+Как Антон пишет заметки в чате: «@ник 36» или «СПАСИБО (43)» — число это зуб FDI; 🔴 — точка А («стараться, нельзя триггерить»), 🟢 — точка Б («стараться нельзя, триггерить»); «(с,нт)» — реакция из А, «(сн,т)» — из Б; «в АА:» — точка АА; строки без значка между 🔴/🟢 — действия триггера. 🟣 и другие значки — не угадывай, что это за точка: спроси.
+
 Ответ — ТОЛЬКО JSON без текста вокруг:
 {"калибровки": [{"дата": "ДД.ММ.ГГГГ", "название": "", "адресат_роль": "", "точка_А": "", "точка_АА": "", "точка_Б": "", "названия_точек": "", "источник": "", "достоверность": "", "на_сайт": ""}],
- "коммуникации": [{"дата": "", "адресат_роль": "", "лицо_адресата": "", "фраза_адресата": "", "ответ_А": "", "лицо_после_А": "", "ответ_АА": "", "лицо_после_АА": "", "ответ_Б": "", "лицо_после_Б": "", "названия_точек": "", "портал": "", "зуб": "", "источник": "", "реакция_после_А": "", "реакция_после_Б": "", "продолжение_Б": ""}],
+ "коммуникации": [{"дата": "", "адресат_роль": "", "адресат_слово": "", "лицо_адресата": "", "фраза_адресата": "", "ответ_А": "", "лицо_после_А": "", "ответ_АА": "", "лицо_после_АА": "", "ответ_Б": "", "лицо_после_Б": "", "названия_точек": "", "портал": "", "зуб": "", "источник": "", "реакция_после_А": "", "реакция_после_Б": "", "продолжение_Б": ""}],
  "участник": null,
  "вопросы": ["короткий вопрос Антону"]}
-ник_tg, id и на_сайт у коммуникаций бот проставит сам.
+ник_tg, id и на_сайт у коммуникаций бот проставит сам. Вопросы — только то, без чего строку не заполнить: максимум 3, каждый одной фразой до 100 символов («Зуб 43 — это про батю?»). Не спрашивай, как оформлять — правила выше.
 
 ТЗ таблицы участников:
 """
@@ -373,7 +385,7 @@ async def extract_slot(slot_id: int, participants: list[S.Participant] | None = 
         drafts.insert(0, (S.TAB_PARTICIPANTS, ex.participant_row))
     sdb.replace_drafts(slot_id, drafts)
     sdb.replace_questions(slot_id, ex.questions)
-    sdb.update_slot(slot_id, status="extracted")
+    sdb.update_slot(slot_id, status="extracted", report_msg_id=None)
     logger.info("Секретарь: слот %s разобран: калибровок %d, коммуникаций %d, вопросов %d",
                 slot_id, len(ex.calibrations), len(ex.communications), len(ex.questions))
     return ex
@@ -412,58 +424,84 @@ def _current_ids(day: dt.date, slot_rows: list | None) -> list[int]:
     return [r["id"] for r in (slot_rows if slot_rows is not None else sdb.slots_of_day(day.isoformat()))]
 
 
-async def send_day_list(bot, day: dt.date, slot_rows: list) -> None:
+def _day_items(day: dt.date, slot_rows: list, participants: list[S.Participant]) -> list[S.DayItem]:
+    """Три отметки на участника: 🎙 запись (совпала ли с расписанием), 💬 заметка, 📖 история."""
     items = []
     for s in slot_rows:
+        p = _participant_for(s, participants)
+        mats = sdb.materials_of_slot(s["id"])
+        rec = ""
+        for m in (x for x in mats if x["source"] == "запись"):
+            label = S.parse_recording_name(m["ref"])[1]
+            own = S.count_mentions(m["text"], s["name"], p)
+            others = {
+                o["name"]: S.count_mentions(m["text"], o["name"], _participant_for(o, participants))
+                for o in slot_rows if o["id"] != s["id"]
+            }
+            state = S.recording_state(own, others, bool(label) and S._label_mentions(label, s["name"]))
+            rec = "other" if state == "other" and rec != "ok" else "ok"
+        comms = [sdb.draft_row(d) for d in sdb.drafts_of_slot(s["id"], None)
+                 if d["sheet"] == S.TAB_COMMUNICATIONS and d["status"] in ("pending", "added")]
         name = s["name"] + (" (нет в «Участниках»)" if s["match"] == "none" else "")
-        items.append((name, s["time_msk"], _sources(s["id"]), s["status"]))
-    msg = await _send(bot, S.day_list_text(day, items))
+        items.append(S.DayItem(
+            name=name, hhmm=s["time_msk"], rec=rec,
+            note=any(m["source"] in ("чат", "личка") for m in mats),
+            story=S.story_state(comms), status=s["status"],
+        ))
+    return items
+
+
+async def send_day_list(bot, day: dt.date, slot_rows: list, participants: list[S.Participant] | None = None) -> None:
+    if participants is None:
+        participants = S.parse_participants(await asyncio.to_thread(google.tab_values, S.TAB_PARTICIPANTS))
+    msg = await _send(bot, S.day_list_text(day, _day_items(day, slot_rows, participants)))
     sdb.update_day(day.isoformat(), list_msg_id=msg.message_id)
 
-    participants = None
     for s in slot_rows:
         if s["match"] == "ambiguous" and not s["msg_id"]:
-            participants = participants or S.parse_participants(await asyncio.to_thread(google.tab_values, S.TAB_PARTICIPANTS))
             cands = S.match_participant(s["name"], participants).candidates[:6]
             buttons = [[(f"{p.name} {p.nick}".strip(), f"sec:pick:{s['id']}:{p.row}")] for p in cands]
             buttons.append([("Нет в таблице", f"sec:pick:{s['id']}:0")])
-            await _send(bot, f"Кто это: «{s['name']}» {s['time_msk']}? Несколько похожих в листе «Участники».", reply_markup=_kb(buttons))
+            m = await _send(bot, f"Кто это: «{s['name']}» {s['time_msk']}? Несколько похожих в листе «Участники».", reply_markup=_kb(buttons))
+            sdb.update_slot(s["id"], msg_id=m.message_id)
+        # отдельное сообщение — только тем, по кому совсем ничего нет: на него отвечают заметкой
         if s["status"] == "pending" and not _sources(s["id"]) and not s["msg_id"]:
             m = await _send(
                 bot,
-                f"❓ {s['name']} {s['time_msk']} — ничего нет.\nПришли заметки ответом на это сообщение.",
-                reply_markup=_kb([[("Не было созвона", f"sec:nocall:{s['id']}"), ("Пропустить сегодня", f"sec:skip:{s['id']}")]]),
+                f"{s['name']} {s['time_msk']} — ничего нет. Ответь на это сообщение заметкой.",
+                reply_markup=_kb([[("Не было созвона", f"sec:nocall:{s['id']}"), ("Пропустить", f"sec:skip:{s['id']}")]]),
             )
             sdb.update_slot(s["id"], msg_id=m.message_id)
 
 
-async def send_summary(bot, day: dt.date) -> None:
+async def send_summary(bot, day: dt.date, participants: list[S.Participant] | None = None) -> int:
+    """По одному сообщению на участника — история в формате Антона («ПО СЕРЕГЕ»), до трёх вопросов
+    внутри и кнопки «Добавить / Изменить / Не добавлять». Уже показанные не повторяются: после
+    пересборки слота (ответ Антона) report_msg_id сбрасывается и история приходит заново."""
+    if participants is None:
+        participants = S.parse_participants(await asyncio.to_thread(google.tab_values, S.TAB_PARTICIPANTS))
     dkey = day.isoformat()
-    slots = sdb.slots_of_day(dkey)
-    lines, questions = [], []
-    for s in slots:
+    sent = 0
+    for s in sdb.slots_of_day(dkey):
         drafts = sdb.drafts_of_slot(s["id"])
-        cal = [sdb.draft_row(d) for d in drafts if d["sheet"] == S.TAB_CALIBRATIONS]
+        if not drafts or s["report_msg_id"]:
+            continue
+        p = _participant_for(s, participants)
         com = [sdb.draft_row(d) for d in drafts if d["sheet"] == S.TAB_COMMUNICATIONS]
-        prow = next((sdb.draft_row(d) for d in drafts if d["sheet"] == S.TAB_PARTICIPANTS), None)
-        lines += S.summary_lines(s["name"], cal, com, prow)
-        for q in sdb.questions_of_slot(s["id"], open_only=True):
-            questions.append((s, q))
-    if not lines and not questions:
-        return
-    waiting = [s for s in slots if s["status"] == "pending"]
-    head = "По всем собрал." if not waiting else f"Собрал по части (ждут материала: {len(waiting)})."
-    text = head + (" Новые случаи:\n" + "\n".join(lines) if lines else " Новых строк нет.")
-    if questions:
-        text += "\nВопросы:\n" + "\n".join(f"— {s['name']}: {q['text']}" for s, q in questions)
-    markup = None
-    if lines:
-        markup = _kb([[("Добавить всё", f"sec:all:{dkey}"), ("По одному", f"sec:each:{dkey}"), ("Не добавлять", f"sec:none:{dkey}")]])
-    await _send(bot, text, reply_markup=markup)
-    for s, q in questions:
-        if not q["msg_id"]:
-            m = await _send(bot, f"❓ {s['name']} {s['time_msk']}: {q['text']}\nОтветь реплаем — допишу в строку перед записью.")
-            sdb.update_question(q["id"], msg_id=m.message_id)
+        cal = sum(1 for d in drafts if d["sheet"] == S.TAB_CALIBRATIONS)
+        qs = [q["text"] for q in sdb.questions_of_slot(s["id"], open_only=True)]
+        gender = (p.fields.get("пол") if p else "") or ""
+        text = S.story_text(s["name"], gender, com, cal, qs)
+        m = await _send(bot, text, reply_markup=_kb([[
+            ("Добавить", f"sec:sadd:{s['id']}"), ("Изменить", f"sec:sedit:{s['id']}"), ("Не добавлять", f"sec:sdrop:{s['id']}"),
+        ]]))
+        sdb.update_slot(s["id"], report_msg_id=m.message_id)
+        sent += 1
+    if sent > 1:
+        await _send(bot, f"Историй на проверку: {sent}.", reply_markup=_kb([[
+            ("Добавить всё", f"sec:all:{dkey}"), ("Не добавлять", f"sec:none:{dkey}"),
+        ]]))
+    return sent
 
 
 async def run_day(bot, day: dt.date, until_msk: dt.time | None, job_queue=None) -> None:
@@ -478,9 +516,11 @@ async def run_day(bot, day: dt.date, until_msk: dt.time | None, job_queue=None) 
         if not rows:
             await _send(bot, f"Секретарь: в таблице эфиров на {day:%d.%m} созвонов нет.")
             return
-        await send_day_list(bot, day, rows)
+        # сначала разбор — чтобы в списке уже стояли отметки 📖
         await process_pending(day, participants)
-        await send_summary(bot, day)
+        rows = [sdb.get_slot(r["id"]) for r in rows]
+        await send_day_list(bot, day, rows, participants)
+        await send_summary(bot, day, participants)
     if first and job_queue is not None:
         job_queue.run_once(remind_job, when=dt.timedelta(hours=SECRETARY_REMIND_HOURS), data=day.isoformat(), name=f"sec_remind_{day}")
 
@@ -660,6 +700,25 @@ async def callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             for d in drafts:
                 await _send_draft(bot, d)
 
+    elif action in ("sadd", "sedit", "sdrop"):
+        sid = int(parts[2])
+        slot = sdb.get_slot(sid)
+        day = dt.date.fromisoformat(slot["day"])
+        drafts = sdb.drafts_of_slot(sid)
+        if action == "sedit":
+            await query.message.reply_text("Ответь на сообщение с историей: что поправить — словами. Пересоберу.")
+        elif not drafts:
+            await query.message.reply_text("Эта история уже решена.")
+        elif action == "sadd":
+            async with _lock:
+                cal, com, prt = await _write_drafts(day, drafts)
+            await query.message.reply_text(f"Добавил {slot['name']}: коммуникаций {com}, калибровок {cal}.")
+        else:
+            for d in drafts:
+                sdb.update_draft(d["id"], status="skipped")
+            await _journal_finished(day, {sid})
+            await query.message.reply_text(f"{slot['name']}: не добавляю.")
+
     elif action in ("add", "edit", "drop"):
         draft = sdb.get_draft(int(parts[2]))
         if not draft or draft["status"] != "pending":
@@ -716,6 +775,24 @@ async def _attach_material(bot, slot_id: int, ref: str, text: str) -> None:
     await send_summary(bot, day)
 
 
+async def _correct_slot(bot, slot, text: str) -> None:
+    """Ответ Антона на историю: закрывает открытые вопросы и идёт в разбор как поправка."""
+    if slot["status"] in ("added", "declined"):
+        await _send(bot, f"{slot['name']}: строки уже решены — поправь в таблице руками.")
+        return
+    open_q = sdb.questions_of_slot(slot["id"], open_only=True)
+    for q in open_q:
+        sdb.update_question(q["id"], answer=text)
+    if not open_q:
+        sdb.add_answer(slot["id"], "Поправка Антона к истории", text)
+    sdb.update_slot(slot["id"], status="material")
+    await _send(bot, f"{slot['name']}: пересобираю с твоей поправкой…")
+    day = dt.date.fromisoformat(slot["day"])
+    async with _lock:
+        await process_pending(day)
+    await send_summary(bot, day)
+
+
 def _latest_day() -> dt.date | None:
     from bot.db import get_conn
     with get_conn() as conn:
@@ -746,6 +823,10 @@ async def admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 async with _lock:
                     await process_pending(dt.date.fromisoformat(slot["day"]))
                 await send_summary(bot, dt.date.fromisoformat(slot["day"]))
+            raise ApplicationHandlerStop
+        rep = sdb.slot_by_report_msg(rid)
+        if rep:
+            await _correct_slot(bot, rep, text)
             raise ApplicationHandlerStop
         d = sdb.draft_by_msg(rid)
         if d and d["status"] == "pending":

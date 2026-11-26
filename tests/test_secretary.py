@@ -219,6 +219,13 @@ class FormattingTests(unittest.TestCase):
         self.assertEqual(both["ник_tg"], "@x")
         self.assertEqual(both["id"], "")
 
+    def test_chain_cleanup(self):
+        d = date(2026, 11, 26)
+        r, _ = S.finalize_communication({"ответ_А": "a", "ответ_Б": "b", "реакция_после_Б": "злится",
+                                         "продолжение_Б": "злится / КИЯ / в шоке / победа / ?"}, d, "@x", "созвон")
+        self.assertEqual(r["реакция_после_Б"], "")
+        self.assertEqual(r["продолжение_Б"], "злится / КИЯ / в шоке / победа")
+
     def test_calibration_defaults(self):
         r, _ = S.finalize_calibration({"точка_А": "молчу", "достоверность": "наверное"}, date(2026, 11, 26), "@x", "созвон")
         self.assertEqual(r["достоверность"], "неясно")
@@ -261,18 +268,51 @@ class FormattingTests(unittest.TestCase):
 
     def test_texts(self):
         text = S.day_list_text(date(2026, 11, 26), [
-            ("Глафира", "10:00", ["запись"], "material"),
-            ("Марфа", "10:15", ["запись", "чат"], "material"),
-            ("Фекла", "10:30", [], "pending"),
+            S.DayItem("Глафира", "10:00", rec="ok", note=False, story="full"),
+            S.DayItem("Марфа", "10:15", rec="other", note=True, story="partial"),
+            S.DayItem("Фекла", "10:30"),
+            S.DayItem("Зоя", "10:45", status="no_call"),
         ])
-        self.assertIn("✅ Глафира 10:00 — запись", text)
-        self.assertIn("✅ Марфа 10:15 — запись + пост в чате", text)
-        self.assertIn("❓ Фекла 10:30 — ничего нет", text)
+        self.assertIn("Глафира 10:00   🎙✅ 💬▫️ 📖✅", text)
+        self.assertIn("Марфа 10:15   🎙⚠️ 💬✅ 📖⚠️", text)
+        self.assertIn("Фекла 10:30   🎙▫️ 💬▫️ 📖▫️", text)
+        self.assertIn("➖ Зоя 10:45 — не было", text)
+        self.assertIn("другой человек", text)
         lines = S.summary_lines("Хуанита", [{}, {}], [{"адресат_роль": "мама", "ответ_А": "Да, хорошо", "ответ_Б": "Нет, не хочу"},
                                                        {"адресат_роль": "начальник", "ответ_Б": "Нет"}], None)
-        self.assertIn("• Хуанита — мама: А «Да, хорошо» / Б «Нет, не хочу» ✅ на сайт", lines)
-        self.assertIn("• Хуанита — начальник: только Б (нет ответа из А) — на сайт не пойдёт", lines)
         self.assertIn("• Хуанита — 2 калибровки", lines)
+
+    def test_story_text_like_antons_report(self):
+        c = {"адресат_роль": "папа", "адресат_слово": "батя", "фраза_адресата": "приходит домой", "зуб": "43",
+             "ответ_А": "надо подстроиться, стать маленьким",
+             "ответ_Б": "папа пришёл! буду ещё больше бегать",
+             "продолжение_Б": "злится, машет кулаком / подбегает: КИЯ / в шоке, но уже не злится / с криком «победа» бежит строить вигвам"}
+        t = S.story_text("Глеб", "м", [c], 1, ["Какой зуб?"])
+        self.assertEqual(t.splitlines()[:9], [
+            "ПО ГЛЕБУ",
+            "🐲 БАТЯ приходит домой   (🦷43)",
+            "👦 надо подстроиться, стать маленьким",
+            "",
+            "👦🦷 папа пришёл! буду ещё больше бегать",
+            "🐲 БАТЯ злится, машет кулаком",
+            "",
+            "👦🦷 подбегает: КИЯ",
+            "🐲 БАТЯ в шоке, но уже не злится",
+        ])
+        self.assertIn("👦🦷 с криком «победа» бежит строить вигвам", t)
+        self.assertIn("＋ 1 калибровка", t)
+        self.assertIn("❓ Какой зуб?", t)
+        self.assertIn("точка Б — ❓ нет", S.story_text("Зоя", "ж", [{"адресат_роль": "мама", "ответ_А": "молчу"}]))
+        self.assertEqual(S.dative("Гульназ", "ж"), "Гульназ")
+        self.assertEqual(S.dative("Ксения"), "Ксении")
+
+    def test_recording_and_story_state(self):
+        self.assertEqual(S.recording_state(0, {"Зоя": 3}, False), "other")
+        self.assertEqual(S.recording_state(0, {"Зоя": 1}, False), "ok")  # одно упоминание — не повод
+        self.assertEqual(S.recording_state(0, {"Зоя": 5}, True), "ok")
+        self.assertEqual(S.story_state([{"адресат_роль": "мама", "ответ_А": "a", "ответ_Б": "b"}]), "full")
+        self.assertEqual(S.story_state([{"адресат_роль": "мама", "ответ_А": "a"}]), "partial")
+        self.assertEqual(S.story_state([]), "")
 
 
 # ---------------------------------------------------------------- сквозной прогон на фейках
@@ -435,13 +475,16 @@ class EndToEndTests(unittest.TestCase):
         texts = [m.text for m in self.bot.sent]
         day_list = texts[0]
         self.assertIn("Созвоны 26.11: 3", day_list)
-        self.assertIn("✅ Глафира 08:00 — запись", day_list)
-        self.assertIn("❓ Фекла (нет в «Участниках») 08:30 — ничего нет", day_list)
+        self.assertIn("Глафира 08:00   🎙✅ 💬▫️ 📖✅", day_list)
+        self.assertIn("Фекла (нет в «Участниках») 08:30   🎙▫️ 💬▫️ 📖▫️", day_list)
         self.assertTrue(any(t.startswith("Кто это: «Дуся Х»") for t in texts), "неоднозначное — вопрос с кнопками")
-        q_irina = next(m for m in self.bot.sent if m.text.startswith("❓ Фекла"))
+        q_irina = next(m for m in self.bot.sent if m.text.startswith("Фекла 08:30 — ничего нет"))
         self.assertIn("sec:nocall:", " ".join(buttons(q_irina)))
-        summary = next(m for m in self.bot.sent if m.text.startswith("Собрал по части"))
-        self.assertIn("Глафира — мама: А «Хорошо» / Б «Не, не хочу» ✅ на сайт", summary.text)
+        story = next(m for m in self.bot.sent if m.text.startswith("ПО ГЛАФИРЕ"))
+        self.assertIn("🐲 МАМА Хватит лежать", story.text)
+        self.assertIn("👧🦷 Не, не хочу", story.text)
+        self.assertTrue(any(b.startswith("sec:sadd:") for b in buttons(story)))
+        self.assertFalse(any(t.startswith("❓") for t in texts), "вопросы — внутри истории, не отдельными сообщениями")
         self.assertEqual(len(self.llm_calls), 1)
         self.assertIn("[12:02:00]", self.llm_calls[0])
         self.assertNotIn("Фекла", self.llm_calls[0])  # в запрос по Глафире чужие созвоны не попали
@@ -478,7 +521,7 @@ class EndToEndTests(unittest.TestCase):
     def test_ready_block_reply_closes_participant_without_claude(self):
         self.run_async(SB.run_day(self.bot, self.DAY, None))
         calls_before = len(self.llm_calls)
-        q_irina = next(m for m in self.bot.sent if m.text.startswith("❓ Фекла"))
+        q_irina = next(m for m in self.bot.sent if m.text.startswith("Фекла 08:30 — ничего нет"))
         block = ("Строки для таблицы\nЛист «Калибровки»\n"
                  "26.11.2026\t\tтелефон бывшего\tмуж\tмолчу\t\tговорю «хватит»\t\tсозвон\tчётко\tнет\n")
         self.reply(q_irina.message_id, block)
@@ -492,12 +535,25 @@ class EndToEndTests(unittest.TestCase):
 
     def test_no_call_button_and_question_answer(self):
         self.run_async(SB.run_day(self.bot, self.DAY, None))
-        q_irina = next(m for m in self.bot.sent if m.text.startswith("❓ Фекла"))
+        q_irina = next(m for m in self.bot.sent if m.text.startswith("Фекла 08:30 — ничего нет"))
         slot_id = int(buttons(q_irina)[0].split(":")[2])
         self.press(f"sec:nocall:{slot_id}")
         self.assertEqual(sdb.get_slot(slot_id)["status"], "no_call")
         journal = self.book.tabs[S.TAB_JOURNAL].get_all_values()
         self.assertEqual(journal[-1][7], "не было")
+
+    def test_story_buttons_and_reply_correction(self):
+        self.run_async(SB.run_day(self.bot, self.DAY, None))
+        story = next(m for m in self.bot.sent if m.text.startswith("ПО ГЛАФИРЕ"))
+        self.reply(story.message_id, "зуб 46, мама не злая, а грустная")
+        self.assertEqual(len(self.llm_calls), 2)
+        self.assertIn("зуб 46, мама не злая, а грустная", self.llm_calls[1])
+        again = [m for m in self.bot.sent if m.text.startswith("ПО ГЛАФИРЕ")]
+        self.assertEqual(len(again), 2, "после поправки история приходит заново")
+        sid = int(next(b for b in buttons(again[-1]) if b.startswith("sec:sadd:")).split(":")[2])
+        self.press(f"sec:sadd:{sid}")
+        self.assertEqual(len(self.book.tabs[S.TAB_COMMUNICATIONS].get_all_values()), 4)
+        self.assertEqual(sdb.get_slot(sid)["status"], "added")
 
     def test_pick_ambiguous_then_material(self):
         self.run_async(SB.run_day(self.bot, self.DAY, None))
