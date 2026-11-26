@@ -578,3 +578,16 @@ class DriftAndLabelTests(unittest.TestCase):
         slots = [S.Slot(self.D, time(8, 0), "Глафира")]
         tr = S.Transcript("x.webm", datetime(2026, 11, 26, 13, 30), 600, "[13:30:00] x")
         self.assertEqual(S.assign_transcripts(slots, [tr]), {})
+
+
+class NickTranslitTests(unittest.TestCase):
+    def test_unknown_participant_by_latin_nick(self):
+        self.assertTrue(S.mentions("@ZoyaPetrova0 21 - мама", "Зоя", None))
+        self.assertTrue(S.mentions("@Feklalvova 36", "Фекла", None))
+        self.assertFalse(S.mentions("@Feklalvova 36", "Зоя", None))
+        self.assertFalse(S.mentions("@zoyana_x", "Зоя", None))  # другое, более длинное имя
+
+    def test_known_nick_is_exact(self):
+        p = S.Participant(3, {"ник_tg": "@glafira_g", "имя": "Глафира"})
+        self.assertTrue(S.mentions("@glafira_g\n🔴 стараться", "Глафира", p))
+        self.assertFalse(S.mentions("@glafira_other про маму", "Глафира", p))

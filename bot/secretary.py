@@ -603,7 +603,39 @@ def mentions(text: str, efiry_name: str, participant: Participant | None) -> boo
         for n in names:
             if len(n) >= 3 and (same_name(t, n) or _stem_eq(t, n)):
                 return True
+    # Участника нет в листе «Участники» (ник неизвестен): @YanaPanchenk0 → «Яна», @Irralvova → «Ирра» —
+    # ник начинается с имени латиницей. Если ник в листе есть, чужой @ник — про другого человека.
+    if not (participant and participant.nick):
+        handles = [t.lstrip("@") for t in toks if t.startswith("@")]
+        for n in names:
+            for v in translit_variants(n):
+                if len(v) >= 3 and any(h.startswith(v) and not _longer_name_prefix(h, v, n) for h in handles):
+                    return True
     return False
+
+
+_TRANSLIT = {
+    "а": ["a"], "б": ["b"], "в": ["v"], "г": ["g"], "д": ["d"], "е": ["e"], "ж": ["zh"], "з": ["z"],
+    "и": ["i"], "й": ["y", "i", "j"], "к": ["k"], "л": ["l"], "м": ["m"], "н": ["n"], "о": ["o"], "п": ["p"],
+    "р": ["r"], "с": ["s"], "т": ["t"], "у": ["u"], "ф": ["f"], "х": ["kh", "h"], "ц": ["ts", "c"],
+    "ч": ["ch"], "ш": ["sh"], "щ": ["sch", "shch"], "ъ": [""], "ы": ["y"], "ь": [""], "э": ["e"],
+    "ю": ["yu", "iu", "ju"], "я": ["ya", "ia", "ja"],
+}
+
+
+def translit_variants(name: str, limit: int = 32) -> list[str]:
+    out = [""]
+    for ch in norm(name):
+        opts = _TRANSLIT.get(ch, [ch])
+        out = [o + v for o in out for v in opts][:limit]
+    return out
+
+
+def _longer_name_prefix(handle: str, variant: str, name: str) -> bool:
+    """@irina_x не про «Иру»: после латинского имени на -а/-я сразу идёт n/i/y — это начало более
+    длинного имени (Ирина, Анна), а не фамилия. Лучше вопрос Антону, чем чужая заметка."""
+    rest = handle[len(variant):]
+    return bool(rest) and name.endswith(("а", "я")) and rest[:1] in ("n", "i", "y")
 
 
 def _stem_eq(word: str, name: str) -> bool:
