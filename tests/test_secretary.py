@@ -303,6 +303,12 @@ class FormattingTests(unittest.TestCase):
         self.assertIn("＋ 1 калибровка", t)
         self.assertIn("❓ Какой зуб?", t)
         self.assertIn("точка Б — ❓ нет", S.story_text("Зоя", "ж", [{"адресат_роль": "мама", "ответ_А": "молчу"}]))
+        intro = S.story_text("Зоя", "ж", [{"адресат_роль": "папа", "до_триггера": "гуляет / Чё-то поныть хочется",
+                                           "фраза_адресата": "Ты чё ноешь?", "ответ_А": "сдерживаюсь"}])
+        self.assertEqual(intro.splitlines()[1:3], ["👧 гуляет / Чё-то поныть хочется", "🐲 ПАПА Ты чё ноешь?"])
+        row, _ = S.finalize_communication({"до_триггера": "гуляет", "ответ_А": "a", "ответ_Б": "b"}, date(2026, 11, 27), "@zoya", "созвон")
+        self.assertEqual(row["до_триггера"], "гуляет")
+        self.assertEqual(S.row_values(S.COMMUNICATION_COLUMNS, row)[-1], "гуляет")
         self.assertEqual(S.dative("Гульназ", "ж"), "Гульназ")
         self.assertEqual(S.dative("Ксения"), "Ксении")
 

@@ -56,6 +56,7 @@ COMMUNICATION_COLUMNS = [
     "id", "дата", "ник_tg", "адресат_роль", "лицо_адресата", "фраза_адресата", "ответ_А",
     "лицо_после_А", "ответ_АА", "лицо_после_АА", "ответ_Б", "лицо_после_Б", "названия_точек",
     "портал", "зуб", "источник", "на_сайт", "реакция_после_А", "реакция_после_Б", "продолжение_Б",
+    "до_триггера",
 ]
 DEFAULT_COLUMNS = {
     TAB_PARTICIPANTS: PARTICIPANT_COLUMNS,
@@ -1032,6 +1033,9 @@ def story_text(name: str, gender: str, communications: list[dict], calibrations:
         if k:
             out.append("— — —")
         who = (c.get("адресат_слово") or c.get("адресат_роль") or "триггер").strip().upper()
+        intro = (c.get("до_триггера") or "").strip()
+        if intro:
+            out.append(f"{me} {intro}")
         tooth = (c.get("зуб") or "").strip()
         head = f"{TRIGGER_EMOJI} {who} {c.get('фраза_адресата', '').strip()}".rstrip()
         out.append(head + (f"   ({TOOTH_EMOJI}{tooth})" if tooth else ""))
