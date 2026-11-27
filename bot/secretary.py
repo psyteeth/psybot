@@ -270,7 +270,7 @@ DIMINUTIVES = [
     {"евгений", "женя"},
     {"анастасия", "настя", "настена"},
     {"дарья", "даша"},
-    {"ксения", "ксюша"},
+    {"ксения", "ксюша", "ксюха", "ксюшка"},
     {"виктория", "вика"},
     {"валентина", "валя"},
     {"людмила", "люда", "мила"},
@@ -351,6 +351,8 @@ def match_participant(efiry_name: str, participants: list[Participant]) -> Match
         narrowed = [p for p in hits if any(t in _tokens(p.name)[1:] for t in rest)]
         if narrowed:
             hits = narrowed
+    if not hits:  # «Янинка» → Янина, «Гульгназ» → Гульназ: -ка, падеж, одна опечатка
+        hits = [p for p in participants if _tokens(p.name) and name_like(first, _tokens(p.name)[0])]
     if len(hits) == 1:
         return Match("ok", hits)
     if len(hits) > 1:
@@ -517,9 +519,20 @@ def assign_transcripts(
         else:
             rest.append(tr)
     claimed = set(out)
+    drift = timedelta(minutes=drift_min)
+    own = _own_files(slots, rest, drift)
     leftovers = []
     for tr in rest:
         covered = [i for i, s in enumerate(slots) if i not in claimed and _covers(tr, s, tol)]
+        if len(covered) > 1:
+            # Созвон затянулся: у следующего слота есть своя запись, начавшаяся ближе к его времени, —
+            # хвост этой записи не его.
+            covered = [i for i in covered if own.get(i) in (None, id(tr))] or covered[:1]
+        if len(covered) > 1:
+            # В записи звучит имя только одного из слотов — запись целиком его.
+            named = [i for i in covered if count_mentions(tr.text, slots[i].name, None)]
+            if len(named) == 1:
+                covered = named
         if not covered:
             leftovers.append(tr)
             continue
@@ -534,15 +547,32 @@ def assign_transcripts(
             others = [slots[j] for j in covered if j != i]
             if piece.strip():
                 out.setdefault(i, []).append(TranscriptPiece(tr, piece, others))
-    drift = timedelta(minutes=drift_min)
     for tr in leftovers:
         free = [
             (abs(tr.start_th - s.start_th), i) for i, s in enumerate(slots)
             if i not in out and s.day == tr.start_th.date() and abs(tr.start_th - s.start_th) <= drift
         ]
         free.sort()
-        if free and (len(free) == 1 or free[0][0] != free[1][0]):
+        if len(free) > 1 and free[0][0] == free[1][0]:
+            # два слота в одно время («Ирра, Ксения») — к тому, чьё имя звучит в записи
+            tied = [i for d, i in free if d == free[0][0]]
+            named = [i for i in tied if count_mentions(tr.text, slots[i].name, None)]
+            free = [(free[0][0], named[0])] if len(named) == 1 else []
+        if free:
             out[free[0][1]] = [TranscriptPiece(tr, tr.text, [])]
+    return out
+
+
+def _own_files(slots: list[Slot], transcripts: list[Transcript], drift: timedelta) -> dict[int, int]:
+    """Слот → id записи, начавшейся ближе всех к его времени (не дальше drift)."""
+    out = {}
+    for i, s in enumerate(slots):
+        near = sorted(
+            (abs(tr.start_th - s.start_th), k, tr) for k, tr in enumerate(transcripts)
+            if tr.start_th.date() == s.day and abs(tr.start_th - s.start_th) <= drift
+        )
+        if near:
+            out[i] = id(near[0][2])
     return out
 
 
@@ -586,9 +616,16 @@ def _label_mentions(label: str, name: str) -> bool:
 
 # ---------------------------------------------------------------- посты в чате
 
-def mentions(text: str, efiry_name: str, participant: Participant | None) -> bool:
-    """Упомянут ли участник в посте: @ник или имя (с уменьшительными) отдельным словом."""
+def mentions(text: str, efiry_name: str, participant: Participant | None, known_nicks: set[str] | None = None) -> bool:
+    """Упомянут ли участник в посте: @ник или имя (с уменьшительными) отдельным словом.
+    Пост начинается с @ника другого участника из листа — он про того, даже если в тексте
+    звучит похожее имя («@ianina_n … Яна» — не про Яну)."""
     toks = _tokens(text)
+    own_nick = norm(participant.nick).lstrip("@") if participant and participant.nick else ""
+    if known_nicks and toks and toks[0].startswith("@"):
+        head = toks[0].lstrip("@")
+        if head in known_nicks and head != own_nick:
+            return False
     if participant and participant.nick:
         nick = norm(participant.nick).lstrip("@")
         if nick and any(t.lstrip("@") == nick for t in toks):
@@ -943,7 +980,7 @@ def count_mentions(text: str, efiry_name: str, participant: "Participant | None"
     for t in _tokens(text):
         if nick and t.lstrip("@") == nick:
             n += 1
-        elif any(len(x) >= 3 and (same_name(t, x) or _stem_eq(t, x)) for x in names):
+        elif any(len(x) >= 3 and (same_name(t, x) or _stem_eq(t, x) or name_like(t, x)) for x in names):
             n += 1
     return n
 

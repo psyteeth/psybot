@@ -630,6 +630,34 @@ class DriftAndLabelTests(unittest.TestCase):
         self.assertEqual(got[2][0].transcript.file, "Без имени.webm")
         self.assertTrue(all(not p.shared_with for ps in got.values() for p in ps))
 
+    def test_overrun_calls_keep_whole_files(self):
+        """Созвоны затягиваются: хвост записи не уходит следующему, если у него своя запись;
+        запись с одним названным именем — целиком тому; две в одно время — по имени."""
+        d = self.D
+        slots = [S.Slot(d, time(10, 0), "Глафира"), S.Slot(d, time(10, 15), "Марфа"), S.Slot(d, time(10, 30), "Зоя"),
+                 S.Slot(d, time(10, 45), "Фекла"), S.Slot(d, time(10, 45), "Дуся")]
+        def tr(h, m, dur, who):
+            st = datetime(2026, 11, 26, h, m)
+            lines = [f"[{h + (m + k) // 60:02d}:{(m + k) % 60:02d}:00] {who} слева от тебя" for k in range(dur)]
+            return S.Transcript(f"Meeting in Yandex Telemost 26.11.26 {h:02d}-{m:02d}-00 — recording.webm", st, dur * 60, "\n".join(lines))
+        files = [tr(14, 1, 17, "Глафира"), tr(14, 18, 18, "Зойка"),  # в записи Марфы ведущий зовёт её «Зойка»
+                 tr(14, 36, 13, "Зойка"), tr(15, 0, 13, "Дуся")]
+        got = S.assign_transcripts(slots, files)
+        whole = {i: [(p.transcript.start_th.strftime("%H:%M"), p.text == p.transcript.text) for p in ps] for i, ps in got.items()}
+        self.assertEqual(whole, {0: [("14:01", True)], 1: [("14:18", True)], 2: [("14:36", True)], 4: [("15:00", True)]})
+
+    def test_post_headed_by_other_nick(self):
+        zoya = None  # Зои нет в листе
+        post = "@marfa_m\n\nсмотрю на себя, Зоя бы сказала, что я унылая"
+        self.assertTrue(S.mentions(post, "Зоя", zoya))
+        self.assertFalse(S.mentions(post, "Зоя", zoya, {"marfa_m", "glafira_g"}))
+        marfa = S.Participant(5, {"ник_tg": "@marfa_m", "имя": "Марфа"})
+        self.assertTrue(S.mentions(post, "Марфа", marfa, {"marfa_m"}))
+
+    def test_match_participant_ka_form(self):
+        ps = [S.Participant(5, {"ник_tg": "@marfa_m", "имя": "Марфина"}), S.Participant(6, {"имя": "Марфа"})]
+        self.assertEqual(S.match_participant("Марфинка", ps).participant.row, 5)
+
     def test_far_recording_not_assigned(self):
         slots = [S.Slot(self.D, time(8, 0), "Глафира")]
         tr = S.Transcript("x.webm", datetime(2026, 11, 26, 13, 30), 600, "[13:30:00] x")

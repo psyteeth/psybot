@@ -224,16 +224,36 @@ async def refresh_day(day: dt.date, until_msk: dt.time | None) -> tuple[list, li
             if sdb.add_material(slot["id"], "запись", piece.transcript.file, piece.text, meta):
                 _mark_new_material(slot["id"])
 
+    known = {S.norm(p.nick).lstrip("@") for p in participants if p.nick}
+    rows = [sdb.get_slot(i) for i in ids]
     for post in sdb.chat_posts_of_day(dkey):
-        for slot in rows:
-            p = _participant_for(slot, participants)
-            if S.mentions(post["text"], slot["name"], p):
-                if sdb.add_material(slot["id"], "чат", f"{post['chat_id']}:{post['msg_id']}", post["text"]):
-                    _mark_new_material(slot["id"])
+        hits = [slot for slot in rows if S.mentions(post["text"], slot["name"], _participant_for(slot, participants), known)]
+        for slot in _one_slot_per_person(hits):
+            if sdb.add_material(slot["id"], "чат", f"{post['chat_id']}:{post['msg_id']}", post["text"]):
+                _mark_new_material(slot["id"])
 
     rows = [sdb.get_slot(i) for i in ids]
     logger.info("Секретарь %s: слотов %d, расшифровок %d", dkey, len(rows), len(transcripts))
     return rows, participants
+
+
+def _one_slot_per_person(slots: list) -> list:
+    """У участника два слота за день (записался в 09:00, созвонился в 10:15) — пост идёт в тот,
+    где есть запись, иначе в первый."""
+    out, seen = [], {}
+    for s in slots:
+        key = s["part_row"] or None
+        if key is None:
+            out.append(s)
+            continue
+        has_rec = any(m["source"] == "запись" for m in sdb.materials_of_slot(s["id"]))
+        if key not in seen:
+            seen[key] = (len(out), has_rec)
+            out.append(s)
+        elif has_rec and not seen[key][1]:
+            out[seen[key][0]] = s
+            seen[key] = (seen[key][0], True)
+    return out
 
 
 def _mark_new_material(slot_id: int) -> None:
