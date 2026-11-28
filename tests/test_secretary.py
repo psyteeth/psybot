@@ -692,3 +692,40 @@ class StaleSlotTests(unittest.TestCase):
         self.assertEqual(sdb.drop_stale_slots("2026-12-01", {keep}), 1)
         self.assertEqual({s["id"] for s in sdb.slots_of_day("2026-12-01")}, {keep, busy})
         self.assertIsNone(sdb.get_slot(stale))
+
+
+class GrowthTests(unittest.TestCase):
+    def test_extraction_and_story(self):
+        p = S.Participant(5, {"ник_tg": "@zoya_z", "имя": "Зоя"})
+        ex = S.build_extraction({"путь_роста": [{"зуб": "43", "текст": "научилась говорить «нет», теперь не сжимается" + " x" * 300}, {"текст": ""}]},
+                                date(2026, 11, 28), p, "созвон")
+        self.assertEqual(len(ex.growth), 1)
+        g = ex.growth[0]
+        self.assertEqual((g["ник_tg"], g["зуб"]), ("@zoya_z", "43"))
+        self.assertLessEqual(len(g["путь_роста"]), 400)
+        t = S.story_text("Зоя", "ж", [], 0, [], ex.growth)
+        self.assertIn("🌱 Путь роста:", t)
+        self.assertIn("(🦷43)", t)
+        no_nick = S.build_extraction({"путь_роста": [{"текст": "научилась"}]}, date(2026, 11, 28), None, "созвон")
+        self.assertFalse(no_nick.growth)
+        self.assertTrue(any("Пути роста" in q for q in no_nick.questions))
+
+    def test_plan_growth_appends_never_overwrites(self):
+        values = [S.CARD_COLUMNS, ["подсказка"] * len(S.CARD_COLUMNS),
+                  ["@zoya_z", "43"] + [""] * 10 + ["научилась кричать, теперь легче"],
+                  ["@marfa_m", ""] + [""] * 11]
+        col = S.CARD_COLUMNS.index("путь_роста") + 1
+        updates, appends = S.plan_growth(values, [
+            {"ник_tg": "@Zoya_Z", "зуб": "43", "путь_роста": "научилась молчать по-взрослому, теперь не оправдывается"},
+            {"ник_tg": "@zoya_z", "зуб": "43", "путь_роста": "научилась кричать, теперь легче"},  # уже есть — не повторяем
+            {"ник_tg": "@marfa_m", "зуб": "21", "путь_роста": "научилась смотреть в упор"},  # одна карточка без зуба — она
+            {"ник_tg": "@dusya_d", "зуб": "36", "путь_роста": "научилась уходить"},
+            {"ник_tg": "@dusya_d", "зуб": "36", "путь_роста": "научилась возвращаться"},
+        ])
+        self.assertEqual(updates, [
+            (3, col, "научилась кричать, теперь легче\nнаучилась молчать по-взрослому, теперь не оправдывается"),
+            (4, col, "научилась смотреть в упор"),
+        ])
+        self.assertEqual(len(appends), 1)
+        self.assertEqual(appends[0][:2], ["@dusya_d", "36"])
+        self.assertEqual(appends[0][col - 1], "научилась уходить\nнаучилась возвращаться")

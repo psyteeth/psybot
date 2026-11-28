@@ -160,6 +160,30 @@ class SecretaryGoogle:
         return len(out)
 
 
+    def append_growth(self, rows: list[dict]) -> None:
+        """Успехи — новой строкой в «путь_роста» карточки (ник+зуб); нет карточки — новая строка.
+        Других колонок не трогаем: их заполняет Антон. Нет листа — создаём с заголовком."""
+        if not rows:
+            return
+        book = self._participants_book()
+        try:
+            ws = book.worksheet(S.TAB_CARDS)
+        except gspread.WorksheetNotFound:
+            ws = book.add_worksheet(S.TAB_CARDS, rows=200, cols=len(S.CARD_COLUMNS))
+            ws.update(range_name="A1", values=[S.CARD_COLUMNS], value_input_option="RAW")
+        values = ws.get_all_values()
+        updates, appends = S.plan_growth(values, rows)
+        if updates:
+            ws.batch_update([{"range": gspread.utils.rowcol_to_a1(r, c), "values": [[v]]} for r, c, v in updates],
+                            value_input_option="RAW")
+        if appends:
+            start = max(S.first_empty_row(values), 3)
+            need = start + len(appends) - 1
+            if need > ws.row_count:
+                ws.add_rows(need - ws.row_count + 50)
+            ws.update(range_name=f"A{start}", values=appends, value_input_option="RAW")
+
+
 google = SecretaryGoogle()
 
 
@@ -305,12 +329,15 @@ SYSTEM_PROMPT = """Ты — секретарь школы психостомат
 - Пиши коротко и живо, словами участника, в настоящем времени, как сценку: каждая реплика — одно действие или фраза.
 - Сайт отличает действие от реплики по первой букве: действие — со строчной («приходит домой», «злится, краснеет, машет кулаком», «подбегает: КИЯ — и по яйцам»), прямая речь — с заглавной («Папа пришёл! Буду ещё больше бегать!»). Удар пиши словами «КИЯ»/«по яйцам», победу — «победа», шок и боль триггера — «в шоке», «больно», покраснение — «краснеет»: по ним сайт рисует сценку.
 
+ПУТЬ РОСТА (лист «Карточки»): на созвоне Антон спрашивает, какие у участника успехи по зубу. Каждый успех — отдельный элемент «путь_роста»: обобщёнными словами, в форме «научился …, теперь …» («научился говорить отцу «нет», теперь не сжимается, когда тот кричит»), до 400 символов, без имён, фамилий и контактов (ни участника, ни других людей — пиши «отец», «муж», «подруга»). Зуб — номер FDI, если назван. Нет успехов — пустой список, не выдумывай.
+
 Как Антон пишет заметки в чате: «@ник 36» или «СПАСИБО (43)» — число это зуб FDI; 🔴 — точка А («стараться, нельзя триггерить»), 🟢 — точка Б («стараться нельзя, триггерить»); «(с,нт)» — реакция из А, «(сн,т)» — из Б; «в АА:» — точка АА; строки без значка между 🔴/🟢 — действия триггера. 🟣 и другие значки — не угадывай, что это за точка: спроси.
 
 Ответ — ТОЛЬКО JSON без текста вокруг:
 {"калибровки": [{"дата": "ДД.ММ.ГГГГ", "название": "", "адресат_роль": "", "точка_А": "", "точка_АА": "", "точка_Б": "", "названия_точек": "", "источник": "", "достоверность": "", "на_сайт": ""}],
  "коммуникации": [{"дата": "", "адресат_роль": "", "адресат_слово": "", "лицо_адресата": "", "фраза_адресата": "", "ответ_А": "", "лицо_после_А": "", "ответ_АА": "", "лицо_после_АА": "", "ответ_Б": "", "лицо_после_Б": "", "названия_точек": "", "портал": "", "зуб": "", "источник": "", "реакция_после_А": "", "реакция_после_Б": "", "продолжение_Б": "", "до_триггера": ""}],
  "участник": null,
+ "путь_роста": [{"зуб": "", "текст": "научился …, теперь …"}],
  "вопросы": ["короткий вопрос Антону"]}
 ник_tg, id и на_сайт у коммуникаций бот проставит сам. Вопросы — только то, без чего строку не заполнить: максимум 3, каждый одной фразой до 100 символов («Зуб 43 — это про батю?»). Не спрашивай, как оформлять — правила выше.
 
@@ -402,7 +429,8 @@ async def extract_slot(slot_id: int, participants: list[S.Participant] | None = 
             data = {"вопросы": ["Не смог разобрать материал автоматически — пришли заметки текстом или блок «Строки для таблицы»."]}
         ex = S.build_extraction(data, day, participant, "созвон")
 
-    drafts = [(S.TAB_CALIBRATIONS, r) for r in ex.calibrations] + [(S.TAB_COMMUNICATIONS, r) for r in ex.communications]
+    drafts = ([(S.TAB_CALIBRATIONS, r) for r in ex.calibrations] + [(S.TAB_COMMUNICATIONS, r) for r in ex.communications]
+              + [(S.TAB_CARDS, r) for r in ex.growth])
     if ex.participant_row:
         drafts.insert(0, (S.TAB_PARTICIPANTS, ex.participant_row))
     sdb.replace_drafts(slot_id, drafts)
@@ -513,7 +541,8 @@ async def send_summary(bot, day: dt.date, participants: list[S.Participant] | No
         cal = sum(1 for d in drafts if d["sheet"] == S.TAB_CALIBRATIONS)
         qs = [q["text"] for q in sdb.questions_of_slot(s["id"], open_only=True)]
         gender = (p.fields.get("пол") if p else "") or ""
-        text = S.story_text(s["name"], gender, com, cal, qs)
+        growth = [sdb.draft_row(d) for d in drafts if d["sheet"] == S.TAB_CARDS]
+        text = S.story_text(s["name"], gender, com, cal, qs, growth)
         m = await _send(bot, text, reply_markup=_kb([[
             ("Добавить", f"sec:sadd:{s['id']}"), ("Изменить", f"sec:sedit:{s['id']}"), ("Не добавлять", f"sec:sdrop:{s['id']}"),
         ]]))
@@ -612,6 +641,11 @@ async def _write_drafts(day: dt.date, drafts: list) -> tuple[int, int, int]:
             continue
         by_tab.setdefault(d["sheet"], []).append(d)
     counts = {S.TAB_CALIBRATIONS: 0, S.TAB_COMMUNICATIONS: 0, S.TAB_PARTICIPANTS: 0}
+    cards = by_tab.get(S.TAB_CARDS, [])
+    if cards:
+        await asyncio.to_thread(google.append_growth, [sdb.draft_row(d) for d in cards])
+        for d in cards:
+            sdb.update_draft(d["id"], status="added")
     for tab in (S.TAB_PARTICIPANTS, S.TAB_CALIBRATIONS, S.TAB_COMMUNICATIONS):
         items = by_tab.get(tab, [])
         if not items:
@@ -898,7 +932,7 @@ async def _edit_draft(bot, draft, text: str) -> None:
     day = dt.date.fromisoformat(slot["day"])
     if "\t" in text:
         headers = await asyncio.to_thread(google.headers)
-        cols = headers.get(sheet) or S.DEFAULT_COLUMNS[sheet]
+        cols = headers.get(sheet) or S.DEFAULT_COLUMNS.get(sheet) or ["ник_tg", "зуб", "путь_роста"]
         cells = text.split("\t")
         new = {c: (cells[i].strip() if i < len(cells) else "") for i, c in enumerate(cols)}
     else:
