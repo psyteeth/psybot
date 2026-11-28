@@ -29,12 +29,6 @@ TAB_COMMUNICATIONS = "Коммуникации"
 TAB_FACES = "Лица"
 TAB_ROLES = "Роли"
 TAB_JOURNAL = "Журнал_секретаря"
-TAB_CARDS = "Карточки"
-CARD_COLUMNS = [
-    "ник_tg", "зуб", "триггер", "точка_А", "точка_Б", "все_СП", "все_АЖ", "ОЧЛ", "дофаминовая_ID",
-    "опасная_ID", "зачем_зуб", "залупа", "путь_роста",
-]
-GROWTH_MAX = 400
 JOURNAL_HEADER = ["дата", "время_мск", "участник", "источники", "калибровок", "коммуникаций", "участник_строка", "статус", "обновлено"]
 FIRST_DATA_ROW = 3  # строка 1 — заголовки, строка 2 — подсказки
 
@@ -798,57 +792,6 @@ def finalize_communication(row: dict, day: date, nick: str, default_source: str)
     return r, questions
 
 
-def finalize_growth(row: dict, nick: str) -> dict:
-    """Успех участника одной строкой «научился …, теперь …», не длиннее 400 символов."""
-    text = " ".join(str(row.get("текст") or row.get("путь_роста") or "").split())
-    if len(text) > GROWTH_MAX:
-        text = text[: GROWTH_MAX - 1].rstrip() + "…"
-    tooth = " ".join(str(row.get("зуб") or "").split())
-    return {"ник_tg": nick or sanitize_cell(row.get("ник_tg", "")).strip(), "зуб": tooth, "путь_роста": sanitize_cell(text)}
-
-
-def _nick_key(n: str) -> str:
-    return norm(n).lstrip("@")
-
-
-def plan_growth(values: list[list[str]], rows: list[dict]) -> tuple[list[tuple[int, int, str]], list[list[str]]]:
-    """Как дописать успехи в лист «Карточки»: (обновления (строка, колонка, новое значение), новые строки).
-    Строка карточки — та же пара ник+зуб; если у ника одна карточка без зуба — она. Иначе новая строка
-    (ник + зуб). Старые строки «Пути роста» не трогаем, новая — через перевод строки; повтор не пишем."""
-    header = [h.strip() for h in (values[0] if values else CARD_COLUMNS)]
-    ci = {h: i for i, h in enumerate(header)}
-    cells: dict[int, str] = {}
-    updates: dict[int, str] = {}
-    appends: list[dict] = []
-    def find(nick, tooth):
-        mine = [i for i, r in enumerate(values) if i >= 2 and _nick_key(_cell(values, i, ci["ник_tg"])) == _nick_key(nick)]
-        exact = [i for i in mine if norm(_cell(values, i, ci["зуб"])) == norm(tooth)]
-        if exact:
-            return exact[0]
-        blank = [i for i in mine if not _cell(values, i, ci["зуб"]).strip()]
-        return blank[0] if len(mine) == 1 and blank else None
-    for r in rows:
-        line = r["путь_роста"].strip()
-        if not line:
-            continue
-        i = find(r["ник_tg"], r["зуб"])
-        if i is None:
-            same = next((a for a in appends if _nick_key(a["ник_tg"]) == _nick_key(r["ник_tg"]) and a["зуб"] == r["зуб"]), None)
-            if same:
-                if line not in same["путь_роста"].split("\n"):
-                    same["путь_роста"] += "\n" + line
-            else:
-                appends.append({"ник_tg": r["ник_tg"], "зуб": r["зуб"], "путь_роста": line})
-            continue
-        cur = cells.get(i, _cell(values, i, ci["путь_роста"]))
-        if line in cur.split("\n"):
-            continue
-        cells[i] = (cur.rstrip("\n") + "\n" + line) if cur.strip() else line
-        updates[i] = cells[i]
-    return ([(i + 1, ci["путь_роста"] + 1, v) for i, v in sorted(updates.items())],
-            [row_values(header, a) for a in appends])
-
-
 def finalize_participant(row: dict) -> dict:
     return {c: sanitize_cell(row.get(c, "")) for c in PARTICIPANT_COLUMNS}
 
@@ -924,7 +867,6 @@ class Extraction:
     calibrations: list[dict] = field(default_factory=list)
     communications: list[dict] = field(default_factory=list)
     participant_row: dict | None = None
-    growth: list[dict] = field(default_factory=list)  # «Путь роста»: {ник_tg, зуб, путь_роста}
     questions: list[str] = field(default_factory=list)
 
 
@@ -953,16 +895,6 @@ def build_extraction(data: dict, day: date, participant: Participant | None, def
             missing = "ответа из Б" if row["ответ_А"].strip() else "ответа из А"
             role = row["адресат_роль"].strip() or "адресат не ясен"
             ex.questions.append(f"Коммуникация «{role}»: нет {missing} — на сайт не пойдёт, пока не будет обоих путей.")
-    for raw in data.get("путь_роста") or []:
-        if not isinstance(raw, dict):
-            continue
-        g = finalize_growth(raw, nick)
-        if not g["путь_роста"]:
-            continue
-        if not g["ник_tg"]:
-            ex.questions.append("Успех для «Пути роста» есть, а ника участника нет — в карточку не записать.")
-            continue
-        ex.growth.append(g)
     prow = data.get("участник")
     if isinstance(prow, dict) and any(str(v).strip() for v in prow.values()):
         if participant:
@@ -1091,8 +1023,7 @@ TRIGGER_EMOJI = "🐲"
 TOOTH_EMOJI = "🦷"
 
 
-def story_text(name: str, gender: str, communications: list[dict], calibrations: int = 0, questions: list[str] | None = None,
-               growth: list[dict] | None = None) -> str:
+def story_text(name: str, gender: str, communications: list[dict], calibrations: int = 0, questions: list[str] | None = None) -> str:
     """Отчёт по участнику, как Антон пишет сам («ПО СЕРЕГЕ»): 🐲 ТРИГГЕР и его действие, участник из
     точки А, потом участник из точки Б (🦷) и цепочка реакций триггера. Продолжение_Б — по очереди
     триггер, участник, триггер… (так же читает сайт)."""
@@ -1129,10 +1060,6 @@ def story_text(name: str, gender: str, communications: list[dict], calibrations:
                 out.append(f"{me}{TOOTH_EMOJI} {beat}")
     if not communications:
         out.append("Истории (триггер + реакции из А и Б) не нашёл.")
-    wins = [g for g in (growth or []) if (g.get("путь_роста") or "").strip()]
-    if wins:
-        out.append("\n🌱 Путь роста:")
-        out += [f"🌱 {g['путь_роста'].strip()}" + (f" (🦷{g['зуб']})" if g.get("зуб") else "") for g in wins]
     if calibrations:
         out.append(f"\n＋ {calibrations} {plural(calibrations, 'калибровка', 'калибровки', 'калибровок')}")
     qs = [_q(q, 160) for q in (questions or []) if q][:3]
@@ -1174,7 +1101,6 @@ def draft_preview(sheet: str, row: dict) -> str:
         TAB_CALIBRATIONS: ["дата", "название", "адресат_роль", "точка_А", "точка_АА", "точка_Б", "источник", "достоверность"],
         TAB_COMMUNICATIONS: ["адресат_роль", "лицо_адресата", "фраза_адресата", "ответ_А", "лицо_после_А", "ответ_Б", "лицо_после_Б", "реакция_после_Б", "зуб", "на_сайт"],
         TAB_PARTICIPANTS: PARTICIPANT_COLUMNS,
-        TAB_CARDS: ["ник_tg", "зуб", "путь_роста"],
     }[sheet]
     lines = [f"Лист «{sheet}»:"]
     for k in keys:
