@@ -64,6 +64,7 @@ class SecretaryGoogle:
 
     def __init__(self) -> None:
         self._client = None
+        self._tab_cache: dict[str, tuple[float, list[list[str]]]] = {}
 
     @property
     def client(self) -> gspread.Client:
@@ -83,8 +84,52 @@ class SecretaryGoogle:
             raise RuntimeError(f"в таблице эфиров нет листа «{S.MONTHS_NOM[day.month]} {day.year}»")
         return S.parse_efiry_grid(sh.worksheet(title).get_all_values(), day.year, day.month)
 
-    def tab_values(self, tab: str) -> list[list[str]]:
-        return self._participants_book().worksheet(tab).get_all_values()
+    def tab_values(self, tab: str, max_age: float = 0) -> list[list[str]]:
+        """max_age > 0 — можно взять прочитанное не раньше max_age секунд назад (лимит чтений Sheets)."""
+        import time as _t
+        hit = self._tab_cache.get(tab)
+        if max_age and hit and _t.monotonic() - hit[0] < max_age:
+            return hit[1]
+        values = self._participants_book().worksheet(tab).get_all_values()
+        self._tab_cache[tab] = (_t.monotonic(), values)
+        return values
+
+    def cards(self) -> list[list[str]]:
+        try:
+            return self.tab_values(S.TAB_CARDS, max_age=120)
+        except gspread.WorksheetNotFound:
+            return []
+
+    def write_portraits(self, rows: list[dict]) -> int:
+        """Портрет — целиком в ячейку портрет_зуба (старое имя путь_роста) карточки человека, старый
+        текст заменяется. Карточки нет — новая строка: ник, зуб, портрет. Другие колонки не трогаем."""
+        if not rows:
+            return 0
+        ws = self._participants_book().worksheet(S.TAB_CARDS)
+        values = ws.get_all_values()
+        header = [h.strip() for h in (values[0] if values else [])]
+        col = S.portrait_column(header)
+        if col is None:
+            raise RuntimeError("В «Карточках» нет колонки портрет_зуба")
+        n = 0
+        for r in rows:
+            i = S.card_row_index(values, r["ник_tg"], r.get("зуб", ""))
+            if i is None:
+                start = S.first_empty_row(values)
+                new = [""] * len(header)
+                new[header.index("ник_tg")] = r["ник_tg"]
+                if "зуб" in header:
+                    new[header.index("зуб")] = r.get("зуб", "")
+                new[col] = r["портрет_зуба"]
+                if start > ws.row_count:
+                    ws.add_rows(start - ws.row_count + 50)
+                ws.update(range_name=f"A{start}", values=[new], value_input_option="RAW")
+                values = values + [[]] * (start - 1 - len(values)) + [new]
+            else:
+                ws.update_cell(i + 1, col + 1, r["портрет_зуба"])
+            n += 1
+        self._tab_cache.pop(S.TAB_CARDS, None)
+        return n
 
     def headers(self) -> dict[str, list[str]]:
         out = {}
@@ -374,7 +419,7 @@ async def extract_slot(slot_id: int, participants: list[S.Participant] | None = 
         faces, roles = await asyncio.to_thread(google.faces_roles)
         recent = []
         if participant:
-            _, cal = S.records_from_values(await asyncio.to_thread(google.tab_values, S.TAB_CALIBRATIONS))
+            _, cal = S.records_from_values(await asyncio.to_thread(google.tab_values, S.TAB_CALIBRATIONS, 120))
             recent = [f for _, f in cal if f.get("ник_tg", "").strip() == participant.nick][-10:]
         answered = [q for q in sdb.questions_of_slot(slot_id) if q["answer"]]
         user = [
@@ -405,12 +450,89 @@ async def extract_slot(slot_id: int, participants: list[S.Participant] | None = 
     drafts = [(S.TAB_CALIBRATIONS, r) for r in ex.calibrations] + [(S.TAB_COMMUNICATIONS, r) for r in ex.communications]
     if ex.participant_row:
         drafts.insert(0, (S.TAB_PARTICIPANTS, ex.participant_row))
+    if participant and participant.nick:
+        try:
+            portrait, pq = await _build_portrait(participant, materials, ex, participants)
+        except Exception:  # noqa: BLE001 — без портрета история всё равно уходит Антону
+            logger.exception("Секретарь: портрет для слота %s не собрался", slot_id)
+            portrait, pq = None, []
+        if portrait:
+            drafts.append((S.TAB_CARDS, portrait))
+        ex.questions = (pq + ex.questions)[:5]
     sdb.replace_drafts(slot_id, drafts)
     sdb.replace_questions(slot_id, ex.questions)
     sdb.update_slot(slot_id, status="extracted", report_msg_id=None)
     logger.info("Секретарь: слот %s разобран: калибровок %d, коммуникаций %d, вопросов %d",
                 slot_id, len(ex.calibrations), len(ex.communications), len(ex.questions))
     return ex
+
+
+PORTRAIT_PROMPT = """Ты пишешь «Портрет зуба» для карточки участника школы психостоматологии — текст, который человек
+читает о себе на сайте и за который готов платить. Это не список успехов и не пересказ созвона, а синтез:
+что за зуб, как через него живёт напряжение (триггер, точка А — как сейчас, точка Б — куда идёт), кто его
+давит (альфа-жертвы, спарринг-партнёры, роли), какие стычки и атаки уже были, что меняется.
+
+Правила:
+- 1–3 абзаца, каждый до 1200 символов, абзацы разделяй пустой строкой. Живой, точный, тёплый и честный язык,
+  без канцелярита и диагнозов; можно жёстко и смешно, как говорит тренер.
+- НИКАКИХ имён, фамилий, ников и контактов — ни участника, ни других людей. Только роли: мама, папа, муж,
+  начальник, подруга. Сам участник — «он»/«она» или «человек с этим зубом».
+- Опирайся только на данные ниже, не выдумывай факты. Номер зуба FDI можно называть.
+- Если есть прошлый портрет — обнови его целиком с учётом нового, не дописывай хвост.
+Ответ — только текст портрета, без заголовка и пояснений."""
+
+
+def _fetch_attacks() -> list[dict]:
+    import urllib.request
+    try:
+        with urllib.request.urlopen("https://psyteeth.github.io/psylive/data/attacks.json", timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:  # noqa: BLE001
+        logger.warning("Секретарь: attacks.json не прочитан")
+        return []
+
+
+async def _build_portrait(participant: S.Participant, materials: list, ex: S.Extraction,
+                          participants: list[S.Participant]) -> tuple[dict | None, list[str]]:
+    """Портрет зуба по всему, что есть о человеке. Возвращает черновик для «Карточек» и вопросы."""
+    nick = participant.nick
+    cards_values = await asyncio.to_thread(google.cards)
+    if not cards_values:
+        return None, []
+    cards = S.card_fields(cards_values, nick)
+    tooth = (cards[0].get("зуб") if cards else "") or participant.fields.get("главный_зуб", "").strip() \
+        or next((c.get("зуб", "").split(",")[0].strip() for c in ex.communications if c.get("зуб")), "")
+    _, comms = S.records_from_values(await asyncio.to_thread(google.tab_values, S.TAB_COMMUNICATIONS, 120))
+    _, cals = S.records_from_values(await asyncio.to_thread(google.tab_values, S.TAB_CALIBRATIONS, 120))
+    mine_c = [f for _, f in comms if f.get("ник_tg", "").strip() == nick][-15:]
+    mine_k = [f for _, f in cals if f.get("ник_tg", "").strip() == nick][-25:]
+    persona = participant.fields.get("персонаж", "").strip()
+    attacks = [a for a in await asyncio.to_thread(_fetch_attacks) if persona and a.get("who") == persona]
+    old = next((c.get(k, "") for c in cards for k in S.PORTRAIT_KEYS if c.get(k)), "")
+    def rows(rs, skip=("ник_tg", "id", "дата", "источник", "на_сайт", "достоверность")):
+        return "\n".join(" | ".join(f"{k}: {v}" for k, v in r.items() if v and k not in skip) for r in rs) or "нет"
+    mats = "\n\n".join(f"### {m['source']}\n{m['text']}" for m in materials)[:40000]
+    user = "\n\n".join([
+        "Строка из «Участники»: " + rows([{k: v for k, v in participant.fields.items() if k not in ("имя", "ник_tg", "персонаж")}]),
+        "Карточки (по зубам): " + rows(cards, skip=("ник_tg",) + S.PORTRAIT_KEYS),
+        "Стычки (лист «Коммуникации»): " + rows(mine_c + ex.communications),
+        "Калибровки: " + rows(mine_k + ex.calibrations),
+        "Атаки (с сайта): " + rows([{k: v for k, v in a.items() if k != "who"} for a in attacks]),
+        "Прошлый портрет: " + (old or "нет"),
+        "Материалы нового созвона:\n" + mats,
+    ])
+    text = S.finalize_portrait(await llm._ask(PORTRAIT_PROMPT, user, MODEL_SONNET, max_tokens=3000))
+    if not text:
+        return None, []
+    qs = []
+    names = [S._tokens(p.name)[0] for p in participants if S._tokens(p.name)]
+    hits = S.name_words(text, names)
+    if hits:
+        qs.append(f"В портрете похоже на имя: {', '.join(hits[:3])} — сайт такой текст выкинет. Поправь ответом.")
+    if not cards:
+        qs.append("Карточки в «Карточках» нет — при «Добавить» заведу строку: ник, зуб, портрет.")
+    return {"ник_tg": nick, "зуб": tooth, "портрет_зуба": text}, qs
 
 
 async def process_pending(day: dt.date, participants=None) -> int:
@@ -513,7 +635,8 @@ async def send_summary(bot, day: dt.date, participants: list[S.Participant] | No
         cal = sum(1 for d in drafts if d["sheet"] == S.TAB_CALIBRATIONS)
         qs = [q["text"] for q in sdb.questions_of_slot(s["id"], open_only=True)]
         gender = (p.fields.get("пол") if p else "") or ""
-        text = S.story_text(s["name"], gender, com, cal, qs)
+        portrait = next((sdb.draft_row(d).get("портрет_зуба", "") for d in drafts if d["sheet"] == S.TAB_CARDS), "")
+        text = S.story_text(s["name"], gender, com, cal, qs, portrait)
         m = await _send(bot, text, reply_markup=_kb([[
             ("Добавить", f"sec:sadd:{s['id']}"), ("Изменить", f"sec:sedit:{s['id']}"), ("Не добавлять", f"sec:sdrop:{s['id']}"),
         ]]))
@@ -612,6 +735,11 @@ async def _write_drafts(day: dt.date, drafts: list) -> tuple[int, int, int]:
             continue
         by_tab.setdefault(d["sheet"], []).append(d)
     counts = {S.TAB_CALIBRATIONS: 0, S.TAB_COMMUNICATIONS: 0, S.TAB_PARTICIPANTS: 0}
+    cards = by_tab.get(S.TAB_CARDS, [])
+    if cards:
+        await asyncio.to_thread(google.write_portraits, [sdb.draft_row(d) for d in cards])
+        for d in cards:
+            sdb.update_draft(d["id"], status="added")
     for tab in (S.TAB_PARTICIPANTS, S.TAB_CALIBRATIONS, S.TAB_COMMUNICATIONS):
         items = by_tab.get(tab, [])
         if not items:
@@ -898,7 +1026,7 @@ async def _edit_draft(bot, draft, text: str) -> None:
     day = dt.date.fromisoformat(slot["day"])
     if "\t" in text:
         headers = await asyncio.to_thread(google.headers)
-        cols = headers.get(sheet) or S.DEFAULT_COLUMNS[sheet]
+        cols = headers.get(sheet) or S.DEFAULT_COLUMNS.get(sheet) or ["ник_tg", "зуб", "портрет_зуба"]
         cells = text.split("\t")
         new = {c: (cells[i].strip() if i < len(cells) else "") for i, c in enumerate(cols)}
     else:

@@ -29,6 +29,14 @@ TAB_COMMUNICATIONS = "Коммуникации"
 TAB_FACES = "Лица"
 TAB_ROLES = "Роли"
 TAB_JOURNAL = "Журнал_секретаря"
+TAB_CARDS = "Карточки"
+CARD_COLUMNS = [
+    "ник_tg", "зуб", "триггер", "точка_А", "точка_Б", "все_СП", "все_АЖ", "ОЧЛ", "дофаминовая_ID",
+    "опасная_ID", "зачем_зуб", "залупа", "портрет_зуба",
+]
+PORTRAIT_KEYS = ("портрет_зуба", "путь_роста")  # старое название колонки сайт тоже читает
+PORTRAIT_PARAS = 3
+PORTRAIT_PARA_MAX = 1200
 JOURNAL_HEADER = ["дата", "время_мск", "участник", "источники", "калибровок", "коммуникаций", "участник_строка", "статус", "обновлено"]
 FIRST_DATA_ROW = 3  # строка 1 — заголовки, строка 2 — подсказки
 
@@ -792,6 +800,73 @@ def finalize_communication(row: dict, day: date, nick: str, default_source: str)
     return r, questions
 
 
+def finalize_portrait(text: str) -> str:
+    """Портрет зуба: 1–3 абзаца по ≤1200 символов, абзац — одна строка ячейки (сайт показывает строки
+    абзацами)."""
+    paras = [" ".join(p.split()) for p in re.split(r"\n+", str(text or "")) if p.strip()]
+    out = []
+    for p in paras[:PORTRAIT_PARAS]:
+        if len(p) > PORTRAIT_PARA_MAX:
+            cut = p[:PORTRAIT_PARA_MAX - 1]
+            dot = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+            p = cut[: dot + 1] if dot > PORTRAIT_PARA_MAX // 2 else cut.rstrip() + "…"
+        out.append(sanitize_cell(p))
+    return "\n".join(out)
+
+
+def name_words(text: str, names: list[str]) -> list[str]:
+    """Слова портрета, похожие на имена участников (на сайте фильтр имён выкинет такой текст)."""
+    forms = set()
+    for n in names:
+        n = norm(n)
+        if len(n) >= 3:
+            forms.add(n)
+            for g in DIMINUTIVES:
+                if n in g:
+                    forms |= g
+    found = []
+    for w in re.findall(r"[А-ЯЁA-Z][а-яёa-z]{2,}", text or ""):
+        if any(name_like(w, n) for n in forms) and w not in found:
+            found.append(w)
+    return found
+
+
+def card_row_index(values: list[list[str]], nick: str, tooth: str = "") -> int | None:
+    """Строка карточки (0-based) человека: та же пара ник+зуб, иначе первая строка ника."""
+    if not values:
+        return None
+    header = [h.strip() for h in values[0]]
+    if "ник_tg" not in header:
+        return None
+    ni, ti = header.index("ник_tg"), header.index("зуб") if "зуб" in header else -1
+    key = norm(nick).lstrip("@")
+    mine = [i for i in range(2, len(values)) if key and norm(_cell(values, i, ni)).lstrip("@") == key]
+    exact = [i for i in mine if tooth and ti >= 0 and norm(_cell(values, i, ti)) == norm(tooth)]
+    return (exact or mine or [None])[0]
+
+
+def portrait_column(header: list[str]) -> int | None:
+    h = [x.strip() for x in header]
+    for k in PORTRAIT_KEYS:
+        if k in h:
+            return h.index(k)
+    return None
+
+
+def card_fields(values: list[list[str]], nick: str) -> list[dict]:
+    """Все строки «Карточек» человека как словари (без пустых ячеек)."""
+    if not values:
+        return []
+    header = [h.strip() for h in values[0]]
+    key = norm(nick).lstrip("@")
+    ni = header.index("ник_tg") if "ник_tg" in header else 0
+    out = []
+    for i in range(2, len(values)):
+        if key and norm(_cell(values, i, ni)).lstrip("@") == key:
+            out.append({h: _cell(values, i, j) for j, h in enumerate(header) if h and _cell(values, i, j)})
+    return out
+
+
 def finalize_participant(row: dict) -> dict:
     return {c: sanitize_cell(row.get(c, "")) for c in PARTICIPANT_COLUMNS}
 
@@ -1023,7 +1098,8 @@ TRIGGER_EMOJI = "🐲"
 TOOTH_EMOJI = "🦷"
 
 
-def story_text(name: str, gender: str, communications: list[dict], calibrations: int = 0, questions: list[str] | None = None) -> str:
+def story_text(name: str, gender: str, communications: list[dict], calibrations: int = 0, questions: list[str] | None = None,
+               portrait: str = "") -> str:
     """Отчёт по участнику, как Антон пишет сам («ПО СЕРЕГЕ»): 🐲 ТРИГГЕР и его действие, участник из
     точки А, потом участник из точки Б (🦷) и цепочка реакций триггера. Продолжение_Б — по очереди
     триггер, участник, триггер… (так же читает сайт)."""
@@ -1060,6 +1136,9 @@ def story_text(name: str, gender: str, communications: list[dict], calibrations:
                 out.append(f"{me}{TOOTH_EMOJI} {beat}")
     if not communications:
         out.append("Истории (триггер + реакции из А и Б) не нашёл.")
+    if (portrait or "").strip():
+        out.append(f"\n{TOOTH_EMOJI} ПОРТРЕТ ЗУБА")
+        out += [p for p in portrait.split("\n") if p.strip()]
     if calibrations:
         out.append(f"\n＋ {calibrations} {plural(calibrations, 'калибровка', 'калибровки', 'калибровок')}")
     qs = [_q(q, 160) for q in (questions or []) if q][:3]
@@ -1101,6 +1180,7 @@ def draft_preview(sheet: str, row: dict) -> str:
         TAB_CALIBRATIONS: ["дата", "название", "адресат_роль", "точка_А", "точка_АА", "точка_Б", "источник", "достоверность"],
         TAB_COMMUNICATIONS: ["адресат_роль", "лицо_адресата", "фраза_адресата", "ответ_А", "лицо_после_А", "ответ_Б", "лицо_после_Б", "реакция_после_Б", "зуб", "на_сайт"],
         TAB_PARTICIPANTS: PARTICIPANT_COLUMNS,
+        TAB_CARDS: ["ник_tg", "зуб", "портрет_зуба"],
     }[sheet]
     lines = [f"Лист «{sheet}»:"]
     for k in keys:

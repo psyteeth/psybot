@@ -692,3 +692,29 @@ class StaleSlotTests(unittest.TestCase):
         self.assertEqual(sdb.drop_stale_slots("2026-12-01", {keep}), 1)
         self.assertEqual({s["id"] for s in sdb.slots_of_day("2026-12-01")}, {keep, busy})
         self.assertIsNone(sdb.get_slot(stale))
+
+
+class PortraitTests(unittest.TestCase):
+    def test_finalize_and_names(self):
+        long = "Первое предложение. " * 80
+        t = S.finalize_portrait(f"{long}\n\nВторой абзац.\n\nТретий.\n\nЧетвёртый лишний.")
+        paras = t.split("\n")
+        self.assertEqual(len(paras), 3)
+        self.assertLessEqual(len(paras[0]), 1200)
+        self.assertTrue(paras[0].endswith("."))
+        self.assertEqual(S.name_words("Мама давит, а Глафира молчит. Глашу жалко", ["Глафира", "Зоя"]), ["Глафира", "Глашу"])
+        self.assertEqual(S.name_words("Мама давит, зуб 43 болит", ["Глафира"]), [])
+
+    def test_card_row_and_column(self):
+        values = [["ник_tg", "зуб", "путь_роста"], ["подсказка", "", ""],
+                  ["@zoya_z", "13", ""], ["@zoya_z", "21", "старый"], ["@marfa_m", "", ""]]
+        self.assertEqual(S.card_row_index(values, "@Zoya_Z", "21"), 3)
+        self.assertEqual(S.card_row_index(values, "@zoya_z", "36"), 2)
+        self.assertIsNone(S.card_row_index(values, "@dusya_d"))
+        self.assertEqual(S.portrait_column(values[0]), 2)
+        self.assertEqual(S.portrait_column(["ник_tg", "портрет_зуба", "путь_роста"]), 1)
+        self.assertEqual(S.card_fields(values, "@zoya_z")[1], {"ник_tg": "@zoya_z", "зуб": "21", "путь_роста": "старый"})
+
+    def test_story_shows_portrait(self):
+        t = S.story_text("Зоя", "ж", [], 0, [], "Абзац один.\nАбзац два.")
+        self.assertIn("🦷 ПОРТРЕТ ЗУБА\nАбзац один.\nАбзац два.", t)
